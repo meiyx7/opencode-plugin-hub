@@ -223,6 +223,36 @@ npm publish --access public            # publishConfig 会把它发到 registry.
 - npm 发布是公开且难以撤回的，建议先 `npm pack`，在本地或测试机器上确认能装再发。
 - 发布后用 `npm view opencode-plugin-hub version --registry=https://registry.npmjs.org/` 确认。npmmirror 是异步镜像，刚发布时可能还没同步；如果 OpenCode 通过镜像拉包暂时找不到，等几分钟或临时把 registry 指向官方 npm。
 
+### 后续版本：GitHub Actions + Trusted Publishing
+
+`0.1.0` 已经手动发布。后续版本推荐用 Trusted Publishing，仓库里不存 `NPM_TOKEN`。
+
+先在 npm 配置 trusted publisher：
+
+1. 打开 <https://www.npmjs.com/package/opencode-plugin-hub/settings>
+2. **Trusted Publishing** → **Add a trusted publisher** → **GitHub Actions**
+3. 填：
+   - Organization or user: `meiyx7`
+   - Repository: `opencode-plugin-hub`
+   - Workflow filename: `publish.yml`
+   - Environment: 留空
+4. 保存
+
+之后发新版本：
+
+```bash
+npm version patch
+git push --follow-tags
+```
+
+然后在 GitHub 上为该 tag 创建 Release（或者在 Actions 里手动运行 **Publish to npm**）。`.github/workflows/publish.yml` 会用 `id-token: write` 和 `npm publish --provenance` 发布，不需要 `NPM_TOKEN`。
+
+注意：
+
+- `package.json` 的 `version` 必须先 bump，且不能和 npm 上已有版本重复。
+- 如果还没配置 Trusted Publishing 就运行 workflow，会发布失败。
+- `.github/workflows/ci.yml` 会在 push / PR 时跑 typecheck 和 build。
+
 ## 已知边界
 
 - 只在 macOS 桌面版 2.2.5 上验证过。GUI Plugin SDK 仍是 experimental 接口，随时可能变。
