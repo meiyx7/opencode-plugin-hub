@@ -28,6 +28,9 @@ jobs:
       - name: Use npm with Trusted Publishing support
         run: npm install -g npm@latest
 
+      - name: Remove deprecated always-auth setting
+        run: npm config delete always-auth || true
+
       - name: Install
         run: npm ci
 
