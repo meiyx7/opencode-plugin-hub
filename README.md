@@ -225,7 +225,7 @@ npm publish --access public            # publishConfig 会把它发到 registry.
 
 ### 后续版本：GitHub Actions + Trusted Publishing
 
-`0.1.0` 已经手动发布。后续版本推荐用 Trusted Publishing，仓库里不存 `NPM_TOKEN`。
+`0.1.0` / `0.1.1` 已发布。后续版本用 **push `v*` tag 自动发布**，仓库里不存 `NPM_TOKEN`。
 
 先在 npm 配置 trusted publisher：
 
@@ -245,13 +245,21 @@ npm version patch
 git push --follow-tags
 ```
 
-然后在 GitHub 上为该 tag 创建 Release（或者在 Actions 里手动运行 **Publish to npm**）。`.github/workflows/publish.yml` 会用 `id-token: write` 和 `npm publish --provenance` 发布，不需要 `NPM_TOKEN`。
+`npm version` 会创建 `v0.1.2` 这样的 annotated tag；`git push --follow-tags` 把 main 和 tag 一起推上去，tag push 会自动触发 **Publish to npm**，不需要创建 Release，也不需要手动点。
+
+`.github/workflows/publish.yml` 会：
+
+- 校验 tag 和 `package.json` 的 version 一致
+- 用 `id-token: write` 和 `npm publish --provenance` 发布
+- 不需要 `NPM_TOKEN`
 
 注意：
 
 - `package.json` 的 `version` 必须先 bump，且不能和 npm 上已有版本重复。
-- 如果还没配置 Trusted Publishing 就运行 workflow，会发布失败。
-- `.github/workflows/ci.yml` 会在 push / PR 时跑 typecheck 和 build。
+- 已发布的 tag 不要强推；要重发就 bump 一个新版本。
+- 如果还没配置 Trusted Publishing 就推 tag，publish workflow 会失败。
+- 如果 tag 没有跟着 push 上去（极少数 `--follow-tags` 情况），补一个 `git push origin v0.1.2`。
+- `.github/workflows/ci.yml` 仍然在 push / PR 时跑 typecheck 和 build；手动 **Publish to npm** 仅作为重试入口保留。
 
 ## 已知边界
 
