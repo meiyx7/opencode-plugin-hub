@@ -115,7 +115,7 @@ function noteIcon(tone: Tone): IconName {
 function readableError(error: unknown): string {
   const text = error instanceof Error ? error.message : String(error)
   if (/SchemaError|Missing key at/i.test(text)) {
-    return "插件窗口与后台服务版本不一致。点顶部的「彻底重启」让两边换成同一版本。"
+    return "插件窗口与后台服务版本不一致。点上方工具栏的「彻底重启」让两边换成同一版本。"
   }
   if (/unknown method|not implemented|no such method|method.*not.*found/i.test(text)) {
     return "后台服务还是旧版本，暂时没有「彻底重启」能力。请先手动完全退出 OpenCode（并结束 serve --service）再打开一次。"
@@ -173,7 +173,7 @@ const CSS = `
     radial-gradient(120% 160% at 0% 0%, color-mix(in srgb, var(--ph-accent) 13%, transparent) 0%, transparent 52%),
     var(--ph-layer);
 }
-.ph-hero-copy { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+.ph-hero-copy { display: flex; flex: 1; flex-direction: column; gap: 6px; min-width: 0; }
 .ph-kicker {
   display: flex;
   align-items: center;
@@ -209,23 +209,6 @@ const CSS = `
   border-radius: 5px;
   background: var(--ph-layer-2);
 }
-.ph-hero-actions { display: flex; gap: 6px; margin-top: 8px; flex-wrap: wrap; }
-.ph-stats {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(92px, 1fr));
-  gap: 8px;
-  align-content: center;
-}
-.ph-stat {
-  min-width: 92px;
-  padding: 10px 12px;
-  border: 1px solid var(--ph-border);
-  border-radius: 10px;
-  background: var(--ph-layer-2);
-}
-.ph-stat b { display: block; font-size: 18px; font-weight: 650; line-height: 1.2; color: var(--ph-strong); }
-.ph-stat span { font-size: 10.5px; color: var(--ph-muted); }
-.ph-stat[data-tone="accent"] b { color: var(--ph-accent); }
 
 /* notice */
 .ph-notice {
@@ -299,6 +282,11 @@ const CSS = `
   color: var(--ph-muted);
   font-size: 9.5px;
   font-weight: 600;
+}
+.ph-count-alert {
+  background: color-mix(in srgb, var(--ph-accent) 14%, transparent);
+  color: var(--ph-accent);
+  white-space: nowrap;
 }
 .ph-tab[data-active="true"] .ph-count {
   background: color-mix(in srgb, var(--ph-accent) 16%, transparent);
@@ -629,7 +617,6 @@ button.ph-chip:focus-visible,
 
 @media (max-width: 760px) {
   .ph-hero { flex-direction: column; }
-  .ph-stats { grid-template-columns: repeat(4, minmax(0, 1fr)); }
   .ph-card { flex-wrap: wrap; }
   .ph-card-body { flex-basis: calc(100% - 50px); }
   .ph-actions { width: 100%; justify-content: flex-start; padding-left: 50px; }
@@ -1000,7 +987,7 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
           notify(result.message, "error")
           return
         }
-        notify(`${result.message}。点顶部的「彻底重启」后生效`, "success")
+        notify(`${result.message}。点上方工具栏的「彻底重启」后生效`, "success")
         const latest = version || hits().find((hit) => hit.name === name)?.version || ""
         setCatalog((prev) => prev.map((entry) => (entry.pkg === name ? { ...entry, installed: true } : entry)))
         setHits((prev) =>
@@ -1031,7 +1018,7 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
           notify(result.message, "error")
           return
         }
-        notify(`${result.message}。点顶部的「彻底重启」后生效`, "success")
+        notify(`${result.message}。点上方工具栏的「彻底重启」后生效`, "success")
         setCatalog((prev) =>
           prev.map((item) => (item.pkg === entry.name ? { ...item, installed: false } : item)),
         )
@@ -1179,12 +1166,17 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
     void checkUpdates(true)
   })
 
-  const tabButton = (id: Tab, label: string, icon: IconName, count?: number | string) => (
+  const tabButton = (id: Tab, label: string, icon: IconName, count?: number | string, alert?: number) => (
     <button class="ph-tab" data-active={tab() === id} onClick={() => switchTab(id)}>
       <ui.Icon name={icon} size="small" />
       {label}
       <Show when={count !== undefined && count !== ""}>
         <span class="ph-count">{count}</span>
+      </Show>
+      <Show when={alert !== undefined && alert > 0}>
+        <span class="ph-count ph-count-alert" title={`${alert} 个可更新`}>
+          {alert} 可更新
+        </span>
       </Show>
     </button>
   )
@@ -1509,53 +1501,6 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
           <div class="ph-path" title={state()?.configPath}>
             配置：<code>{state()?.configPath ?? "读取中…"}</code> · <code>{state()?.configKey ?? "plugins"}[]</code>
           </div>
-          <div class="ph-hero-actions">
-            <ui.Button
-              variant="neutral"
-              size="small"
-              icon="open-file"
-              busy={isBusy("config")}
-              onClick={() => void openConfig()}
-            >
-              打开配置
-            </ui.Button>
-            <ui.Button
-              variant="ghost"
-              size="small"
-              icon="refresh"
-              busy={isBusy("reload")}
-              onClick={() => void reload()}
-            >
-              重载配置
-            </ui.Button>
-            <ui.Button
-              variant="ghost"
-              size="small"
-              icon="outline-rotate-clockwise"
-              busy={isBusy("restart")}
-              onClick={() => void restartApp()}
-            >
-              彻底重启
-            </ui.Button>
-          </div>
-        </div>
-        <div class="ph-stats">
-          <div class="ph-stat">
-            <b>{state()?.plugins.length ?? "—"}</b>
-            <span>已安装</span>
-          </div>
-          <div class="ph-stat" data-tone={outdated() > 0 ? "accent" : ""}>
-            <b>{checked() ? outdated() : "—"}</b>
-            <span>可更新</span>
-          </div>
-          <div class="ph-stat">
-            <b>{meta() ? catalog().length : "—"}</b>
-            <span>精选条目</span>
-          </div>
-          <div class="ph-stat">
-            <b>{meta() ? catalog().filter((entry) => entry.pkg).length : "—"}</b>
-            <span>可直接安装</span>
-          </div>
         </div>
       </section>
 
@@ -1577,20 +1522,36 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
         <div class="ph-tabs" role="tablist">
           {tabButton("catalog", "精选目录", "extensions", meta() ? catalog().length : undefined)}
           {tabButton("search", "npm 搜索", "magnifying-glass", searched() ? hits().length : undefined)}
-          {tabButton("installed", "已安装", "checklist", state()?.plugins.length ?? 0)}
+          {tabButton("installed", "已安装", "checklist", state()?.plugins.length ?? 0, outdated())}
         </div>
         <span class="ph-spacer" />
-        <Show when={props.embedded}>
-          <ui.Button
-            variant="ghost"
-            size="small"
-            icon="open-file"
-            busy={isBusy("config")}
-            onClick={() => void openConfig()}
-          >
-            配置
-          </ui.Button>
-        </Show>
+        <ui.Button
+          variant="ghost"
+          size="small"
+          icon="open-file"
+          busy={isBusy("config")}
+          onClick={() => void openConfig()}
+        >
+          打开配置
+        </ui.Button>
+        <ui.Button
+          variant="ghost"
+          size="small"
+          icon="refresh"
+          busy={isBusy("reload")}
+          onClick={() => void reload()}
+        >
+          重载配置
+        </ui.Button>
+        <ui.Button
+          variant="neutral"
+          size="small"
+          icon="outline-rotate-clockwise"
+          busy={isBusy("restart")}
+          onClick={() => void restartApp()}
+        >
+          彻底重启
+        </ui.Button>
         <Show when={tab() === "catalog"}>
           <ui.Button
             variant="ghost"
@@ -1838,7 +1799,7 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
 
       <footer class="ph-footer">
         <div class="ph-footer-note">
-          安装和移除只改配置，不会立即生效：插件与模型目录都是启动时快照的。改完点顶部的「彻底重启」，应用会自动退出并重新打开。
+          安装和移除只改配置，不会立即生效：插件与模型目录都是启动时快照的。改完点上方工具栏的「彻底重启」，应用会自动退出并重新打开。
         </div>
       </footer>
     </div>
