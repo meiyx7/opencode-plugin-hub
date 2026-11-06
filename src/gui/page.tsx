@@ -17,11 +17,8 @@ type Note = { text: string; tone: Tone }
 
 const PAGE = 24
 
-const SOURCE_LABEL: Record<string, string> = {
-  network: "社区目录 · 已更新",
-  cache: "社区目录 · 本地缓存",
-  builtin: "社区目录 · 内置快照",
-}
+const CATALOG_SOURCE_FALLBACK = "https://github.com/awesome-opencode/awesome-opencode"
+const CATALOG_SOURCE_TITLE = "精选目录来自 awesome-opencode 社区维护的 registry.json，不是 OpenCode 官方推荐"
 
 const TYPE_LABEL: Record<string, string> = {
   plugins: "插件",
@@ -70,16 +67,6 @@ function relativeDate(value: string): string {
   if (days < 30) return `${days} 天前`
   if (days < 365) return `${Math.floor(days / 30)} 个月前`
   return `${Math.floor(days / 365)} 年前`
-}
-
-function formatDate(epoch: number): string {
-  if (!epoch) return ""
-  return new Date(epoch).toLocaleString("zh-CN", {
-    month: "2-digit",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-  })
 }
 
 function initial(name: string): string {
@@ -195,7 +182,22 @@ const CSS = `
   font-size: 12px;
   line-height: 1.6;
   color: var(--ph-muted);
-  max-width: 54ch;
+  max-width: 72ch;
+}
+.ph-inline-source {
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--ph-accent);
+  font: inherit;
+  line-height: inherit;
+  cursor: pointer;
+}
+.ph-inline-source:hover { text-decoration: underline; }
+.ph-inline-source:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--ph-accent) 55%, transparent);
+  outline-offset: 2px;
+  border-radius: 2px;
 }
 .ph-path {
   overflow: hidden;
@@ -594,6 +596,26 @@ button.ph-chip:focus-visible,
 .ph-root[data-embedded="true"] {
   max-width: none;
   padding: 0 0 8px;
+}
+/* The host caps "x-large" at 980x600. Give the standalone hub more room and
+   let the dialog be resized from its bottom-right corner, within the window. */
+[data-component="dialog-v2"][data-size="x-large"]:has(.ph-root[data-embedded="true"]) [data-slot="dialog-container"] {
+  width: min(100vw - 48px, 1180px);
+  height: min(100vh - 88px, 780px);
+  min-width: min(100vw - 48px, 720px);
+  min-height: min(100vh - 88px, 480px);
+  max-width: calc(100vw - 24px);
+  max-height: calc(100vh - 24px);
+  resize: both;
+}
+[data-component="dialog-v2"][data-size="x-large"]:has(.ph-detail) [data-slot="dialog-container"] {
+  width: min(100vw - 48px, 1180px);
+  height: min(100vh - 88px, 780px);
+  min-width: min(100vw - 48px, 720px);
+  min-height: min(100vh - 88px, 480px);
+  max-width: calc(100vw - 24px);
+  max-height: calc(100vh - 24px);
+  resize: both;
 }
 .ph-root[data-embedded="true"] .ph-toolbar {
   position: sticky;
@@ -1145,7 +1167,7 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
     return list
   })
 
-  const installable = createMemo(() => visible().filter((entry) => entry.pkg).length)
+  const registryUrl = () => meta()?.registry || CATALOG_SOURCE_FALLBACK
   const outdated = createMemo(() => [...updates().values()].filter((item) => item.hasUpdate).length)
   const bySpec = (spec: string) => updates().get(spec)
   const byPackage = createMemo(() => {
@@ -1496,7 +1518,16 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
             <h2 class="ph-title">插件中心</h2>
           </Show>
           <p class="ph-sub">
-            浏览社区精选、搜索 npm 上的 OpenCode 插件。安装前先看下载量、README 和主页，确认它到底能做什么。
+            浏览{" "}
+            <button
+              type="button"
+              class="ph-inline-source"
+              title={CATALOG_SOURCE_TITLE}
+              onClick={() => void openUrl(registryUrl())}
+            >
+              awesome-opencode
+            </button>{" "}
+            社区维护的精选目录、搜索 npm 上的 OpenCode 插件。安装前先看下载量、README 和主页，确认它到底能做什么。
           </p>
           <div class="ph-path" title={state()?.configPath}>
             配置：<code>{state()?.configPath ?? "读取中…"}</code> · <code>{state()?.configKey ?? "plugins"}[]</code>
@@ -1600,7 +1631,7 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
               <div class="ph-filter-row">
                 <div class="ph-grow">
                   <ui.TextInput
-                    label="筛选社区精选插件"
+                    label="筛选 awesome-opencode 精选插件"
                     placeholder="按名称、描述或标签筛选，例如 memory / auth / token"
                     type="search"
                     value={filter()}
@@ -1627,17 +1658,6 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
                     )}
                   </For>
                 </div>
-              </div>
-              <div class="ph-meta">
-                <span>{SOURCE_LABEL[meta()?.source ?? ""] ?? "加载中…"}</span>
-                <span class="ph-dot" />
-                <span>
-                  {catalog().length} 个条目 · {installable()} 个可安装
-                </span>
-                <Show when={meta()?.fetchedAt}>
-                  <span class="ph-dot" />
-                  <span>更新于 {formatDate(meta()!.fetchedAt)}</span>
-                </Show>
               </div>
             </div>
 
@@ -1785,7 +1805,7 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
                 <div class="ph-empty">
                   <ui.Icon name="extensions" size="large" />
                   <strong>还没有安装插件</strong>
-                  <span>去「精选目录」看看社区推荐，或者在「npm 搜索」里找长尾插件。</span>
+                  <span>去「精选目录」看看 awesome-opencode 的推荐，或者在「npm 搜索」里找长尾插件。</span>
                 </div>
               }
             >
@@ -1809,11 +1829,24 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
 /** The standalone x-large dialog opened from the titlebar pill and the ⌘⌥P shortcut. */
 export function PluginHubDialog(props: { ctx: Context; admin: AdminClient; onClose: () => void }) {
   const ui = props.ctx.ui
+  const openSettings = () => {
+    props.onClose()
+    // Let the dialog unmount before the host swaps in the Settings view.
+    setTimeout(() => props.ctx.layout.settings("hub"), 0)
+  }
   return (
     <ui.Dialog
       title="插件中心"
       size="x-large"
-      footer={<ui.Button onClick={props.onClose}>关闭</ui.Button>}
+      footer={
+        <div class="ph-dialog-footer">
+          <span class="ph-footer-note">拖动右下角可调整大小</span>
+          <ui.Button size="small" variant="ghost" icon="settings-gear" onClick={openSettings}>
+            在设置中打开
+          </ui.Button>
+          <ui.Button size="small" onClick={props.onClose}>关闭</ui.Button>
+        </div>
+      }
     >
       <PluginHubPage ctx={props.ctx} admin={props.admin} embedded />
     </ui.Dialog>

@@ -27,6 +27,8 @@ export interface CatalogResultValue {
   entries: CatalogEntryValue[]
   /** Where the list came from: `network`, `cache` or `builtin`. */
   source: string
+  /** The registry URL the entries came from. */
+  registry: string
   /** Epoch milliseconds of the data, 0 for the built-in snapshot. */
   fetchedAt: number
   error: string
@@ -129,7 +131,7 @@ function toEntries(raw: RawEntry[], installed: Set<string>): CatalogEntryValue[]
   return out
 }
 
-async function fetchRemote(): Promise<RawEntry[]> {
+async function fetchRemote(): Promise<{ entries: RawEntry[]; url: string }> {
   let lastError = ""
   for (const url of SOURCES) {
     try {
@@ -143,7 +145,7 @@ async function fetchRemote(): Promise<RawEntry[]> {
         lastError = "registry 格式不是数组"
         continue
       }
-      return body as RawEntry[]
+      return { entries: body as RawEntry[], url }
     } catch (error) {
       lastError = describe(error)
     }
@@ -153,6 +155,8 @@ async function fetchRemote(): Promise<RawEntry[]> {
 
 interface CacheFile {
   fetchedAt: number
+  /** The source URL that produced this cache. Older caches do not have it. */
+  url?: string
   entries: RawEntry[]
 }
 
@@ -167,11 +171,11 @@ async function readCache(): Promise<CacheFile | undefined> {
   }
 }
 
-async function writeCache(entries: RawEntry[]): Promise<number> {
+async function writeCache(entries: RawEntry[], url: string): Promise<number> {
   const fetchedAt = Date.now()
   try {
     await mkdir(cacheDir(), { recursive: true })
-    await writeFile(cacheFile(), JSON.stringify({ fetchedAt, entries }), "utf8")
+    await writeFile(cacheFile(), JSON.stringify({ fetchedAt, url, entries }), "utf8")
   } catch {
     // A failed cache write still leaves the in-memory result usable.
   }
@@ -186,17 +190,30 @@ export async function browse(installed: Set<string>, force: boolean): Promise<Ca
   const cache = await readCache()
   const fresh = cache !== undefined && Date.now() - cache.fetchedAt < TTL
   if (cache && fresh && !force) {
-    return { entries: toEntries(cache.entries, installed), source: "cache", fetchedAt: cache.fetchedAt, error: "" }
+    return {
+      entries: toEntries(cache.entries, installed),
+      source: "cache",
+      registry: cache.url ?? SOURCES[0]!,
+      fetchedAt: cache.fetchedAt,
+      error: "",
+    }
   }
   try {
     const remote = await fetchRemote()
-    const fetchedAt = await writeCache(remote)
-    return { entries: toEntries(remote, installed), source: "network", fetchedAt, error: "" }
+    const fetchedAt = await writeCache(remote.entries, remote.url)
+    return {
+      entries: toEntries(remote.entries, installed),
+      source: "network",
+      registry: remote.url,
+      fetchedAt,
+      error: "",
+    }
   } catch (error) {
     if (cache) {
       return {
         entries: toEntries(cache.entries, installed),
         source: "cache",
+        registry: cache.url ?? SOURCES[0]!,
         fetchedAt: cache.fetchedAt,
         error: describe(error),
       }
@@ -204,6 +221,7 @@ export async function browse(installed: Set<string>, force: boolean): Promise<Ca
     return {
       entries: toEntries(SNAPSHOT.map(toRaw), installed),
       source: "builtin",
+      registry: SOURCES[0]!,
       fetchedAt: 0,
       error: describe(error),
     }

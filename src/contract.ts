@@ -131,6 +131,8 @@ export const CatalogResult = Schema.Struct({
   entries: Schema.Array(CatalogEntry),
   /** `network`, `cache` or `builtin`. */
   source: Schema.String,
+  /** The registry URL the entries came from. Optional for older cached results. */
+  registry: Schema.optional(Schema.String),
   fetchedAt: Schema.Number,
   error: Schema.String,
 })
