@@ -1,0 +1,63 @@
+{
+  "name": "opencode-plugin-hub",
+  "version": "0.1.0",
+  "description": "Plugin manager for OpenCode Desktop: browse community plugins, search npm, inspect README and downloads, install and update without editing JSON.",
+  "type": "module",
+  "license": "MIT",
+  "author": "meiyx7",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/meiyx7/opencode-plugin-hub.git"
+  },
+  "homepage": "https://github.com/meiyx7/opencode-plugin-hub#readme",
+  "bugs": {
+    "url": "https://github.com/meiyx7/opencode-plugin-hub/issues"
+  },
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "plugin-manager",
+    "plugin-hub",
+    "marketplace",
+    "npm"
+  ],
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "exports": {
+    ".": "./dist/index.js",
+    "./gui-experimental": "./dist/gui-experimental.cjs",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "src",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  },
+  "dependencies": {
+    "@opencode/plugin": "2.2.5",
+    "jsonc-parser": "^3.3.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "esbuild": "^0.28.2",
+    "effect": "4.0.6",
+    "solid-js": "^1.9.5",
+    "typescript": "^5.7.0",
+    "vite": "^7.1.0",
+    "vite-plugin-solid": "^2.11.0"
+  },
+  "scripts": {
+    "build": "vite build && esbuild src/index.ts --bundle --platform=node --format=esm --external:@opencode/plugin --outfile=dist/index.js",
+    "dev": "vite build --watch",
+    "typecheck": "tsc --noEmit",
+    "refresh": "node scripts/refresh-registry.mjs",
+    "prepublishOnly": "npm run typecheck && npm run build"
+  }
+}
