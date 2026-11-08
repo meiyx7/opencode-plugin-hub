@@ -1,6 +1,6 @@
 {
   "name": "opencode-plugin-hub",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "Plugin manager for OpenCode Desktop: browse community plugins, search npm, inspect README and downloads, install and update without editing JSON.",
   "type": "module",
   "license": "MIT",
