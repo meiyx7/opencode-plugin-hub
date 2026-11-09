@@ -1035,7 +1035,9 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
         const result = await props.admin.browse({ force })
         setCatalog([...result.entries])
         setMeta(result)
-        if (result.error) notify(result.error, "error")
+        // A fallback source still shows the full list, so a network miss is a downgrade to note,
+        // not an error to alarm about. Only the stale built-in snapshot is worth a warning.
+        if (result.error) notify(result.error, result.source === "builtin" ? "warning" : "info")
         // Keep the installed view in sync with what the catalog just reported.
         await refresh()
       } catch (error) {

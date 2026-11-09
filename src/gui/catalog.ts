@@ -45,13 +45,30 @@ interface SnapshotEntry {
   tags: string[]
 }
 
+interface Source {
+  url: string
+  /** Extra `Accept` value this source needs. The GitHub contents API only returns the raw file for its raw media type. */
+  accept?: string
+}
+
 /**
- * Two community mirrors of the same curated list. The first is the upstream project; the
- * second is a fork that occasionally carries newer entries, so it only acts as a fallback.
+ * The same curated list, reachable several ways. `raw.githubusercontent.com` is TLS-reset on some
+ * networks (the handshake is dropped with "connection reset by peer") while `api.github.com` stays
+ * reachable, so every repository is offered through both: the CDN first — no rate limit, and it is
+ * the canonical copy — then the contents API as a fallback. The fork occasionally carries newer
+ * entries and only matters when the upstream copies fail.
  */
-const SOURCES = [
-  "https://raw.githubusercontent.com/awesome-opencode/awesome-opencode/main/dist/registry.json",
-  "https://raw.githubusercontent.com/Gracdjd/awesome-opencode/main/dist/registry.json",
+const SOURCES: Source[] = [
+  { url: "https://raw.githubusercontent.com/awesome-opencode/awesome-opencode/main/dist/registry.json" },
+  {
+    url: "https://api.github.com/repos/awesome-opencode/awesome-opencode/contents/dist/registry.json?ref=main",
+    accept: "application/vnd.github.raw+json",
+  },
+  { url: "https://raw.githubusercontent.com/Gracdjd/awesome-opencode/main/dist/registry.json" },
+  {
+    url: "https://api.github.com/repos/Gracdjd/awesome-opencode/contents/dist/registry.json?ref=main",
+    accept: "application/vnd.github.raw+json",
+  },
 ]
 
 /** Re-fetch the remote list at most this often; otherwise the cache wins. */
@@ -133,11 +150,12 @@ function toEntries(raw: RawEntry[], installed: Set<string>): CatalogEntryValue[]
 
 async function fetchRemote(): Promise<{ entries: RawEntry[]; url: string }> {
   let lastError = ""
-  for (const url of SOURCES) {
+  for (const source of SOURCES) {
     try {
-      const response = await fetch(url, { signal: AbortSignal.timeout(12_000), headers: { accept: "application/json" } })
+      const headers: Record<string, string> = { accept: source.accept ?? "application/json" }
+      const response = await fetch(source.url, { signal: AbortSignal.timeout(12_000), headers })
       if (!response.ok) {
-        lastError = `${new URL(url).host} 返回 ${response.status}`
+        lastError = `${new URL(source.url).host} 返回 ${response.status}`
         continue
       }
       const body = (await response.json()) as unknown
@@ -145,7 +163,7 @@ async function fetchRemote(): Promise<{ entries: RawEntry[]; url: string }> {
         lastError = "registry 格式不是数组"
         continue
       }
-      return { entries: body as RawEntry[], url }
+      return { entries: body as RawEntry[], url: source.url }
     } catch (error) {
       lastError = describe(error)
     }
@@ -182,6 +200,9 @@ async function writeCache(entries: RawEntry[], url: string): Promise<number> {
   return fetchedAt
 }
 
+/** The first source's URL, used when a cached payload predates the `url` field. */
+const PRIMARY_URL = SOURCES[0]!.url
+
 /**
  * The curated community list. Network first (cached for half a day), then the cache, then the
  * snapshot baked into this bundle — so the page is never empty, even offline.
@@ -193,7 +214,7 @@ export async function browse(installed: Set<string>, force: boolean): Promise<Ca
     return {
       entries: toEntries(cache.entries, installed),
       source: "cache",
-      registry: cache.url ?? SOURCES[0]!,
+      registry: cache.url ?? PRIMARY_URL,
       fetchedAt: cache.fetchedAt,
       error: "",
     }
@@ -213,7 +234,7 @@ export async function browse(installed: Set<string>, force: boolean): Promise<Ca
       return {
         entries: toEntries(cache.entries, installed),
         source: "cache",
-        registry: cache.url ?? SOURCES[0]!,
+        registry: cache.url ?? PRIMARY_URL,
         fetchedAt: cache.fetchedAt,
         error: describe(error),
       }
@@ -221,7 +242,7 @@ export async function browse(installed: Set<string>, force: boolean): Promise<Ca
     return {
       entries: toEntries(SNAPSHOT.map(toRaw), installed),
       source: "builtin",
-      registry: SOURCES[0]!,
+      registry: PRIMARY_URL,
       fetchedAt: 0,
       error: describe(error),
     }
@@ -240,6 +261,14 @@ function toRaw(entry: SnapshotEntry): RawEntry {
 }
 
 function describe(error: unknown): string {
-  if (error instanceof Error) return error.message
-  return String(error)
+  const message = error instanceof Error ? error.message : String(error)
+  // `fetch failed` is undici's wrapper for every socket-level failure; on its own it says nothing
+  // about what to do. Name the likely causes so the notice is actionable instead of alarming.
+  if (/fetch failed|network|ECONNRESET|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|socket hang up/i.test(message)) {
+    return "无法连接插件目录（网络受限或连接被重置），已改用本地缓存"
+  }
+  if (/aborted|timeout/i.test(message)) {
+    return "连接插件目录超时，已改用本地缓存"
+  }
+  return message
 }
