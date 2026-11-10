@@ -58,6 +58,6 @@
     "dev": "vite build --watch",
     "typecheck": "tsc --noEmit",
     "refresh": "node scripts/refresh-registry.mjs",
-    "prepublishOnly": "npm run typecheck && npm run build"
+    "prepublishOnly": "node scripts/ensure-ci-publish.mjs && npm run typecheck && npm run build"
   }
 }
