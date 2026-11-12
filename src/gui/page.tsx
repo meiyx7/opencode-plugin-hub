@@ -10,6 +10,7 @@ type CatalogEntry = Awaited<ReturnType<AdminClient["browse"]>>["entries"][number
 type CatalogResult = Awaited<ReturnType<AdminClient["browse"]>>
 type UpdateInfo = Awaited<ReturnType<AdminClient["updates"]>>["items"][number]
 type PackageDetail = Awaited<ReturnType<AdminClient["detail"]>>
+type RuntimeInfo = Awaited<ReturnType<AdminClient["runtime"]>>["items"][number]
 
 type Tab = "catalog" | "search" | "installed"
 type Tone = "info" | "success" | "warning" | "error"
@@ -46,8 +47,16 @@ const SUGGESTIONS = ["qoder", "notify", "memory", "auth", "usage", "theme", "mcp
 const COMPACT = new Intl.NumberFormat("zh-CN", { notation: "compact", maximumFractionDigits: 1 })
 
 function formatCount(value: number): string {
+  // -1 marks "the download API could not be asked": unknown, never rendered as 0.
+  if (value < 0) return "—"
   if (!Number.isFinite(value) || value <= 0) return "0"
   return COMPACT.format(value)
+}
+
+/** The count is genuinely unknown (API failed), so the tooltip must not claim a number. */
+function countTitle(value: number, kind: string): string | undefined {
+  if (value < 0) return `${kind}暂不可用`
+  return `${kind} ${value.toLocaleString()} 次`
 }
 
 function formatBytes(value: number): string {
@@ -513,6 +522,18 @@ const CSS = `
   border-color: color-mix(in srgb, var(--ph-danger) 30%, transparent);
   background: color-mix(in srgb, var(--ph-danger) 9%, transparent);
 }
+/* 运行状态徽章：加载成功用成功色，失败用危险色，待重启/未知保持中性——
+   待生效不是错误，不能一进列表就满屏红色。 */
+.ph-badge[data-runtime="loaded"] {
+  color: var(--ph-success);
+  border-color: color-mix(in srgb, var(--ph-success) 30%, transparent);
+  background: color-mix(in srgb, var(--ph-success) 9%, transparent);
+}
+.ph-badge[data-runtime="failed"] {
+  color: var(--ph-danger);
+  border-color: color-mix(in srgb, var(--ph-danger) 30%, transparent);
+  background: color-mix(in srgb, var(--ph-danger) 9%, transparent);
+}
 .ph-chips { display: flex; align-items: center; gap: 4px; flex-wrap: wrap; }
 .ph-chip {
   display: inline-flex;
@@ -860,11 +881,11 @@ function DetailDialog(props: DetailDialogProps) {
           <Show when={data()!.version}>
             <div class="ph-detail-stats">
               <div class="ph-detail-stat">
-                <b title={`${data()!.weekly.toLocaleString()} 次`}>{formatCount(data()!.weekly)}</b>
+                <b title={countTitle(data()!.weekly, "周下载")}>{formatCount(data()!.weekly)}</b>
                 <span>周下载</span>
               </div>
               <div class="ph-detail-stat">
-                <b title={`${data()!.monthly.toLocaleString()} 次`}>{formatCount(data()!.monthly)}</b>
+                <b title={countTitle(data()!.monthly, "月下载")}>{formatCount(data()!.monthly)}</b>
                 <span>月下载</span>
               </div>
               <div class="ph-detail-stat">
@@ -982,6 +1003,26 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
   const [updates, setUpdates] = createSignal<Map<string, UpdateInfo>>(new Map())
   const [checked, setChecked] = createSignal(false)
   const [staleOnly, setStaleOnly] = createSignal(false)
+  // 运行事实（服务端已加载/失败/未知），与“已在配置中”分开表达。
+  const [runtime, setRuntime] = createSignal<Map<string, RuntimeInfo>>(new Map())
+  const [runtimeError, setRuntimeError] = createSignal("")
+  /** 配置与上一次已知运行状态不一致的条目数：安装/移除后等待重启生效的数量。 */
+  const pendingCount = createMemo(() => {
+    const map = runtime()
+    if (map.size === 0) return 0 // 从未拿到过运行事实：不虚构“待生效”数量
+    return (state()?.plugins ?? []).filter((entry) => {
+      const info = map.get(entry.spec)
+      // unknown：服务端已应答但没加载它；info 缺失：刚改过配置，尚未重新读取。
+      // failed 是“已加载但报错”，不算等待重启。
+      return !info || info.status === "unknown"
+    }).length
+  })
+  /**
+   * 待生效状态栏只在拿到过运行事实、且确有配置项与运行事实不一致时出现。
+   * 服务端读不到（旧版本后台）时显示未知，不显示虚构的“全部已生效”。
+   */
+  const hasPendingChanges = () => runtime().size > 0 && pendingCount() > 0
+  const pendingChangesCount = () => pendingCount()
 
   const [busyKeys, setBusyKeys] = createSignal<ReadonlySet<string>>(new Set())
   const [note, setNote] = createSignal<Note>()
@@ -1016,6 +1057,21 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
     }
   }
 
+  /** 读取服务端运行事实；读不到时保留 unknown，不假装全部已加载。 */
+  const loadRuntime = async () => {
+    try {
+      const result = await props.admin.runtime()
+      const map = new Map<string, RuntimeInfo>()
+      for (const item of result.items) map.set(item.spec, item)
+      setRuntime(map)
+      setRuntimeError(result.error)
+    } catch (error) {
+      // Older running builds have no runtime method: keep the honest unknown state.
+      setRuntime(new Map())
+      setRuntimeError((state()) ? readableError(error) : "")
+    }
+  }
+
   /** Fills the update map: keyed by config spec, so directory plugins match their own row. */
   const checkUpdates = async (silent = false) => {
     await track("updates", async () => {
@@ -1024,7 +1080,8 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
         const map = new Map<string, UpdateInfo>()
         for (const item of result.items) map.set(item.spec, item)
         setUpdates(map)
-        setChecked(true)
+        // 整体失败时 items 为空：这不是“检查完成、全部最新”，不能标记为已检查。
+        setChecked(result.error === "" && result.items.length > 0)
         if (silent) return
         const stale = result.items.filter((item) => item.hasUpdate).length
         const failed = result.items.filter((item) => item.error).length
@@ -1032,10 +1089,10 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
         const message = result.error
           ? result.error
           : failed > 0
-            ? `${failed} 个插件未能检查（registry 连接失败），其余${stale > 0 ? `有 ${stale} 个可更新` : "已是最新"}`
+            ? `${failed} 个插件未能检查（registry 连接失败）${stale > 0 ? `，其余 ${stale} 个可更新` : ""}`
             : stale > 0
               ? `发现 ${stale} 个可更新的插件`
-              : "全部已是最新版本"
+              : "已检查的插件均为最新版本"
         notify(
           message,
           result.error ? "error" : failed > 0 ? "warning" : stale > 0 ? "info" : "success",
@@ -1065,13 +1122,17 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
 
   const runSearch = async (text: string) => {
     setQuery(text)
+    // 只接受最后一次请求的结果：较早的关键词晚返回时不得覆盖新结果。
+    const seq = ++searchSeq
     await track("search", async () => {
       try {
         const result = await props.admin.search({ query: text })
+        if (seq !== searchSeq) return
         setHits(result.hits)
         setSearched(true)
         if (result.error) notify(result.error, "error")
       } catch (error) {
+        if (seq !== searchSeq) return
         notify(readableError(error), "error")
       }
     })
@@ -1080,11 +1141,16 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
   /** 输入防抖 450ms 自动搜索；同一个词不重复请求。 */
   let searchTimer: number | undefined
   let lastSearch = ""
+  let searchSeq = 0
   const scheduleSearch = (text: string) => {
     setQuery(text)
     if (searchTimer) window.clearTimeout(searchTimer)
     const trimmed = text.trim()
-    if (!trimmed) return
+    if (!trimmed) {
+      // 清空即失效：排队中的旧结果不允许再回填。
+      searchSeq += 1
+      return
+    }
     searchTimer = window.setTimeout(() => {
       if (trimmed === lastSearch) return
       lastSearch = trimmed
@@ -1101,7 +1167,7 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
           notify(result.message, "error")
           return
         }
-        notify(`${result.message}。点右上角「更多操作 → 彻底重启 OpenCode」后生效`, "success")
+        notify(`${result.message}。配置需重启后生效：点「彻底重启 OpenCode」完成加载`, "success")
         const latest = version || hits().find((hit) => hit.name === name)?.version || ""
         setCatalog((prev) => prev.map((entry) => (entry.pkg === name ? { ...entry, installed: true } : entry)))
         setHits((prev) =>
@@ -1109,7 +1175,10 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
             hit.name === name ? { ...hit, installed: true, current: latest, hasUpdate: false } : hit,
           ),
         )
+        // 配置变了：之前的运行事实已过期，重新读取；新 spec 在服务端列表里
+        // 出现之前，卡片会如实显示“待重启生效”。
         await checkUpdates(true)
+        void loadRuntime()
       } catch (error) {
         notify(readableError(error), "error")
       }
@@ -1132,7 +1201,7 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
           notify(result.message, "error")
           return
         }
-        notify(`${result.message}。点右上角「更多操作 → 彻底重启 OpenCode」后生效`, "success")
+        notify(`${result.message}。配置需重启后生效：点「彻底重启 OpenCode」完成移除`, "success")
         setCatalog((prev) =>
           prev.map((item) => (item.pkg === entry.name ? { ...item, installed: false } : item)),
         )
@@ -1146,6 +1215,7 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
           next.delete(entry.spec)
           return next
         })
+        void loadRuntime()
       } catch (error) {
         notify(readableError(error), "error")
       }
@@ -1254,7 +1324,7 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
 
   const sortedHits = createMemo(() => {
     const list = [...hits()]
-    if (sort() === "downloads") list.sort((a, b) => b.weekly - a.weekly)
+    if (sort() === "downloads") list.sort((a, b) => b.weekly - a.weekly) // -1 (unknown) sinks to the end
     else if (sort() === "recent") list.sort((a, b) => (b.published || "").localeCompare(a.published || ""))
     return list
   })
@@ -1267,6 +1337,8 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
 
   const registryUrl = () => meta()?.registry || CATALOG_SOURCE_FALLBACK
   const outdated = createMemo(() => [...updates().values()].filter((item) => item.hasUpdate).length)
+  // 未能检查的条目数：失败不能被总结成“全部已是最新”。
+  const uncheckedCount = createMemo(() => [...updates().values()].filter((item) => item.error).length)
   const visiblePlugins = createMemo(() => {
     const plugins = state()?.plugins ?? []
     if (!staleOnly()) return plugins
@@ -1292,10 +1364,28 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
     void refresh()
     void loadCatalog(false)
     void checkUpdates(true)
+    void loadRuntime()
   })
 
   const tabButton = (id: Tab, label: string, icon: IconName, count?: number | string, alert?: number) => (
-    <button class="ph-tab" data-active={tab() === id} onClick={() => switchTab(id)}>
+    <button
+      class="ph-tab"
+      role="tab"
+      id={`ph-tab-${id}`}
+      aria-selected={tab() === id}
+      aria-controls="ph-tabpanel"
+      data-active={tab() === id}
+      onClick={() => switchTab(id)}
+      onKeyDown={(event) => {
+        // 左右方向键在页签间移动，符合 tablist 的键盘约定。
+        if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return
+        event.preventDefault()
+        const order: Tab[] = ["catalog", "search", "installed"]
+        const index = order.indexOf(tab())
+        const next = event.key === "ArrowRight" ? (index + 1) % order.length : (index + order.length - 1) % order.length
+        switchTab(order[next]!)
+      }}
+    >
       <ui.Icon name={icon} size="small" />
       {label}
       <Show when={count !== undefined && count !== ""}>
@@ -1478,12 +1568,12 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
           >
             <div class="ph-desc ph-clamp">{hit.description || "—"}</div>
             <div class="ph-meta">
-              <span title={`周下载 ${hit.weekly.toLocaleString()} 次`}>
+              <span title={countTitle(hit.weekly, "周下载")}>
                 <ui.Icon name="download" size="small" />
                 {formatCount(hit.weekly)}/周
               </span>
               <span class="ph-dot" />
-              <span title={`月下载 ${hit.monthly.toLocaleString()} 次`}>{formatCount(hit.monthly)}/月</span>
+              <span title={countTitle(hit.monthly, "月下载")}>{formatCount(hit.monthly)}/月</span>
               <Show when={hit.publisher}>
                 <span class="ph-dot" />
                 <span>by {hit.publisher}</span>
@@ -1552,6 +1642,26 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
     const busy = () => isBusy(`install:${entry.name}`)
     const current = () => info()?.current || entry.version
     const unchecked = () => (info()?.error ?? "") !== ""
+    // 运行事实：服务端已加载 / 加载失败 / 未知（没拿到运行信息或刚改过配置）。
+    const runtimeInfo = () => runtime().get(entry.spec)
+    const runtimeStatus = () => {
+      const info = runtimeInfo()
+      if (!info) return runtimeError() ? "unknown" : "pending"
+      if (info.status === "failed") return "failed"
+      if (info.status === "loaded") return "loaded"
+      // 服务端已应答但列表里没有：配置已写入、尚未被加载；应答不可用才是真正的“未验证”。
+      return info.available ? "pending" : "unknown"
+    }
+    const runtimeLabel = () =>
+      runtimeStatus() === "loaded"
+        ? runtimeInfo()!.runtimeVersion
+          ? `运行中 v${runtimeInfo()!.runtimeVersion}`
+          : "运行中"
+        : runtimeStatus() === "failed"
+          ? "加载失败"
+          : runtimeStatus() === "pending"
+            ? "待重启生效"
+            : "运行状态未验证"
     return (
       <article class="ph-card" data-stale={stale() ? "true" : undefined} data-busy={busy() ? "true" : undefined}>
         <div class="ph-card-main">
@@ -1564,6 +1674,9 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
               <span class="ph-pkg">{entry.spec}</span>
             </div>
             <div class="ph-chips">
+              <span class="ph-badge" data-runtime={runtimeStatus()} title={runtimeLabel()}>
+                {runtimeLabel()}
+              </span>
               <Show when={stale()}>
                 <span class="ph-badge" data-tone="accent">
                   可更新 → v{info()!.latest}
@@ -1676,6 +1789,23 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
           </div>
         </Show>
 
+        {/* 待生效变更常驻在工具栏上方，直到重启完成；不能只在安装后提示一次。 */}
+        <Show when={runtimeError()}>
+          <div class="ph-notice" data-tone="warning">
+            <ui.Icon name="circle-exclamation" size="small" />
+            <span>{runtimeError()}。重启后重新打开插件中心会再读取。</span>
+          </div>
+        </Show>
+        <Show when={hasPendingChanges()}>
+          <div class="ph-notice" data-tone="info">
+            <ui.Icon name="outline-rotate-clockwise" size="small" />
+            <span>有 {pendingChangesCount()} 项配置变更待重启生效。插件在应用启动时加载，重启后才能运行新配置。</span>
+            <ui.Button size="small" variant="ghost" icon="outline-rotate-clockwise" onClick={() => void restartApp()}>
+              彻底重启 OpenCode
+            </ui.Button>
+          </div>
+        </Show>
+
         <div class="ph-toolbar">
         <div class="ph-tabs" role="tablist">
           {tabButton("catalog", "精选目录", "extensions", meta() ? catalog().length : undefined)}
@@ -1705,6 +1835,7 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
                 setSearched(false)
                 setQuery("")
                 setNote(undefined)
+                searchSeq += 1 // 丢弃仍在路上的搜索结果
               }}
             >
               清空
@@ -1749,7 +1880,7 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
 
       <Switch>
         <Match when={tab() === "catalog"}>
-          <section class="ph-panel">
+          <section class="ph-panel" role="tabpanel" id="ph-tabpanel" aria-labelledby={`ph-tab-${tab()}`}>
             <div class="ph-filters">
               <div class="ph-filter-row">
                 <div class="ph-grow">
@@ -1825,7 +1956,7 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
         </Match>
 
         <Match when={tab() === "search"}>
-          <section class="ph-panel">
+          <section class="ph-panel" role="tabpanel" id="ph-tabpanel" aria-labelledby={`ph-tab-${tab()}`}>
             <div class="ph-searchbar">
               <div class="ph-grow">
                 <ui.TextInput
@@ -1924,7 +2055,7 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
         </Match>
 
         <Match when={tab() === "installed"}>
-          <section class="ph-panel">
+          <section class="ph-panel" role="tabpanel" id="ph-tabpanel" aria-labelledby={`ph-tab-${tab()}`}>
             <div class="ph-resultbar">
               <h3 class="ph-h3">
                 已安装 <span class="ph-count">{state()?.plugins.length ?? 0}</span>
@@ -1946,7 +2077,11 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
               <span class="ph-spacer" />
               <Show when={checked()}>
                 <span class="ph-meta">
-                  检查过 npm registry{outdated() > 0 ? ` · ${outdated()} 个可更新` : " · 全部已是最新"}
+                  {uncheckedCount() > 0
+                    ? `已检查 ${Math.max(0, (state()?.plugins.length ?? 0) - uncheckedCount())} 个 · ${uncheckedCount()} 个未能检查${outdated() > 0 ? ` · ${outdated()} 个可更新` : ""}`
+                    : outdated() > 0
+                      ? `检查过 npm registry · ${outdated()} 个可更新`
+                      : "检查过 npm registry · 已检查的插件均为最新"}
                 </span>
               </Show>
             </div>
@@ -1965,8 +2100,18 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
                 fallback={
                   <div class="ph-empty">
                     <ui.Icon name="checklist" size="large" />
-                    <strong>没有可更新的插件</strong>
-                    <span>已安装的插件都已是最新版本。点工具栏的「检查更新」可以再查一次。</span>
+                    <Show
+                      when={uncheckedCount() > 0}
+                      fallback={
+                        <>
+                          <strong>没有可更新的插件</strong>
+                          <span>已检查的插件都已是最新版本。点工具栏的「检查更新」可以再查一次。</span>
+                        </>
+                      }
+                    >
+                      <strong>有 {uncheckedCount()} 个插件未能检查</strong>
+                      <span>部分插件没能连上 npm registry，不能当作“已是最新”。点工具栏的「检查更新」重试。</span>
+                    </Show>
                     <ui.Button variant="ghost" size="small" onClick={() => setStaleOnly(false)}>
                       显示全部
                     </ui.Button>

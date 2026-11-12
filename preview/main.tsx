@@ -95,6 +95,7 @@ const ctx = {
         { spec: "opencode-plugin-hub", name: "opencode-plugin-hub", kind: "package", current: "0.1.4", latest: "0.1.4", hasUpdate: false, managed: true, error: "" },
         { spec: "opencode-usage-center", name: "opencode-usage-center", kind: "package", current: "0.2.0", latest: "0.2.1", hasUpdate: true, managed: true, error: "" },
         { spec: "opencode-qoder-bridge", name: "opencode-qoder-bridge", kind: "package", current: "0.3.2", latest: "0.3.3", hasUpdate: true, managed: true, error: "" },
+        { spec: "/local/dev-plugin", name: "dev-plugin", kind: "path", current: "1.0.0", latest: "", hasUpdate: false, managed: false, error: "无法连接 npm registry，本次未检查" },
       ],
       error: "",
     }),
@@ -188,6 +189,18 @@ const ctx = {
     remove: async () => ({ ok: false, message: "预览模式不执行移除", state: fakeState }),
     reload: async () => ({ ok: true, message: "预览模式", state: fakeState }),
     restart: async () => ({ ok: false }),
+    // 预览里展示运行状态徽章：一条已加载、一条未知，用于核对 UI 呈现。
+    runtime: async () => ({
+      items: fakeState.plugins.map((entry, index) => ({
+        spec: entry.spec,
+        name: entry.name,
+        status: index === 0 ? "loaded" : "unknown",
+        runtimeVersion: index === 0 ? entry.version : "",
+        error: "",
+        available: true,
+      })),
+      error: "",
+    }),
   }),
   ui: { Button, Icon, IconButton, Tooltip, Loader, Menu, TextInput, Markdown, Dialog },
   dialogs: {

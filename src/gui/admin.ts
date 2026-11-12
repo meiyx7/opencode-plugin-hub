@@ -1,7 +1,7 @@
 import { spawn } from "node:child_process"
 import { homedir, tmpdir } from "node:os"
 import { basename, join } from "node:path"
-import { copyFile, cp, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises"
+import { copyFile, cp, mkdir, mkdtemp, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises"
 import { applyEdits, modify, parse, type ParseError } from "jsonc-parser"
 
 export interface InstalledEntryValue {
@@ -58,7 +58,9 @@ export interface PackageDetailValue {
   license: string
   keywords: string[]
   maintainers: string[]
+  /** Weekly downloads; `-1` when the download API could not be asked (unknown, not zero). */
   weekly: number
+  /** Monthly downloads; `-1` when the download API could not be asked (unknown, not zero). */
   monthly: number
   published: string
   created: string
@@ -379,13 +381,40 @@ export async function updates(): Promise<UpdatesResultValue> {
 /**
  * Edits one value in place, so the user's comments, ordering and indentation survive on every other line.
  * `path` is a jsonc path such as `["plugins", 2]`.
+ *
+ * All config mutations funnel through this function while holding a module-level
+ * queue: two overlapping edits (two cards, or the settings page and the dialog)
+ * each re-read the file inside their turn, so neither clobbers the other.
+ * Writes land via tmp-file + rename so a crash cannot leave a half-written config.
  */
+let configQueue: Promise<unknown> = Promise.resolve()
+function enqueue<T>(task: () => Promise<T>): Promise<T> {
+  const next = configQueue.then(task, task)
+  configQueue = next.catch(() => undefined)
+  return next
+}
+
 async function applyEdit(file: ConfigFile, path: (string | number)[], value: unknown): Promise<HubStateValue> {
-  const text = file.text.trim().length > 0 ? file.text : "{}\n"
-  const options = { formattingOptions: { insertSpaces: true, tabSize: 2, eol: "\n" } }
-  const edits = modify(text, path, value, options)
-  await writeFile(file.path, applyEdits(text, edits), "utf8")
-  return snapshot()
+  return enqueue(async () => {
+    // Re-read inside the queue: the file may have changed since the caller read it.
+    const fresh = await readConfig()
+    const text = fresh.text.trim().length > 0 ? fresh.text : "{}\n"
+    const options = { formattingOptions: { insertSpaces: true, tabSize: 2, eol: "\n" } }
+    const edits = modify(text, path, value, options)
+    await atomicWrite(fresh.path, applyEdits(text, edits))
+    return snapshot()
+  })
+}
+
+/** Write via a temp file in the same directory, then rename over the target (atomic on the same volume). */
+async function atomicWrite(path: string, text: string): Promise<void> {
+  const tmp = `${path}.plugin-hub-${process.pid}-${Date.now()}.tmp`
+  try {
+    await writeFile(tmp, text, "utf8")
+    await rename(tmp, path)
+  } finally {
+    await rm(tmp, { force: true }).catch(() => undefined)
+  }
 }
 
 /** Index of the entry that owns `name`, matching either the raw name or a directory's package.json name. */
@@ -530,7 +559,9 @@ export async function install(spec: string, version: string): Promise<MutationVa
     // A directory plugin cannot be updated by editing the config: its files have to be replaced.
     if (index >= 0 && splitSpec(file.plugins[index]!).kind === "path") {
       const dir = expandPath(file.plugins[index]!)
-      const result = await refreshDirectory(dir, name, version.trim())
+      // The directory refresh rewrites files, not the config — still run it
+      // through the queue so it cannot interleave with a config edit.
+      const result = await enqueue(() => refreshDirectory(dir, name, version.trim()))
       return { ok: result.ok, message: result.message, state: await snapshot() }
     }
 
@@ -676,17 +707,18 @@ function trimReadme(raw: string): { text: string; truncated: boolean } {
   return { text: `${text}\n\n…`, truncated: true }
 }
 
+/** `-1` means the download API could not be asked: the UI must show 暂不可用, not 0. */
 async function loadDownloads(name: string, period: "last-week" | "last-month"): Promise<number> {
   try {
     const response = await fetch(`${NPM_API}/downloads/point/${period}/${encodeURIComponent(name)}`, {
       signal: AbortSignal.timeout(8_000),
       headers: { accept: "application/json" },
     })
-    if (!response.ok) return 0
+    if (!response.ok) return -1
     const body = (await response.json()) as { downloads?: number }
     return Number(body.downloads ?? 0) || 0
   } catch {
-    return 0
+    return -1
   }
 }
 
@@ -996,6 +1028,92 @@ export async function reload(argv: readonly string[]): Promise<MutationValue> {
   } catch (error) {
     return { ok: false, message: describe(error), state }
   }
+}
+
+/** One configured plugin's runtime truth, as the running server reports it. */
+export interface RuntimeInfoValue {
+  spec: string
+  name: string
+  status: "loaded" | "failed" | "unknown"
+  runtimeVersion: string
+  error: string
+  available: boolean
+}
+
+export interface RuntimeResultValue {
+  items: RuntimeInfoValue[]
+  error: string
+}
+
+interface PluginListInfo {
+  source?:
+    | { type: "builtin" }
+    | { type: "package"; target?: string; version?: string; outdated?: true; updating?: true }
+    | { type: "local"; path?: string }
+    | { type: "sdk" }
+  state?: { status: "active" } | { status: "failed"; error?: string }
+}
+
+/**
+ * Cross-references the config with the server's running plugin list, so the UI
+ * can tell 已配置待生效 from 已加载. Best effort: when the server cannot be
+ * asked, every item stays "unknown" instead of pretending to know.
+ */
+export async function runtime(endpoint: { url: string; headers: Readonly<Record<string, string>> } | undefined): Promise<RuntimeResultValue> {
+  const state = await snapshot()
+  if (!endpoint) return { items: state.plugins.map(toUnknown), error: "无法连接后台服务，运行状态未知" }
+  try {
+    const response = await fetch(`${endpoint.url.replace(/\/$/, "")}/plugin`, {
+      signal: AbortSignal.timeout(8_000),
+      headers: { accept: "application/json", ...endpoint.headers },
+    })
+    if (!response.ok) {
+      return { items: state.plugins.map(toUnknown), error: `后台服务返回 ${response.status}，运行状态未知` }
+    }
+    const body = (await response.json()) as { data?: PluginListInfo[] } | PluginListInfo[]
+    const list = Array.isArray(body) ? body : body.data ?? []
+    const items = state.plugins.map((entry) => {
+      // The server reports the source target; the config holds the spec (name, name@range or a path).
+      const name = splitSpec(entry.spec).name
+      const loaded = list.find((info) => {
+        const source = info.source
+        if (!source) return false
+        if (source.type === "package" && typeof source.target === "string") {
+          return splitSpec(source.target).name === name
+        }
+        if (source.type === "local" && entry.kind === "path") {
+          return source.path === expandPath(entry.spec)
+        }
+        return false
+      })
+      // Only the fields in RuntimeInfo cross the IPC boundary; config details stay on this side.
+      const base = { spec: entry.spec, name: entry.name }
+      if (!loaded) return { ...base, status: "unknown" as const, runtimeVersion: "", error: "", available: true }
+      if (loaded.state?.status === "failed") {
+        return {
+          ...base,
+          status: "failed" as const,
+          runtimeVersion: "",
+          error: loaded.state.error ?? "加载失败",
+          available: true,
+        }
+      }
+      return {
+        ...base,
+        status: "loaded" as const,
+        runtimeVersion: loaded.source?.type === "package" ? (loaded.source.version ?? "") : entry.version,
+        error: "",
+        available: true,
+      }
+    })
+    return { items, error: "" }
+  } catch (error) {
+    return { items: state.plugins.map(toUnknown), error: `无法读取运行状态：${describe(error)}` }
+  }
+}
+
+function toUnknown(entry: InstalledEntryValue): RuntimeInfoValue {
+  return { spec: entry.spec, name: entry.name, status: "unknown", runtimeVersion: "", error: "", available: false }
 }
 
 function describe(error: unknown): string {

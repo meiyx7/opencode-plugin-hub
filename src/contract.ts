@@ -65,7 +65,9 @@ export const PackageDetail = Schema.Struct({
   license: Schema.String,
   keywords: Schema.Array(Schema.String),
   maintainers: Schema.Array(Schema.String),
+  /** Weekly downloads; `-1` when the download API could not be asked. */
   weekly: Schema.Number,
+  /** Monthly downloads; `-1` when the download API could not be asked. */
   monthly: Schema.Number,
   /** Publish date of the latest version, ISO 8601. */
   published: Schema.String,
@@ -156,6 +158,25 @@ export const Mutation = Schema.Struct({
   state: HubState,
 })
 
+/** One configured plugin's runtime truth as the running server reports it. */
+export const RuntimeInfo = Schema.Struct({
+  spec: Schema.String,
+  name: Schema.String,
+  /** "loaded" (server runs it), "failed" (server reports an error) or "unknown" (no runtime answer). */
+  status: Schema.Union([Schema.Literal("loaded"), Schema.Literal("failed"), Schema.Literal("unknown")]),
+  /** Version the running server loaded, empty when unknown. */
+  runtimeVersion: Schema.String,
+  /** The server's failure message for a plugin that failed to load. */
+  error: Schema.String,
+  /** True when the server itself could not be asked; per-plugin status stays "unknown". */
+  available: Schema.Boolean,
+})
+
+export const RuntimeResult = Schema.Struct({
+  items: Schema.Array(RuntimeInfo),
+  error: Schema.String,
+})
+
 export const Target = Schema.Struct({
   spec: Schema.String,
   version: Schema.String,
@@ -184,5 +205,6 @@ export const Admin = Ipc.define({
     remove: { input: Target, output: Mutation },
     reload: { output: Mutation },
     restart: { output: Opened },
+    runtime: { output: RuntimeResult },
   },
 })
