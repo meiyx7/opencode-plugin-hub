@@ -1,4 +1,4 @@
-import { createMemo, createSignal, For, onMount, Show, Switch, Match } from "solid-js"
+import { createEffect, createMemo, createSignal, For, onMount, Show, Switch, Match } from "solid-js"
 import type { Context, IconName, IpcClient } from "@opencode/plugin/gui"
 import type { Admin } from "../contract"
 
@@ -241,6 +241,21 @@ const CSS = `
   background: color-mix(in srgb, var(--ph-warning) 7%, transparent);
 }
 .ph-notice span { flex: 1; min-width: 0; }
+.ph-notice-close {
+  flex: 0 0 auto;
+  display: grid;
+  place-items: center;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: inherit;
+  opacity: 0.55;
+  cursor: pointer;
+}
+.ph-notice-close:hover { opacity: 1; background: color-mix(in srgb, currentColor 10%, transparent); }
 
 /* toolbar and tabs */
 .ph-toolbar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
@@ -961,6 +976,8 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
   const [query, setQuery] = createSignal("")
   const [searched, setSearched] = createSignal(false)
   const [sort, setSort] = createSignal<Sort>("relevance")
+  /** 搜索结果分批渲染：50 张卡一次挂载会拖慢首屏。 */
+  const [hitLimit, setHitLimit] = createSignal(12)
 
   const [updates, setUpdates] = createSignal<Map<string, UpdateInfo>>(new Map())
   const [checked, setChecked] = createSignal(false)
@@ -1060,6 +1077,21 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
     })
   }
 
+  /** 输入防抖 450ms 自动搜索；同一个词不重复请求。 */
+  let searchTimer: number | undefined
+  let lastSearch = ""
+  const scheduleSearch = (text: string) => {
+    setQuery(text)
+    if (searchTimer) window.clearTimeout(searchTimer)
+    const trimmed = text.trim()
+    if (!trimmed) return
+    searchTimer = window.setTimeout(() => {
+      if (trimmed === lastSearch) return
+      lastSearch = trimmed
+      void runSearch(trimmed)
+    }, 450)
+  }
+
   const install = async (name: string, version = "") => {
     await track(`install:${name}`, async () => {
       try {
@@ -1069,7 +1101,7 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
           notify(result.message, "error")
           return
         }
-        notify(`${result.message}。点工具栏的「彻底重启」后生效`, "success")
+        notify(`${result.message}。点右上角「更多操作 → 彻底重启 OpenCode」后生效`, "success")
         const latest = version || hits().find((hit) => hit.name === name)?.version || ""
         setCatalog((prev) => prev.map((entry) => (entry.pkg === name ? { ...entry, installed: true } : entry)))
         setHits((prev) =>
@@ -1100,7 +1132,7 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
           notify(result.message, "error")
           return
         }
-        notify(`${result.message}。点工具栏的「彻底重启」后生效`, "success")
+        notify(`${result.message}。点右上角「更多操作 → 彻底重启 OpenCode」后生效`, "success")
         setCatalog((prev) =>
           prev.map((item) => (item.pkg === entry.name ? { ...item, installed: false } : item)),
         )
@@ -1226,6 +1258,12 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
     else if (sort() === "recent") list.sort((a, b) => (b.published || "").localeCompare(a.published || ""))
     return list
   })
+  const visibleHits = createMemo(() => sortedHits().slice(0, hitLimit()))
+  // 结果集合变化（新搜索、清空）后回到首批；副作用放在 createEffect 而不是 memo 里。
+  createEffect(() => {
+    void hits()
+    setHitLimit(12)
+  })
 
   const registryUrl = () => meta()?.registry || CATALOG_SOURCE_FALLBACK
   const outdated = createMemo(() => [...updates().values()].filter((item) => item.hasUpdate).length)
@@ -1250,6 +1288,7 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
   }
 
   onMount(() => {
+    // refresh 先行保证「已安装」不依赖目录拉取的成败；loadCatalog 成功后还会再同步一次。
     void refresh()
     void loadCatalog(false)
     void checkUpdates(true)
@@ -1624,6 +1663,9 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
           <div class="ph-notice" data-tone={note()!.tone}>
             <ui.Icon name={noteIcon(note()!.tone)} size="small" />
             <span>{note()!.text}</span>
+            <button type="button" class="ph-notice-close" aria-label="关闭提示" onClick={() => setNote(undefined)}>
+              <ui.Icon name="close" size="small" />
+            </button>
           </div>
         </Show>
 
@@ -1641,33 +1683,6 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
           {tabButton("installed", "已安装", "checklist", state()?.plugins.length ?? 0, outdated())}
         </div>
         <span class="ph-spacer" />
-        <ui.Button
-          variant="ghost"
-          size="small"
-          icon="open-file"
-          busy={isBusy("config")}
-          onClick={() => void openConfig()}
-        >
-          打开配置
-        </ui.Button>
-        <ui.Button
-          variant="ghost"
-          size="small"
-          icon="refresh"
-          busy={isBusy("reload")}
-          onClick={() => void reload()}
-        >
-          重载配置
-        </ui.Button>
-        <ui.Button
-          variant="neutral"
-          size="small"
-          icon="outline-rotate-clockwise"
-          busy={isBusy("restart")}
-          onClick={() => void restartApp()}
-        >
-          彻底重启
-        </ui.Button>
         <Show when={tab() === "catalog"}>
           <ui.Button
             variant="ghost"
@@ -1707,6 +1722,28 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
             检查更新
           </ui.Button>
           </Show>
+        {/* 低频管理操作收进溢出菜单，工具栏只留当前任务需要的动作 */}
+        <ui.Menu
+          label="更多操作"
+          icon="outline-dots"
+          placement="bottom-end"
+          items={[
+            {
+              type: "group",
+              label: "配置",
+              items: [
+                { label: "打开配置文件", icon: "open-file", onSelect: () => void openConfig() },
+                { label: "重载配置", icon: "refresh", onSelect: () => void reload() },
+              ],
+            },
+            { type: "separator" },
+            {
+              label: "彻底重启 OpenCode…",
+              icon: "outline-rotate-clockwise",
+              onSelect: () => void restartApp(),
+            },
+          ]}
+        />
         </div>
       </div>
 
@@ -1793,11 +1830,15 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
               <div class="ph-grow">
                 <ui.TextInput
                   label="搜索 npm 上的 OpenCode 插件"
-                  placeholder="搜索插件，例如 qoder / notify / usage"
+                  placeholder="搜索插件，例如 qoder / notify / usage（输入后自动搜索）"
                   type="search"
                   value={query()}
-                  onInput={setQuery}
-                  onSubmit={(value) => void runSearch(value)}
+                  onInput={scheduleSearch}
+                  onSubmit={(value) => {
+                    if (searchTimer) window.clearTimeout(searchTimer)
+                    lastSearch = value.trim()
+                    void runSearch(value)
+                  }}
                 />
               </div>
               <ui.Button
@@ -1865,8 +1906,17 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
                   }
                 >
                   <div class="ph-list">
-                    <For each={sortedHits()}>{(hit) => searchRow(hit)}</For>
+                    <For each={visibleHits()}>{(hit) => searchRow(hit)}</For>
                   </div>
+                  <Show when={sortedHits().length > visibleHits().length}>
+                    <ui.Button
+                      variant="ghost"
+                      size="small"
+                      onClick={() => setHitLimit((n) => n + 12)}
+                    >
+                      显示更多（还有 {sortedHits().length - visibleHits().length} 个）
+                    </ui.Button>
+                  </Show>
                 </Show>
               </Show>
             </Show>
@@ -1934,7 +1984,7 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
 
       <footer class="ph-footer">
         <div class="ph-footer-note">
-          安装和移除只改配置，不会立即生效：插件与模型目录都是启动时快照的。改完点工具栏的「彻底重启」，应用会自动退出并重新打开。
+          安装和移除只改配置，不会立即生效：插件与模型目录都是启动时快照的。改完点右上角「更多操作 → 彻底重启 OpenCode」，应用会自动退出并重新打开。
         </div>
       </footer>
     </div>
