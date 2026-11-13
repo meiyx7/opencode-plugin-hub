@@ -25,6 +25,31 @@ async function getJson(url, timeout = 20_000) {
   return response.json()
 }
 
+/**
+ * The official registry is blackholed on some networks, so package verification probes the same
+ * mirror the runtime uses. Verification is a best-effort part of this script: a name that cannot
+ * be checked is left without a version rather than guessed.
+ */
+const REGISTRIES = ["https://registry.npmjs.org", "https://registry.npmmirror.com"]
+let registry
+
+async function pickRegistry() {
+  if (registry) return registry
+  const answers = await Promise.all(
+    REGISTRIES.map(async (base) => {
+      try {
+        const response = await fetch(`${base}/-/ping`, { signal: AbortSignal.timeout(1_500) })
+        return response.ok ? base : undefined
+      } catch {
+        return undefined
+      }
+    }),
+  )
+  registry = answers.find((base) => base !== undefined)
+  if (!registry) throw new Error(`无法连接 npm registry（已尝试 ${REGISTRIES.join("、")}）`)
+  return registry
+}
+
 function candidates(entry) {
   const parts = (entry.repoUrl ?? "").replace(/\/+$/, "").split("/")
   const repo = (parts.pop() ?? "").replace(/\.git$/, "")
@@ -55,7 +80,8 @@ function candidates(entry) {
  */
 async function npmLookup(name) {
   try {
-    const body = await getJson(`https://registry.npmjs.org/${encodeURIComponent(name).replace(/%40/g, "@").replace(/%2F/gi, "/")}`, 10_000)
+    const base = await pickRegistry()
+    const body = await getJson(`${base}/${encodeURIComponent(name)}`, 10_000)
     const tagged = body["dist-tags"]?.latest
     if (tagged) return { name, version: tagged, released: true }
     const versions = Object.keys(body.versions ?? {})

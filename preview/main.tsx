@@ -126,16 +126,66 @@ function Dialog(props: { title?: string; children?: unknown; footer?: unknown; s
   )
 }
 
+/** 预览里补一次主页/仓库与下载量：镜像的搜索索引不返回这两项。 */
+async function previewExtra(name: string): Promise<{ weekly: number; monthly: number; homepage: string; repo: string } | undefined> {
+  const base = "https://registry.npmmirror.com"
+  try {
+    const [latest, series] = await Promise.all([
+      fetch(`${base}/${encodeURIComponent(name)}/latest`, { signal: AbortSignal.timeout(6_000) }).then((r) =>
+        r.ok ? r.json() : undefined,
+      ),
+      fetch(`${base}/downloads/range/last-month/${encodeURIComponent(name)}`, { signal: AbortSignal.timeout(6_000) }).then(
+        (r) => (r.ok ? r.json() : undefined),
+      ),
+    ])
+    const days: { downloads?: number }[] = series?.downloads ?? []
+    const sum = (list: { downloads?: number }[]) => list.reduce((total, day) => total + (Number(day.downloads) || 0), 0)
+    const repository = latest?.repository
+    return {
+      weekly: days.length > 0 ? sum(days.slice(-7)) : -1,
+      monthly: days.length > 0 ? sum(days) : -1,
+      homepage: latest?.homepage ?? "",
+      repo: typeof repository === "string" ? repository : repository?.url ?? "",
+    }
+  } catch {
+    return undefined
+  }
+}
+
 const ctx = {
   client: {},
   main: () => ({
-    snapshot: async () => fakeState,
+    snapshot: async () => fakeStateWithSummary,
     updates: async () => ({ items: fakeUpdates, error: "" }),
     search: async (input: { query: string }) => {
-      const text = input.query.trim() ? `${input.query.trim()} keywords:opencode-plugin` : "keywords:opencode-plugin"
-      const response = await fetch(`https://registry.npmjs.org/-/v1/search?size=25&text=${encodeURIComponent(text)}`)
+      // 与主进程同一套策略：官方源不可达时落到镜像，镜像不认 keywords: 限定词，结果本地过滤。
+      const text = input.query.trim() ? `${input.query.trim()} opencode-plugin` : "opencode-plugin"
+      const bases = ["https://registry.npmjs.org", "https://registry.npmmirror.com"]
+      let response: Response | undefined
+      for (const base of bases) {
+        try {
+          response = await fetch(`${base}/-/v1/search?size=100&text=${encodeURIComponent(text)}`, {
+            signal: AbortSignal.timeout(6_000),
+          })
+          if (!response.ok) continue
+          break
+        } catch {
+          // 下一个源
+        }
+      }
+      if (!response) return { hits: [], error: "无法连接 npm registry" }
       const body = await response.json()
-      const hits = (body.objects ?? []).map((item: any) => ({
+      const wanted = new Set(["opencode", "opencode-plugin", "opencode-plugins", "opencode-ai"])
+      const picked = (body.objects ?? []).filter((item: any) => {
+        const pkg = item.package ?? {}
+        const name = pkg.name ?? ""
+        const keywords = (pkg.keywords ?? []).map((k: string) => String(k).toLowerCase())
+        if (keywords.some((k: string) => /^(dsh|deepseek-harness|deepseek)$/i.test(k)) || /^dsh-/i.test(name)) return false
+        return /opencode/i.test(name) || keywords.some((k: string) => wanted.has(k)) || /\bopencode\b/i.test(pkg.description ?? "")
+      })
+      // 镜像不返回 links 和下载量：详情接口补主页/仓库，下载接口补周/月。
+      const extra = await Promise.all(picked.map((item: any) => previewExtra(item.package.name)))
+      const hits = picked.slice(0, 50).map((item: any, index: number) => ({
         name: item.package.name,
         version: item.package.version ?? "",
         description: item.package.description ?? "",
@@ -144,21 +194,51 @@ const ctx = {
         installed: fakeState.plugins.some((p) => p.name === item.package.name),
         current: fakeState.plugins.find((p) => p.name === item.package.name)?.version ?? "",
         hasUpdate: false,
-        weekly: item.downloads?.weekly ?? 0,
-        monthly: item.downloads?.monthly ?? 0,
+        weekly: item.downloads?.weekly ?? extra[index]?.weekly ?? -1,
+        monthly: item.downloads?.monthly ?? extra[index]?.monthly ?? -1,
         publisher: item.package.maintainers?.[0]?.username ?? "",
         license: item.package.license ?? "",
         keywords: item.package.keywords ?? [],
-        homepage: item.package.links?.homepage ?? "",
-        repo: item.package.links?.repository ?? "",
+        homepage: item.package.links?.homepage ?? extra[index]?.homepage ?? "",
+        repo: item.package.links?.repository ?? extra[index]?.repo ?? "",
         npm: item.package.links?.npm ?? `https://www.npmjs.com/package/${item.package.name}`,
       }))
       return { hits, error: "" }
     },
     browse: async (input: { force: boolean }) => {
-      const response = await fetch("https://raw.githubusercontent.com/awesome-opencode/awesome-opencode/main/dist/registry.json")
-      const raw = await response.json()
-      const entries = (raw as any[])
+      // raw.githubusercontent.com 在部分网络会被重置，api.github.com 仍然可用。
+      // 预览跑在浏览器里，自定义 accept 头会触发 CORS 预检，所以 contents API 走默认 JSON + base64 解码。
+      const sources = [
+        "https://raw.githubusercontent.com/awesome-opencode/awesome-opencode/main/dist/registry.json",
+        "https://api.github.com/repos/awesome-opencode/awesome-opencode/contents/dist/registry.json?ref=main",
+      ]
+      let raw: any[] | undefined
+      let used = sources[0]!
+      for (const url of sources) {
+        try {
+          const response = await fetch(url, { signal: AbortSignal.timeout(8_000) })
+          if (!response.ok) continue
+          const body = await response.json()
+          if (Array.isArray(body)) {
+            raw = body
+            used = url
+            break
+          }
+          if (typeof body?.content === "string") {
+            const text = decodeURIComponent(escape(atob(body.content.replace(/\n/g, ""))))
+            const parsed = JSON.parse(text)
+            if (Array.isArray(parsed)) {
+              raw = parsed
+              used = url
+              break
+            }
+          }
+        } catch {
+          // 下一个源
+        }
+      }
+      if (!raw) return { entries: [], source: "builtin", registry: sources[0]!, fetchedAt: 0, error: "无法连接插件目录" }
+      const entries = raw
         .filter((entry) => ["plugins", "mcp", "themes"].includes(entry.type ?? "plugins"))
         .slice(0, 60)
         .map((entry) => {
@@ -178,11 +258,22 @@ const ctx = {
             installed: fakeState.plugins.some((p) => p.name === pkg),
           }
         })
-      return { entries, source: "network", registry: "https://raw.githubusercontent.com/awesome-opencode/awesome-opencode/main/dist/registry.json", fetchedAt: Date.now(), error: "" }
+      return { entries, source: "network", registry: used, fetchedAt: Date.now(), error: "" }
     },
     detail: async (input: { name: string }) => {
-      const response = await fetch(`https://registry.npmjs.org/${input.name.replace("/", "%2f")}`)
-      if (!response.ok) return { name: input.name, version: "", description: "", homepage: "", repo: "", repoDir: "", npm: `https://www.npmjs.com/package/${input.name}`, bugs: "", license: "", keywords: [], maintainers: [], weekly: 0, monthly: 0, published: "", created: "", versions: 0, unpacked: 0, files: 0, dependencies: [], deprecated: "", readme: "", readmeTruncated: false, installed: false, current: "", hasUpdate: false, error: `npm registry 返回 ${response.status}` }
+      const path = `/${encodeURIComponent(input.name)}`
+      const bases = ["https://registry.npmjs.org", "https://registry.npmmirror.com"]
+      let response: Response | undefined
+      for (const base of bases) {
+        try {
+          response = await fetch(`${base}${path}`)
+          break
+        } catch {
+          // 下一个源
+        }
+      }
+      if (!response) return { name: input.name, version: "", description: "", homepage: "", repo: "", repoDir: "", npm: `https://www.npmjs.com/package/${input.name}`, bugs: "", license: "", keywords: [], maintainers: [], weekly: -1, monthly: -1, published: "", created: "", versions: 0, unpacked: 0, files: 0, dependencies: [], deprecated: "", readme: "", readmeTruncated: false, installed: false, current: "", hasUpdate: false, error: "无法连接 npm registry" }
+      if (!response.ok) return { name: input.name, version: "", description: "", homepage: "", repo: "", repoDir: "", npm: `https://www.npmjs.com/package/${input.name}`, bugs: "", license: "", keywords: [], maintainers: [], weekly: -1, monthly: -1, published: "", created: "", versions: 0, unpacked: 0, files: 0, dependencies: [], deprecated: "", readme: "", readmeTruncated: false, installed: false, current: "", hasUpdate: false, error: `npm registry 返回 ${response.status}` }
       const body = await response.json()
       const latest = body["dist-tags"]?.latest ?? ""
       const manifest = latest ? body.versions?.[latest] : undefined
@@ -198,8 +289,8 @@ const ctx = {
         license: manifest?.license ?? "",
         keywords: manifest?.keywords ?? [],
         maintainers: (body.maintainers ?? []).map((m: any) => m.name),
-        weekly: 0,
-        monthly: 0,
+        weekly: -1,
+        monthly: -1,
         published: body.time?.[latest] ?? "",
         created: body.time?.created ?? "",
         versions: Object.keys(body.versions ?? {}).length,

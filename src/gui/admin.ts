@@ -3,6 +3,7 @@ import { homedir, tmpdir } from "node:os"
 import { basename, isAbsolute, join, resolve } from "node:path"
 import { copyFile, cp, mkdir, mkdtemp, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises"
 import { applyEdits, modify, parse, type ParseError } from "jsonc-parser"
+import { downloadsFor, registryFetch, type Downloads } from "./registry"
 
 export interface InstalledEntryValue {
   spec: string
@@ -294,13 +295,10 @@ const versionCache = new Map<string, { at: number; value: VersionLookup }>()
 export async function npmLatest(name: string, force = false): Promise<VersionLookup> {
   const cached = versionCache.get(name)
   if (!force && cached && Date.now() - cached.at < VERSION_TTL) return cached.value
-  const url = `https://registry.npmjs.org/${encodeURIComponent(name)}/latest`
+  const url = `/${encodeURIComponent(name)}/latest`
   let response: Response
   try {
-    response = await fetch(url, {
-      signal: AbortSignal.timeout(10_000),
-      headers: { accept: "application/json" },
-    })
+    response = await registryFetch(url, { timeoutMs: 10_000 })
   } catch {
     return emptyLookup(false)
   }
@@ -425,7 +423,7 @@ export async function updates(): Promise<UpdatesResultValue> {
           error: !lookupable
             ? "不是 npm 包名，无法查询版本"
             : !lookup.ok
-              ? "无法连接 npm registry，本次未检查"
+              ? "无法连接 npm registry，本次未检查（可设置 OPENCODE_PLUGIN_HUB_REGISTRY 指向可用镜像）"
               : "",
         }
       }),
@@ -495,11 +493,11 @@ interface Packument {
 }
 
 async function packument(name: string, version: string): Promise<{ tarball: string; version: string } | undefined> {
-  const url = `https://registry.npmjs.org/${name.replace("/", "%2f")}`
+  const url = `/${encodeURIComponent(name)}`
   try {
-    const response = await fetch(url, {
-      signal: AbortSignal.timeout(15_000),
-      headers: { accept: "application/vnd.npm.install-v1+json" },
+    const response = await registryFetch(url, {
+      timeoutMs: 15_000,
+      accept: "application/vnd.npm.install-v1+json",
     })
     if (!response.ok) return undefined
     const body = (await response.json()) as Packument
@@ -662,11 +660,19 @@ interface RegistrySearchPackage {
   links?: { npm?: string; homepage?: string; repository?: string; bugs?: string }
 }
 
+interface RegistrySearchItem {
+  downloads?: { weekly?: number; monthly?: number; all?: number }
+  package?: RegistrySearchPackage
+}
+
 interface RegistrySearch {
-  objects?: {
-    downloads?: { weekly?: number; monthly?: number }
-    package?: RegistrySearchPackage
-  }[]
+  objects?: RegistrySearchItem[]
+}
+
+/** What one search hit needs beyond the search index: downloads and the manifest behind `links`. */
+interface SearchExtra {
+  counts: Downloads | undefined
+  manifest: VersionLookup | undefined
 }
 
 /** Tags every plugin carries; they say nothing about what a particular one does. */
@@ -752,8 +758,6 @@ type RemoteDetail = Omit<PackageDetailValue, "npm" | "installed" | "current" | "
 
 const DETAIL_TTL = 10 * 60 * 1000
 const README_LIMIT = 30_000
-const NPM_API = "https://api.npmjs.org"
-const NPM_REGISTRY = "https://registry.npmjs.org"
 
 const detailCache = new Map<string, { at: number; value: RemoteDetail }>()
 
@@ -767,17 +771,9 @@ function trimReadme(raw: string): { text: string; truncated: boolean } {
 
 /** `-1` means the download API could not be asked: the UI must show 暂不可用, not 0. */
 async function loadDownloads(name: string, period: "last-week" | "last-month"): Promise<number> {
-  try {
-    const response = await fetch(`${NPM_API}/downloads/point/${period}/${encodeURIComponent(name)}`, {
-      signal: AbortSignal.timeout(8_000),
-      headers: { accept: "application/json" },
-    })
-    if (!response.ok) return -1
-    const body = (await response.json()) as { downloads?: number }
-    return Number(body.downloads ?? 0) || 0
-  } catch {
-    return -1
-  }
+  const counts = await downloadsFor(name)
+  if (!counts) return -1
+  return period === "last-week" ? counts.weekly : counts.monthly
 }
 
 /**
@@ -786,17 +782,16 @@ async function loadDownloads(name: string, period: "last-week" | "last-month"): 
  */
 async function loadPackument(name: string): Promise<{ body?: NpmPackument; error: string }> {
   try {
-    const response = await fetch(`${NPM_REGISTRY}/${encodeURIComponent(name)}`, {
-      signal: AbortSignal.timeout(20_000),
-      headers: { accept: "application/json" },
-    })
+    const response = await registryFetch(`/${encodeURIComponent(name)}`, { timeoutMs: 20_000 })
     if (response.status === 404) return { error: "npm 上找不到这个包" }
     if (!response.ok) return { error: `npm registry 返回 ${response.status}` }
-    const size = Number(response.headers.get("content-length") ?? 0)
-    if (size > 12 * 1024 * 1024) return loadLatestManifest(name, "包元数据过大，只读取了最新版本")
+    // `content-length` describes the compressed body, so a huge packument can still advertise a
+    // small number. Measure what actually arrived instead of trusting the header.
+    const text = await response.text()
+    if (text.length > 12 * 1024 * 1024) return loadLatestManifest(name, "包元数据过大，只读取了最新版本")
     let body: NpmPackument
     try {
-      body = (await response.json()) as NpmPackument
+      body = JSON.parse(text) as NpmPackument
     } catch {
       return loadLatestManifest(name, "npm 返回的数据无法解析")
     }
@@ -804,16 +799,13 @@ async function loadPackument(name: string): Promise<{ body?: NpmPackument; error
     // Unpublished placeholders have no `versions` at all; buildRemoteDetail turns that into a clear message.
     return { body, error: "" }
   } catch (error) {
-    return { error: describe(error) }
+    return { error: describeNetwork(error) }
   }
 }
 
 async function loadLatestManifest(name: string, reason: string): Promise<{ body?: NpmPackument; error: string }> {
   try {
-    const response = await fetch(`${NPM_REGISTRY}/${encodeURIComponent(name)}/latest`, {
-      signal: AbortSignal.timeout(10_000),
-      headers: { accept: "application/json" },
-    })
+    const response = await registryFetch(`/${encodeURIComponent(name)}/latest`, { timeoutMs: 10_000 })
     if (!response.ok) return { error: reason || `npm registry 返回 ${response.status}` }
     const manifest = (await response.json()) as RegistryManifest & { readme?: string; time?: Record<string, string> }
     if (!manifest?.version) return { error: reason || "npm 返回的数据不完整" }
@@ -828,7 +820,7 @@ async function loadLatestManifest(name: string, reason: string): Promise<{ body?
       error: "",
     }
   } catch (error) {
-    return { error: reason || describe(error) }
+    return { error: reason || describeNetwork(error) }
   }
 }
 
@@ -943,50 +935,116 @@ export async function detail(name: string): Promise<PackageDetailValue> {
   }
 }
 
+/** Keywords that mark a package as an OpenCode plugin rather than something that merely mentions it. */
+const OPENCODE_KEYWORDS = new Set(["opencode", "opencode-plugin", "opencode-plugins", "opencode-ai"])
+
+/**
+ * Plugins for other agent harnesses sometimes name-drop OpenCode in their description (a
+ * compatibility note, a shared notification format). Their own scope is the reliable signal.
+ */
+const OTHER_HARNESS = /^(dsh|deepseek-harness|deepseek)$/i
+
+/**
+ * Mirrors index plain text and ignore the `keywords:` qualifier (it returns zero hits), so the
+ * registry is asked for free text and the results are filtered here instead. A package counts as
+ * an OpenCode plugin when its name, one of its keywords, or its description says so — the
+ * description is what catches plugins published under an unrelated name. Naming another harness
+ * disqualifies it, because those descriptions only mention OpenCode in passing.
+ */
+function isOpencodePlugin(pkg: { name?: string; keywords?: string[]; description?: string }): boolean {
+  const name = pkg.name ?? ""
+  const keywords = pkg.keywords ?? []
+  // Another harness wins over everything else: `dsh-opencode-palette` is a DeepSeek Harness
+  // theme whose name happens to mention OpenCode, and it would not load here.
+  if (keywords.some((keyword) => OTHER_HARNESS.test(keyword))) return false
+  if (/^dsh-/i.test(name)) return false
+  if (/opencode/i.test(name)) return true
+  if (keywords.some((keyword) => OPENCODE_KEYWORDS.has(keyword.toLowerCase()))) return true
+  return /\bopencode\b/i.test(pkg.description ?? "")
+}
+
+/** Enough parallel lookups to fill a page quickly without hammering the mirror. */
+const LOOKUP_CONCURRENCY = 16
+
+async function mapLimited<T, R>(items: readonly T[], limit: number, work: (item: T) => Promise<R>): Promise<R[]> {
+  const out = new Array<R>(items.length)
+  let cursor = 0
+  await Promise.all(
+    Array.from({ length: Math.min(limit, items.length) }, async () => {
+      while (cursor < items.length) {
+        const index = cursor++
+        out[index] = await work(items[index]!)
+      }
+    }),
+  )
+  return out
+}
+
+/** The page shows at most this many hits; extra candidates only widen the pool before filtering. */
+const SEARCH_LIMIT = 50
+
 export async function search(query: string): Promise<SearchResultValue> {
   const trimmed = query.trim()
-  const text = trimmed ? `${trimmed} keywords:${NPM_KEYWORD}` : `keywords:${NPM_KEYWORD}`
+  // A bare keyword query is how the mirror finds the whole plugin family; the term is also
+  // appended to a user query so "memory" does not return unrelated memory libraries.
+  const text = trimmed ? `${trimmed} ${NPM_KEYWORD}` : NPM_KEYWORD
   try {
-    const response = await fetch(`https://registry.npmjs.org/-/v1/search?size=50&text=${encodeURIComponent(text)}`, {
-      signal: AbortSignal.timeout(12_000),
-      headers: { accept: "application/json" },
+    // Ask for more than a page: filtering drops non-plugin packages, and a narrow query returns
+    // fewer than the requested size anyway, so this costs nothing extra.
+    const response = await registryFetch(`/-/v1/search?size=100&text=${encodeURIComponent(text)}`, {
+      timeoutMs: 12_000,
     })
     if (!response.ok) return { hits: [], error: `npm registry 返回 ${response.status}` }
     const body = (await response.json()) as RegistrySearch
     const file = await readConfig()
     const resolved = await resolveAll(file)
     const installed = new Map(resolved.map((entry) => [entry.name, entry.version]))
+    const packages = (body.objects ?? [])
+      .filter((item) => item.package?.name && isOpencodePlugin(item.package))
+      .slice(0, SEARCH_LIMIT)
+    // The mirror's search index omits `links` and only reports all-time downloads. One extra
+    // request per package fills both in: the downloads series, and the `/latest` manifest for
+    // homepage/repo. Unknown stays -1 so the card says 暂不可用 instead of a fake 0.
+    const extra = await mapLimited<RegistrySearchItem, SearchExtra>(packages, LOOKUP_CONCURRENCY, async (item) => {
+      const name = item.package!.name!
+      const [counts, manifest] = await Promise.all([
+        item.downloads?.weekly !== undefined ? undefined : downloadsFor(name),
+        item.package!.links?.homepage || item.package!.links?.repository ? undefined : npmLatest(name),
+      ])
+      return { counts, manifest }
+    })
     const hits: SearchHitValue[] = []
-    for (const item of body.objects ?? []) {
-      const pkg = item.package
-      if (!pkg?.name) continue
-      const name = pkg.name
+    for (const [index, item] of packages.entries()) {
+      const pkg = item.package!
+      const name = pkg.name!
       const isInstalled = installed.has(name)
       const current = isInstalled ? installed.get(name) ?? "" : ""
-      const repo = repository(pkg.links?.repository)
+      const looked = extra[index]
+      const manifest = looked?.manifest
+      const repo = repository(pkg.links?.repository ?? manifest?.repo)
       hits.push({
         name,
         version: pkg.version ?? "",
-        description: pkg.description ?? "",
+        description: pkg.description ?? manifest?.description ?? "",
         published: pkg.date ?? "",
         updated: pkg.date ?? "",
         installed: isInstalled,
         current,
         hasUpdate: isInstalled && isNewer(pkg.version ?? "", current),
-        weekly: Number(item.downloads?.weekly ?? 0) || 0,
-        monthly: Number(item.downloads?.monthly ?? 0) || 0,
+        weekly: item.downloads?.weekly ?? looked?.counts?.weekly ?? -1,
+        monthly: item.downloads?.monthly ?? looked?.counts?.monthly ?? -1,
         // Prefer a human maintainer: CI-published packages list "GitHub Actions" as the publisher.
-        publisher: pkg.maintainers?.[0]?.username ?? pkg.publisher?.username ?? "",
-        license: licenseText(pkg.license),
+        publisher: pkg.maintainers?.[0]?.username ?? pkg.publisher?.username ?? manifest?.publisher ?? "",
+        license: licenseText(pkg.license) || manifest?.license || "",
         keywords: keywordList(pkg.keywords),
-        homepage: cleanUrl(pkg.links?.homepage),
+        homepage: cleanUrl(pkg.links?.homepage) || manifest?.homepage || "",
         repo: repo.url,
         npm: pkg.links?.npm || `https://www.npmjs.com/package/${name}`,
       })
     }
     return { hits, error: "" }
   } catch (error) {
-    return { hits: [], error: describe(error) }
+    return { hits: [], error: describeNetwork(error) }
   }
 }
 
@@ -1187,4 +1245,19 @@ function toUnknown(entry: InstalledEntryValue): RuntimeInfoValue {
 function describe(error: unknown): string {
   if (error instanceof Error) return error.message
   return String(error)
+}
+
+/** Makes socket-level failures actionable: `fetch failed` alone says nothing about what to do. */
+function describeNetwork(error: unknown): string {
+  const message = describe(error)
+  if (/RegistryTimeout|TimeoutError|aborted due to timeout|The operation was aborted/i.test(message)) {
+    return "npm registry 没有及时响应：这个包可能不存在，或镜像正在回源。稍后重试。"
+  }
+  if (/RegistryUnavailable/.test(message)) return message
+  if (/fetch failed|ECONNRESET|ECONNREFUSED|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|socket hang up|other side closed/i.test(message)) {
+    // Mirrors answer an uncached 404 by resetting the socket once their upstream fetch gives up,
+    // so a reset means either "no such package" or "no route to the registry".
+    return "npm registry 未能应答（连接被重置）：这个包可能不存在，或当前网络无法访问 registry。可设置 OPENCODE_PLUGIN_HUB_REGISTRY 指向可用镜像。"
+  }
+  return message
 }
