@@ -1793,7 +1793,10 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
         <Show when={runtimeError()}>
           <div class="ph-notice" data-tone="warning">
             <ui.Icon name="circle-exclamation" size="small" />
-            <span>{runtimeError()}。重启后重新打开插件中心会再读取。</span>
+            <span>{runtimeError()}。配置操作不受影响，可重试读取。</span>
+            <ui.Button size="small" variant="ghost" icon="outline-rotate-clockwise" onClick={() => void loadRuntime()}>
+              重试
+            </ui.Button>
           </div>
         </Show>
         <Show when={hasPendingChanges()}>

@@ -1063,14 +1063,24 @@ export async function runtime(endpoint: { url: string; headers: Readonly<Record<
   const state = await snapshot()
   if (!endpoint) return { items: state.plugins.map(toUnknown), error: "无法连接后台服务，运行状态未知" }
   try {
-    const response = await fetch(`${endpoint.url.replace(/\/$/, "")}/plugin`, {
+    // The sidecar serves its web UI at `/`, so `/plugin` is an HTML page. The
+    // JSON API lives under `/api`; asking the wrong path yields 200 HTML and a
+    // confusing parse error.
+    const response = await fetch(`${endpoint.url.replace(/\/+$/, "")}/api/plugin`, {
       signal: AbortSignal.timeout(8_000),
       headers: { accept: "application/json", ...endpoint.headers },
     })
     if (!response.ok) {
       return { items: state.plugins.map(toUnknown), error: `后台服务返回 ${response.status}，运行状态未知` }
     }
-    const body = (await response.json()) as { data?: PluginListInfo[] } | PluginListInfo[]
+    // Do not assume JSON: a misrouted request can return an HTML page with 200.
+    const text = await response.text()
+    let body: { data?: PluginListInfo[] } | PluginListInfo[]
+    try {
+      body = JSON.parse(text) as { data?: PluginListInfo[] } | PluginListInfo[]
+    } catch {
+      return { items: state.plugins.map(toUnknown), error: "后台返回的不是 JSON，运行状态未知" }
+    }
     const list = Array.isArray(body) ? body : body.data ?? []
     const items = state.plugins.map((entry) => {
       // The server reports the source target; the config holds the spec (name, name@range or a path).
