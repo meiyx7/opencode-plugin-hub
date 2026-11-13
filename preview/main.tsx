@@ -35,6 +35,20 @@ const summaries: Record<string, { description: string; license: string; publishe
   "@magpie-community/opencode-qoder-auth": { description: "Qoder authentication provider for OpenCode.", license: "MIT", publisher: "magpie-community" },
 }
 
+// 真实主进程会把本地 package.json 的概述放进 snapshot，预览照做，
+// 这样「已安装」列表即使还没查到 registry 也有描述。
+const fakeStateWithSummary = {
+  ...fakeState,
+  plugins: fakeState.plugins.map((entry) => {
+    const summary = summaries[entry.name]
+    return {
+      ...entry,
+      description: summary?.description ?? (entry.kind === "path" ? "本地 directory 插件，直接加载工作区里的实现。" : ""),
+      license: summary?.license ?? "",
+    }
+  }),
+}
+
 const fakeUpdates = fakeState.plugins.map((entry) => {
   const summary = summaries[entry.name] ?? { description: "", license: "", publisher: "" }
   const latest = entry.name === "opencode-usage-center" ? "0.3.2" : entry.name === "opencode-timeline-gui" ? "0.2.8" : entry.version

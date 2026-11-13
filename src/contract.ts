@@ -13,6 +13,15 @@ export const InstalledEntry = Schema.Struct({
   version: Schema.String,
   /** False for the plugin that serves this page, which cannot remove itself. */
   removable: Schema.Boolean,
+  /**
+   * One-line summary from the installed package.json, empty when it cannot be read.
+   * Optional so a window and a service built from different revisions still decode each other.
+   */
+  description: Schema.optional(Schema.String),
+  /** SPDX license from the installed package.json; empty when unknown. */
+  license: Schema.optional(Schema.String),
+  homepage: Schema.optional(Schema.String),
+  repo: Schema.optional(Schema.String),
 })
 
 export const HubState = Schema.Struct({

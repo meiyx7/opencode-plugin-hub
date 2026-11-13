@@ -1771,6 +1771,13 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
     const busy = () => isBusy(`install:${entry.name}`)
     const current = () => info()?.current || entry.version
     const unchecked = () => entry.kind !== "path" && (info()?.error ?? "") !== ""
+    /**
+     * 概述先取快照里的本地 package.json，registry 检查回来后用它的结果覆盖。
+     * 只用 registry 会让整列描述在断网或检查未完成时集体变空——包明明就在磁盘上。
+     */
+    const summary = () => info()?.description || entry.description || ""
+    const license = () => info()?.license || entry.license || ""
+    const publisher = () => info()?.publisher || ""
     const runtimeInfo = () => runtime().get(entry.spec)
     const runtimeStatus = () => runtimeState(entry)
     const runtimeLabel = () =>
@@ -1809,13 +1816,13 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
                 <Show when={stale()}>
                   <span class="ph-version-arrow">→ v{info()!.latest}</span>
                 </Show>
-                <Show when={info()?.license}>
+                <Show when={license()}>
                   <span class="ph-dot" />
-                  <span>{info()!.license}</span>
+                  <span>{license()}</span>
                 </Show>
-                <Show when={info()?.publisher}>
+                <Show when={publisher()}>
                   <span class="ph-dot" />
-                  <span>by {info()!.publisher}</span>
+                  <span>by {publisher()}</span>
                 </Show>
               </div>
             </div>
@@ -1825,8 +1832,8 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
             <Show
               when={runtimeInfo()?.error}
               fallback={
-                <div class="ph-desc ph-clamp" title={info()?.description || entry.spec}>
-                  {info()?.description || entry.spec}
+                <div class="ph-desc ph-clamp" title={summary() || entry.spec}>
+                  {summary() || entry.spec}
                 </div>
               }
             >
@@ -2150,7 +2157,7 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
             </div>
 
             <div class="ph-meta">
-              <span>直查 npm 上带 opencode-plugin 标签的包，覆盖精选目录之外的长尾；结果未经人工筛选。</span>
+              <span>按 opencode-plugin 搜索 npm，覆盖精选目录之外的长尾；结果未经人工筛选。</span>
             </div>
 
             <Show when={!searched()}>

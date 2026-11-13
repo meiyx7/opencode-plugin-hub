@@ -11,6 +11,12 @@ export interface InstalledEntryValue {
   kind: string
   version: string
   removable: boolean
+  /** One-line summary from the installed package.json, empty when it cannot be read. */
+  description?: string
+  /** SPDX license from the installed package.json; empty when unknown. */
+  license?: string
+  homepage?: string
+  repo?: string
 }
 
 export interface HubStateValue {
@@ -213,8 +219,14 @@ async function readManifest(dir: string): Promise<Manifest | undefined> {
   }
 }
 
-/** Best-effort installed version of a registry plugin, read from OpenCode's unpacked npm cache. */
-async function installedVersion(name: string, range: string): Promise<string> {
+/**
+ * The package.json of an installed registry plugin, read from OpenCode's unpacked npm cache.
+ *
+ * This is the only place an installed plugin's own summary lives. Going to the registry instead
+ * makes the installed cards depend on the network: when the registry is unreachable the manifest
+ * lookup fails and every card loses its description, even though the package is sitting on disk.
+ */
+async function readInstalledManifest(name: string, range: string): Promise<Manifest | undefined> {
   const wanted = range && range !== "latest" ? range : "latest"
   const roots = Array.from(new Set([`${name}@${wanted}`, `${name}@latest`]))
   for (const root of roots) {
@@ -227,16 +239,20 @@ async function installedVersion(name: string, range: string): Promise<string> {
     }
     for (const stamp of stamps.reverse()) {
       try {
-        const file = join(dir, stamp, "node_modules", name, "package.json")
-        const raw = await readFile(file, "utf8")
+        const raw = await readFile(join(dir, stamp, "node_modules", name, "package.json"), "utf8")
         const json = JSON.parse(raw) as Manifest
-        if (json.version) return json.version
+        if (typeof json === "object" && json !== null && json.version) return json
       } catch {
         // try the next cached install
       }
     }
   }
-  return ""
+  return undefined
+}
+
+/** Best-effort installed version of a registry plugin, read from OpenCode's unpacked npm cache. */
+async function installedVersion(name: string, range: string): Promise<string> {
+  return (await readInstalledManifest(name, range))?.version ?? ""
 }
 
 /** A version range is not a version: only a bare `x.y.z` can be compared. */
@@ -344,16 +360,20 @@ interface ResolvedEntry {
 async function resolveEntry(spec: string): Promise<ResolvedEntry> {
   const parsed = splitSpec(spec)
   if (parsed.kind !== "path") {
-    const version = literalVersion(parsed.range) || (await installedVersion(parsed.name, parsed.range))
+    // Read the installed manifest first: it carries the summary that the installed cards show,
+    // and it is on disk, so the description does not disappear when the registry is unreachable.
+    const manifest = await readInstalledManifest(parsed.name, parsed.range)
+    const repo = repository(manifest?.repository)
+    const version = literalVersion(parsed.range) || manifest?.version || ""
     return {
       spec,
       name: parsed.name,
       kind: parsed.kind,
       version,
-      description: "",
-      license: "",
-      homepage: "",
-      repo: "",
+      description: manifest?.description ?? "",
+      license: licenseText(manifest?.license),
+      homepage: cleanUrl(manifest?.homepage) || repo.url,
+      repo: repo.url,
     }
   }
   const manifest = await readManifest(expandPath(spec))
@@ -384,6 +404,12 @@ export async function snapshot(): Promise<HubStateValue> {
       kind: entry.kind,
       version: entry.version,
       removable: entry.name !== SELF_PACKAGE,
+      // The summary travels with the snapshot so the installed cards have it before (and
+      // without) the registry check — reading it costs nothing, it is already on disk.
+      description: entry.description,
+      license: entry.license,
+      homepage: entry.homepage,
+      repo: entry.repo,
     }))
     return { configPath: file.path, configKey: file.key, plugins, error: "" }
   } catch (error) {
