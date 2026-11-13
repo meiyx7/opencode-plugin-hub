@@ -102,6 +102,14 @@ export const UpdateInfo = Schema.Struct({
   hasUpdate: Schema.Boolean,
   /** False for directory plugins, whose files are replaced instead of re-resolved from the registry. */
   managed: Schema.Boolean,
+  /** One-line summary from the package manifest; empty when it cannot be read. */
+  description: Schema.optional(Schema.String),
+  /** SPDX license from the package manifest; empty when unknown. */
+  license: Schema.optional(Schema.String),
+  homepage: Schema.optional(Schema.String),
+  repo: Schema.optional(Schema.String),
+  /** Publisher or first maintainer from the registry; empty for local directories. */
+  publisher: Schema.optional(Schema.String),
   error: Schema.String,
 })
 

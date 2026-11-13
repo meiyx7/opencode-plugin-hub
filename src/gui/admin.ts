@@ -92,6 +92,13 @@ export interface UpdateInfoValue {
   hasUpdate: boolean
   /** False for directory plugins, whose files are copied rather than resolved from the registry. */
   managed: boolean
+  /** One-line summary from the package manifest; empty when it cannot be read. */
+  description?: string
+  license?: string
+  homepage?: string
+  repo?: string
+  /** Publisher or first maintainer from the registry; empty for local directories. */
+  publisher?: string
   error: string
 }
 
@@ -188,6 +195,10 @@ function expandPath(spec: string): string {
 interface Manifest {
   name?: string
   version?: string
+  description?: string
+  homepage?: string
+  repository?: string | { url?: string; directory?: string }
+  license?: string | { type?: string }
 }
 
 /** The package.json of a directory plugin: the only place its real name and version live. */
@@ -258,46 +269,65 @@ interface VersionLookup {
   version: string
   /** False when the registry could not be reached, so `version` carries no meaning. */
   ok: boolean
+  /** One-line summary from the latest manifest; the installed list shows it instead of blank space. */
+  description: string
+  license: string
+  homepage: string
+  repo: string
+  publisher: string
+}
+
+function emptyLookup(ok: boolean): VersionLookup {
+  return { version: "", ok, description: "", license: "", homepage: "", repo: "", publisher: "" }
 }
 
 const versionCache = new Map<string, { at: number; value: VersionLookup }>()
 
 /**
- * Newest published version. `ok` separates "the registry says there is nothing newer" from
- * "the registry was never reached" — showing the second as "up to date" would be a lie.
+ * Newest published version plus the small manifest fields the installed list shows.
+ * `ok` separates "the registry says there is nothing newer" from "the registry was never
+ * reached" — showing the second as "up to date" would be a lie.
  *
- * A package only counts as published when it has at least one version: the registry serves
- * 200 for placeholder names such as `mem0` that carry no tarball at all.
+ * `/latest` is a single small manifest: the full packument can be megabytes and is only
+ * needed by the detail dialog. A 404 means no published version (removed or placeholder).
  */
 export async function npmLatest(name: string, force = false): Promise<VersionLookup> {
   const cached = versionCache.get(name)
   if (!force && cached && Date.now() - cached.at < VERSION_TTL) return cached.value
-  const url = `https://registry.npmjs.org/${name.replace("/", "%2f")}`
+  const url = `https://registry.npmjs.org/${encodeURIComponent(name)}/latest`
   let response: Response
   try {
     response = await fetch(url, {
       signal: AbortSignal.timeout(10_000),
-      headers: { accept: "application/vnd.npm.install-v1+json" },
+      headers: { accept: "application/json" },
     })
   } catch {
-    return { version: "", ok: false }
+    return emptyLookup(false)
   }
-  // 404 is a definite answer: no such package.
-  if (response.status === 404) return { version: "", ok: true }
-  if (!response.ok) return { version: "", ok: false }
+  // 404 is a definite answer: no published version to update to.
+  if (response.status === 404) return emptyLookup(true)
+  if (!response.ok) return emptyLookup(false)
   try {
-    const body = (await response.json()) as { "dist-tags"?: Record<string, string>; versions?: Record<string, unknown> }
-    const versions = Object.keys(body.versions ?? {})
-    if (versions.length === 0) return { version: "", ok: true }
-    const latest = body["dist-tags"]?.latest
+    const manifest = (await response.json()) as RegistryManifest & {
+      maintainers?: { name?: string; username?: string }[]
+      _npmUser?: { name?: string }
+    }
+    if (!manifest?.version) return emptyLookup(true)
+    const repo = repository(manifest.repository)
+    const maintainer = manifest.maintainers?.[0]
     const value: VersionLookup = {
-      version: latest && versions.includes(latest) ? latest : versions[versions.length - 1] ?? "",
+      version: manifest.version,
       ok: true,
+      description: manifest.description ?? "",
+      license: licenseText(manifest.license),
+      homepage: cleanUrl(manifest.homepage) || repo.url,
+      repo: repo.url,
+      publisher: maintainer?.name || maintainer?.username || manifest._npmUser?.name || "",
     }
     versionCache.set(name, { at: Date.now(), value })
     return value
   } catch {
-    return { version: "", ok: false }
+    return emptyLookup(false)
   }
 }
 
@@ -306,6 +336,10 @@ interface ResolvedEntry {
   name: string
   kind: string
   version: string
+  description: string
+  license: string
+  homepage: string
+  repo: string
 }
 
 /** Normalizes one config entry, looking inside directory plugins for their real identity. */
@@ -313,14 +347,28 @@ async function resolveEntry(spec: string): Promise<ResolvedEntry> {
   const parsed = splitSpec(spec)
   if (parsed.kind !== "path") {
     const version = literalVersion(parsed.range) || (await installedVersion(parsed.name, parsed.range))
-    return { spec, name: parsed.name, kind: parsed.kind, version }
+    return {
+      spec,
+      name: parsed.name,
+      kind: parsed.kind,
+      version,
+      description: "",
+      license: "",
+      homepage: "",
+      repo: "",
+    }
   }
   const manifest = await readManifest(expandPath(spec))
+  const repo = repository(manifest?.repository)
   return {
     spec,
     name: manifest?.name && isPackageName(manifest.name) ? manifest.name : parsed.name,
     kind: "path",
     version: manifest?.version ?? "",
+    description: manifest?.description ?? "",
+    license: licenseText(manifest?.license),
+    homepage: cleanUrl(manifest?.homepage) || repo.url,
+    repo: repo.url,
   }
 }
 
@@ -358,7 +406,7 @@ export async function updates(): Promise<UpdatesResultValue> {
     const items = await Promise.all(
       resolved.map(async (entry): Promise<UpdateInfoValue> => {
         const lookupable = isPackageName(entry.name)
-        const lookup: VersionLookup = lookupable ? await npmLatest(entry.name) : { version: "", ok: false }
+        const lookup: VersionLookup = lookupable ? await npmLatest(entry.name) : emptyLookup(false)
         return {
           spec: entry.spec,
           name: entry.name,
@@ -367,6 +415,13 @@ export async function updates(): Promise<UpdatesResultValue> {
           latest: lookup.version,
           hasUpdate: lookup.ok && isNewer(lookup.version, entry.version),
           managed: entry.kind !== "path",
+          // Directory plugins already carry their package.json summary; registry
+          // plugins get it from the `/latest` manifest in the same request.
+          description: entry.description || lookup.description,
+          license: entry.license || lookup.license,
+          homepage: entry.homepage || lookup.homepage,
+          repo: entry.repo || lookup.repo,
+          publisher: lookup.publisher,
           error: !lookupable
             ? "不是 npm 包名，无法查询版本"
             : !lookup.ok

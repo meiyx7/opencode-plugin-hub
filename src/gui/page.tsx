@@ -13,6 +13,8 @@ type PackageDetail = Awaited<ReturnType<AdminClient["detail"]>>
 type RuntimeInfo = Awaited<ReturnType<AdminClient["runtime"]>>["items"][number]
 
 type Tab = "catalog" | "search" | "installed"
+/** 已安装页的状态筛选；管理页先看问题项，而不是按配置顺序翻。 */
+type InstalledFilter = "all" | "update" | "failed" | "pending" | "unknown"
 type Tone = "info" | "success" | "warning" | "error"
 type Note = { text: string; tone: Tone }
 
@@ -338,6 +340,9 @@ const CSS = `
 .ph-meta > span { display: inline-flex; align-items: center; gap: 4px; min-width: 0; }
 .ph-dot { flex: 0 0 auto; width: 3px; height: 3px; border-radius: 50%; background: currentColor; opacity: 0.4; }
 .ph-resultbar { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; }
+/* 已安装页：搜索、状态筛选和检查结果压在一行，滚动列表从更高的位置开始。 */
+.ph-installed-bar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.ph-installed-search { flex: 0 1 260px; min-width: 180px; }
 .ph-h3 {
   display: flex;
   align-items: center;
@@ -372,18 +377,20 @@ const CSS = `
 }
 
 /* cards */
+/* 浏览卡片：每列至少 296px，按可用宽度排 3–4 列，不再出现超宽单列。 */
 .ph-list {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(248px, 1fr));
+  grid-template-columns: repeat(auto-fill, minmax(296px, 1fr));
   gap: 10px;
   align-items: stretch;
+  justify-content: center;
 }
 .ph-card {
   position: relative;
   display: flex;
   flex-direction: column;
-  gap: 9px;
-  padding: 12px;
+  gap: 8px;
+  padding: 11px 12px 10px;
   border: 1px solid var(--ph-border);
   border-radius: 12px;
   background: var(--ph-layer);
@@ -457,12 +464,16 @@ const CSS = `
   font-weight: 700;
   overflow: hidden;
 }
-.ph-name-row { display: flex; align-items: center; gap: 7px; flex-wrap: wrap; }
+.ph-name-row { display: flex; align-items: center; gap: 7px; min-width: 0; }
 .ph-name {
+  min-width: 0;
   font-size: 13.5px;
   font-weight: 600;
   color: var(--ph-strong);
-  overflow-wrap: anywhere;
+  /* 名称必须单行：徽章、版本再长也只省略名称，不把名字挤成两行。 */
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .ph-pkg {
   font-size: 10.5px;
@@ -472,7 +483,13 @@ const CSS = `
 }
 .ph-version { font-size: 10.5px; font-weight: 400; color: var(--ph-muted); }
 .ph-version-arrow { color: var(--ph-accent); }
-.ph-desc { font-size: 12px; line-height: 1.55; color: var(--ph-muted); }
+.ph-desc {
+  font-size: 12px;
+  line-height: 1.55;
+  color: var(--ph-muted);
+  /* 两张卡描述长短不同也保持同一基线，底部操作区才不会忽高忽低。 */
+  min-height: calc(1.55em * 2);
+}
 .ph-clamp {
   display: -webkit-box;
   -webkit-line-clamp: 2;
@@ -496,6 +513,40 @@ const CSS = `
   padding-top: 8px;
   border-top: 1px solid var(--ph-border);
 }
+
+/* 已安装卡片：与发现卡片同一骨架，但版本/作者只占副标题一行，
+   状态徽章单独一行，名称始终单行，描述固定两行，卡片等高。 */
+.ph-installed-meta {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  font-size: 10.5px;
+  line-height: 1.45;
+  color: var(--ph-muted);
+}
+.ph-installed-meta > span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.ph-installed-meta > .ph-dot { flex: 0 0 auto; overflow: visible; }
+.ph-card-status {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-wrap: wrap;
+  padding-top: 2px;
+}
+.ph-tile[data-runtime="failed"] {
+  color: var(--ph-danger);
+  border-color: color-mix(in srgb, var(--ph-danger) 28%, transparent);
+  background: color-mix(in srgb, var(--ph-danger) 9%, transparent);
+}
+.ph-tile[data-runtime="pending"] { opacity: 0.72; }
+.ph-tile[data-runtime="unknown"] { opacity: 0.55; }
 
 /* badges and chips */
 .ph-badge {
@@ -696,6 +747,24 @@ button.ph-chip:focus-visible,
   max-width: none;
   padding: 0 0 8px;
 }
+/* 对话框已有标题栏，这里不再重复大标题：只留一行来源说明和配置路径。 */
+.ph-root[data-embedded="true"] .ph-hero {
+  padding: 0 0 10px;
+  border: 0;
+  border-bottom: 1px solid var(--ph-border);
+  border-radius: 0;
+  background: none;
+}
+.ph-root[data-embedded="true"] .ph-kicker { display: none; }
+.ph-root[data-embedded="true"] .ph-sub {
+  max-width: none;
+  overflow: hidden;
+  display: -webkit-box;
+  -webkit-line-clamp: 1;
+  -webkit-box-orient: vertical;
+  font-size: 11.5px;
+}
+.ph-root[data-embedded="true"] .ph-path { font-size: 10.5px; }
 /* The host caps "x-large" at 980x600. Give the standalone hub more room and
    let the dialog be resized from its bottom-right corner, within the window. */
 [data-component="dialog-v2"][data-size="x-large"]:has(.ph-root[data-embedded="true"]) [data-slot="dialog-container"] {
@@ -1012,7 +1081,8 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
 
   const [updates, setUpdates] = createSignal<Map<string, UpdateInfo>>(new Map())
   const [checked, setChecked] = createSignal(false)
-  const [staleOnly, setStaleOnly] = createSignal(false)
+  const [installedQuery, setInstalledQuery] = createSignal("")
+  const [installedFilter, setInstalledFilter] = createSignal<InstalledFilter>("all")
   // 运行事实（服务端已加载/失败/未知），与“已在配置中”分开表达。
   const [runtime, setRuntime] = createSignal<Map<string, RuntimeInfo>>(new Map())
   const [runtimeError, setRuntimeError] = createSignal("")
@@ -1349,10 +1419,58 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
   const outdated = createMemo(() => [...updates().values()].filter((item) => item.hasUpdate).length)
   // 未能检查的条目数：失败不能被总结成“全部已是最新”。
   const uncheckedCount = createMemo(() => [...updates().values()].filter((item) => item.error).length)
+
+  /** 运行事实：服务端已加载 / 加载失败 / 待重启 / 未验证。 */
+  const runtimeState = (entry: PluginEntry): "loaded" | "failed" | "pending" | "unknown" => {
+    const info = runtime().get(entry.spec)
+    if (!info) return runtimeError() ? "unknown" : "pending"
+    if (info.status === "failed") return "failed"
+    if (info.status === "loaded") return "loaded"
+    // 服务端已应答但列表里没有：配置已写入、尚未被加载；应答不可用才是真正的“未验证”。
+    return info.available ? "pending" : "unknown"
+  }
+  const failedCount = createMemo(
+    () => (state()?.plugins ?? []).filter((entry) => runtimeState(entry) === "failed").length,
+  )
+  const pendingRuntimeCount = createMemo(
+    () => (state()?.plugins ?? []).filter((entry) => runtimeState(entry) === "pending").length,
+  )
+  const unknownCount = createMemo(
+    () => (state()?.plugins ?? []).filter((entry) => runtimeState(entry) === "unknown").length,
+  )
+  const filterCounts = createMemo<Record<InstalledFilter, number>>(() => ({
+    all: state()?.plugins.length ?? 0,
+    update: outdated(),
+    failed: failedCount(),
+    pending: pendingRuntimeCount(),
+    unknown: unknownCount(),
+  }))
+  /** 问题项排前面：加载失败 → 待重启 → 可更新 → 未验证 → 正常，同级保持配置顺序。 */
+  const severity = (entry: PluginEntry): number => {
+    const status = runtimeState(entry)
+    if (status === "failed") return 0
+    if (status === "pending") return 1
+    if (updates().get(entry.spec)?.hasUpdate) return 2
+    if (status === "unknown") return 3
+    return 4
+  }
   const visiblePlugins = createMemo(() => {
-    const plugins = state()?.plugins ?? []
-    if (!staleOnly()) return plugins
-    return plugins.filter((entry) => updates().get(entry.spec)?.hasUpdate === true)
+    const needle = installedQuery().trim().toLowerCase()
+    const filter = installedFilter()
+    return (state()?.plugins ?? [])
+      .filter((entry) => {
+        if (filter === "update" && updates().get(entry.spec)?.hasUpdate !== true) return false
+        if (filter === "failed" && runtimeState(entry) !== "failed") return false
+        if (filter === "pending" && runtimeState(entry) !== "pending") return false
+        if (filter === "unknown" && runtimeState(entry) !== "unknown") return false
+        if (!needle) return true
+        const info = updates().get(entry.spec)
+        return [entry.name, entry.spec, info?.description ?? "", info?.publisher ?? ""]
+          .join(" ")
+          .toLowerCase()
+          .includes(needle)
+      })
+      .sort((a, b) => severity(a) - severity(b))
   })
   const bySpec = (spec: string) => updates().get(spec)
   const byPackage = createMemo(() => {
@@ -1363,8 +1481,12 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
 
   const switchTab = (next: Tab) => {
     setTab(next)
-    // Leaving the installed view resets its "updatable only" filter.
-    if (next !== "installed") setStaleOnly(false)
+    // Leaving the installed view resets its filters, so a searched name does not
+    // silently hide the list next time it is opened.
+    if (next !== "installed") {
+      setInstalledFilter("all")
+      setInstalledQuery("")
+    }
     // The first look at the installed list also checks the registry, once.
     if (next !== "catalog" && !checked() && !isBusy("updates")) void checkUpdates(true)
   }
@@ -1437,21 +1559,13 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
             </div>
             <div class="ph-card-titles">
               <div class="ph-name-row">
-                <span class="ph-name">{entry.name}</span>
+                <span class="ph-name" title={entry.name}>
+                  {entry.name}
+                </span>
               </div>
               <Show when={entry.pkg}>
-                <span class="ph-pkg">{entry.pkg}</span>
-              </Show>
-            </div>
-            <div class="ph-chips">
-              <Show when={entry.installed}>
-                <span class="ph-badge" data-tone="success">
-                  已安装
-                </span>
-              </Show>
-              <Show when={stale()}>
-                <span class="ph-badge" data-tone="accent">
-                  可更新 → v{info()!.latest}
+                <span class="ph-pkg" title={entry.pkg}>
+                  {entry.pkg}
                 </span>
               </Show>
             </div>
@@ -1476,13 +1590,23 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
                 <span class="ph-dot" />
                 <span>v{entry.version}</span>
               </Show>
+              <Show when={entry.installed}>
+                <span class="ph-badge" data-tone="success">
+                  已安装
+                </span>
+              </Show>
+              <Show when={stale()}>
+                <span class="ph-badge" data-tone="accent">
+                  可更新 → v{info()!.latest}
+                </span>
+              </Show>
               <Show when={!entry.pkg}>
                 <span class="ph-dot" />
                 <span>仅 GitHub 发布</span>
               </Show>
               <Show when={entry.tags.length > 0}>
                 <span class="ph-dot" />
-                <span>{entry.tags.slice(0, 4).join(" / ")}</span>
+                <span>{entry.tags.slice(0, 3).join(" / ")}</span>
               </Show>
             </div>
           </div>
@@ -1547,21 +1671,11 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
             <div class="ph-tile">{initial(hit.name)}</div>
             <div class="ph-card-titles">
               <div class="ph-name-row">
-                <span class="ph-name">{hit.name}</span>
+                <span class="ph-name" title={hit.name}>
+                  {hit.name}
+                </span>
               </div>
               <span class="ph-pkg">v{hit.version}</span>
-            </div>
-            <div class="ph-chips">
-              <Show when={hit.installed}>
-                <span class="ph-badge" data-tone="success">
-                  已安装{hit.current ? ` v${hit.current}` : ""}
-                </span>
-              </Show>
-              <Show when={hit.hasUpdate}>
-                <span class="ph-badge" data-tone="accent">
-                  可更新 → v{hit.version}
-                </span>
-              </Show>
             </div>
           </div>
           <div
@@ -1592,12 +1706,17 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
                 <span class="ph-dot" />
                 <span>{relativeDate(hit.published)}更新</span>
               </Show>
+              <Show when={hit.installed}>
+                <span class="ph-badge" data-tone="success">
+                  已安装{hit.current ? ` v${hit.current}` : ""}
+                </span>
+              </Show>
+              <Show when={hit.hasUpdate}>
+                <span class="ph-badge" data-tone="accent">
+                  可更新 → v{hit.version}
+                </span>
+              </Show>
             </div>
-            <Show when={hit.keywords.length > 0}>
-              <div class="ph-chips">
-                <For each={hit.keywords.slice(0, 3)}>{(keyword) => <span class="ph-chip">{keyword}</span>}</For>
-              </div>
-            </Show>
           </div>
         </div>
         <div class="ph-actions">
@@ -1651,75 +1770,92 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
     const stale = () => info()?.hasUpdate === true
     const busy = () => isBusy(`install:${entry.name}`)
     const current = () => info()?.current || entry.version
-    const unchecked = () => (info()?.error ?? "") !== ""
-    // 运行事实：服务端已加载 / 加载失败 / 未知（没拿到运行信息或刚改过配置）。
+    const unchecked = () => entry.kind !== "path" && (info()?.error ?? "") !== ""
     const runtimeInfo = () => runtime().get(entry.spec)
-    const runtimeStatus = () => {
-      const info = runtimeInfo()
-      if (!info) return runtimeError() ? "unknown" : "pending"
-      if (info.status === "failed") return "failed"
-      if (info.status === "loaded") return "loaded"
-      // 服务端已应答但列表里没有：配置已写入、尚未被加载；应答不可用才是真正的“未验证”。
-      return info.available ? "pending" : "unknown"
-    }
+    const runtimeStatus = () => runtimeState(entry)
     const runtimeLabel = () =>
       runtimeStatus() === "loaded"
-        ? runtimeInfo()!.runtimeVersion
-          ? `运行中 v${runtimeInfo()!.runtimeVersion}`
-          : "运行中"
+        ? "运行中"
         : runtimeStatus() === "failed"
           ? "加载失败"
           : runtimeStatus() === "pending"
-            ? "待重启生效"
-            : "运行状态未验证"
+            ? "待重启"
+            : "未验证"
+    const runtimeHint = () => {
+      const status = runtimeStatus()
+      if (status === "loaded") {
+        const loaded = runtimeInfo()?.runtimeVersion
+        return loaded ? `已加载 v${loaded}` : "宿主已报告加载成功"
+      }
+      if (status === "failed") return runtimeInfo()?.error || "宿主报告加载失败"
+      if (status === "pending") return "配置已写入，重启 OpenCode 后才会加载"
+      return "没有取得宿主的加载证据，不当作已生效"
+    }
     return (
       <article class="ph-card" data-stale={stale() ? "true" : undefined} data-busy={busy() ? "true" : undefined}>
         <div class="ph-card-main">
           <div class="ph-card-head">
-            <div class="ph-tile">{initial(entry.name)}</div>
+            <div class="ph-tile" data-runtime={runtimeStatus()}>
+              {initial(entry.name)}
+            </div>
             <div class="ph-card-titles">
               <div class="ph-name-row">
-                <span class="ph-name">{entry.name}</span>
+                <span class="ph-name" title={entry.name}>
+                  {entry.name}
+                </span>
               </div>
-              <span class="ph-pkg">{entry.spec}</span>
-            </div>
-            <div class="ph-chips">
-              <span class="ph-badge" data-runtime={runtimeStatus()} title={runtimeLabel()}>
-                {runtimeLabel()}
-              </span>
-              <Show when={stale()}>
-                <span class="ph-badge" data-tone="accent">
-                  可更新 → v{info()!.latest}
-                </span>
-              </Show>
-              <Show when={unchecked()}>
-                <span class="ph-badge" data-tone="warning">
-                  未能检查
-                </span>
-              </Show>
-              <Show when={entry.kind === "path"}>
-                <span class="ph-badge">本地目录</span>
-              </Show>
+              <div class="ph-installed-meta" title={entry.spec}>
+                <span>{current() ? `v${current()}` : "版本未知"}</span>
+                <Show when={stale()}>
+                  <span class="ph-version-arrow">→ v{info()!.latest}</span>
+                </Show>
+                <Show when={info()?.license}>
+                  <span class="ph-dot" />
+                  <span>{info()!.license}</span>
+                </Show>
+                <Show when={info()?.publisher}>
+                  <span class="ph-dot" />
+                  <span>by {info()!.publisher}</span>
+                </Show>
+              </div>
             </div>
           </div>
           <div class="ph-card-body">
-            <div class="ph-meta">
-              {versionLabel(current(), info()?.latest ?? "", stale())}
-              <Show when={stale() && entry.kind === "path"}>
-                <span class="ph-dot" />
-                <span>更新会覆盖目录内容，原文件自动备份</span>
-              </Show>
-            </div>
-            <Show when={runtimeInfo()?.error}>
-              <div class="ph-runtime-error" title={runtimeInfo()!.error}>
-                <ui.Icon name="circle-exclamation" size="small" />
-                <span>{runtimeInfo()!.error}</span>
+            {/* 失败原因占用描述的两行位置，而不是把卡片撑高、让同排卡片留白。 */}
+            <Show
+              when={runtimeInfo()?.error}
+              fallback={
+                <div class="ph-desc ph-clamp" title={info()?.description || entry.spec}>
+                  {info()?.description || entry.spec}
+                </div>
+              }
+            >
+              <div class="ph-runtime-error ph-clamp" title={`${entry.spec}\n${runtimeInfo()!.error}`}>
+                加载失败：{runtimeInfo()!.error}
               </div>
+            </Show>
+          </div>
+          <div class="ph-card-status">
+            <span class="ph-badge" data-runtime={runtimeStatus()} title={runtimeHint()}>
+              {runtimeLabel()}
+            </span>
+            <Show when={entry.kind === "path"}>
+              <span class="ph-badge">本地目录</span>
+            </Show>
+            <Show when={stale()}>
+              <span class="ph-badge" data-tone="accent">
+                可更新
+              </span>
+            </Show>
+            <Show when={unchecked()}>
+              <span class="ph-badge" data-tone="warning" title={info()!.error}>
+                未能检查
+              </span>
             </Show>
           </div>
         </div>
         <div class="ph-actions">
-          <Show when={NPM_LIKE.test(entry.name)}>
+          <Show when={entry.kind !== "path" && NPM_LIKE.test(entry.name)}>
             <ui.Button
               variant="ghost"
               size="small"
@@ -1755,6 +1891,18 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
       </article>
     )
   }
+
+  const installedFilterButton = (id: InstalledFilter, label: string) => (
+    <button
+      class="ph-chip"
+      data-active={installedFilter() === id}
+      title={`${label}：${filterCounts()[id]} 个`}
+      onClick={() => setInstalledFilter(id)}
+    >
+      {label}
+      <span class="ph-chip-count">{filterCounts()[id]}</span>
+    </button>
+  )
 
   return (
     <div class="ph-root" data-embedded={props.embedded ? "true" : undefined}>
@@ -2075,23 +2223,25 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
 
         <Match when={tab() === "installed"}>
           <section class="ph-panel" role="tabpanel" id="ph-tabpanel" aria-labelledby={`ph-tab-${tab()}`}>
-            <div class="ph-resultbar">
+            <div class="ph-installed-bar">
               <h3 class="ph-h3">
                 已安装 <span class="ph-count">{state()?.plugins.length ?? 0}</span>
               </h3>
+              <div class="ph-installed-search">
+                <ui.TextInput
+                  label="搜索已安装插件"
+                  placeholder="搜索名称、来源或描述"
+                  type="search"
+                  value={installedQuery()}
+                  onInput={setInstalledQuery}
+                />
+              </div>
               <div class="ph-chips">
-                <button
-                  class="ph-chip"
-                  data-active={staleOnly()}
-                  data-disabled={outdated() === 0 ? "true" : undefined}
-                  title={outdated() === 0 ? "检查更新后再来看可更新的插件" : "只显示有新版本的插件"}
-                  onClick={() => {
-                    if (outdated() > 0) setStaleOnly(!staleOnly())
-                  }}
-                >
-                  可更新
-                  <span class="ph-chip-count">{outdated()}</span>
-                </button>
+                {installedFilterButton("all", "全部")}
+                {installedFilterButton("update", "可更新")}
+                {installedFilterButton("failed", "加载失败")}
+                {installedFilterButton("pending", "待重启")}
+                {installedFilterButton("unknown", "未验证")}
               </div>
               <span class="ph-spacer" />
               <Show when={checked()}>
@@ -2118,21 +2268,28 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
                 when={visiblePlugins().length > 0}
                 fallback={
                   <div class="ph-empty">
-                    <ui.Icon name="checklist" size="large" />
+                    <ui.Icon name={installedQuery().trim() ? "magnifying-glass" : "checklist"} size="large" />
                     <Show
-                      when={uncheckedCount() > 0}
+                      when={installedQuery().trim()}
                       fallback={
                         <>
-                          <strong>没有可更新的插件</strong>
-                          <span>已检查的插件都已是最新版本。点工具栏的「检查更新」可以再查一次。</span>
+                          <strong>当前筛选下没有插件</strong>
+                          <span>已安装的插件没有符合这个状态的条目。可以切回「全部」，或点「检查更新」刷新状态。</span>
                         </>
                       }
                     >
-                      <strong>有 {uncheckedCount()} 个插件未能检查</strong>
-                      <span>部分插件没能连上 npm registry，不能当作“已是最新”。点工具栏的「检查更新」重试。</span>
+                      <strong>没有匹配“{installedQuery().trim()}”的插件</strong>
+                      <span>已安装插件的名称、来源和描述里都没有这个关键词。</span>
                     </Show>
-                    <ui.Button variant="ghost" size="small" onClick={() => setStaleOnly(false)}>
-                      显示全部
+                    <ui.Button
+                      variant="ghost"
+                      size="small"
+                      onClick={() => {
+                        setInstalledFilter("all")
+                        setInstalledQuery("")
+                      }}
+                    >
+                      清除筛选
                     </ui.Button>
                   </div>
                 }

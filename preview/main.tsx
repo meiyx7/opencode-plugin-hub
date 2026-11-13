@@ -4,16 +4,56 @@ import { PluginHubDialog, PluginHubPage } from "../src/gui/page"
 // admin 模块引用 node:child_process / fs；浏览器里用简化 mock 替代
 // （预览重点验收 UI 与交互，网络请求用真 fetch 走 npm/awesome-opencode）。
 
+// 按本机真实配置构造 10 条，覆盖 npm 包、本地目录、可更新、加载失败等形态。
 const fakeState = {
   configPath: "/Users/meiyx/.config/opencode/opencode.json",
   configKey: "plugins",
   plugins: [
-    { spec: "opencode-plugin-hub", name: "opencode-plugin-hub", kind: "package", version: "0.1.4", removable: false },
-    { spec: "opencode-usage-center", name: "opencode-usage-center", kind: "package", version: "0.2.0", removable: true },
-    { spec: "opencode-qoder-bridge", name: "opencode-qoder-bridge", kind: "package", version: "0.3.2", removable: true },
+    { spec: "opencode-mobile-notifications", name: "opencode-mobile-notifications", kind: "package", version: "0.1.2", removable: true },
+    { spec: "./local-plugins/trae-auth-multi", name: "opencode-trae-auth-multi", kind: "path", version: "0.0.1", removable: true },
+    { spec: "opencode-plugin-hub@0.3.2", name: "opencode-plugin-hub", kind: "package", version: "0.3.2", removable: false },
+    { spec: "opencode-usage-center@0.3.1", name: "opencode-usage-center", kind: "package", version: "0.3.1", removable: true },
+    { spec: "opencode-schedule-center@0.1.11", name: "opencode-schedule-center", kind: "package", version: "0.1.11", removable: true },
+    { spec: "opencode-timeline-gui@0.2.7", name: "opencode-timeline-gui", kind: "package", version: "0.2.7", removable: true },
+    { spec: "@magpie-community/opencode-workbuddy-auth@0.2.31", name: "@magpie-community/opencode-workbuddy-auth", kind: "package", version: "0.2.31", removable: true },
+    { spec: "magpie-workbuddy-growth", name: "magpie-workbuddy-growth", kind: "package", version: "1.0.3", removable: true },
+    { spec: "@magpie-community/opencode-zcode-auth@0.1.61", name: "@magpie-community/opencode-zcode-auth", kind: "package", version: "0.1.61", removable: true },
+    { spec: "@magpie-community/opencode-qoder-auth@0.2.67", name: "@magpie-community/opencode-qoder-auth", kind: "package", version: "0.2.67", removable: true },
   ],
   error: "",
 }
+
+const summaries: Record<string, { description: string; license: string; publisher: string }> = {
+  "opencode-mobile-notifications": { description: "Send OpenCode notifications to your phone with a callback URL.", license: "MIT", publisher: "meiyx7" },
+  "opencode-plugin-hub": { description: "Plugin manager for OpenCode Desktop: browse community plugins, search npm and install without editing JSON.", license: "MIT", publisher: "meiyx7" },
+  "opencode-usage-center": { description: "Token usage, cost and cache-hit dashboard for OpenCode sessions.", license: "MIT", publisher: "meiyx7" },
+  "opencode-schedule-center": { description: "Schedule prompts and recurring agent jobs from inside OpenCode.", license: "MIT", publisher: "meiyx7" },
+  "opencode-timeline-gui": { description: "Turn-by-turn navigation through long sessions, with bookmarks and context jumps.", license: "MIT", publisher: "meiyx7" },
+  "@magpie-community/opencode-workbuddy-auth": { description: "WorkBuddy account authentication provider for the magpie plugin family.", license: "MIT", publisher: "magpie-community" },
+  "magpie-workbuddy-growth": { description: "WorkBuddy 国内版成长计划与任务签到管家（发现页入口包）：成长计划任务树一键点亮 / 任务签到领取积分 / 猫猫旅行。", license: "MIT", publisher: "connoryang331" },
+  "@magpie-community/opencode-zcode-auth": { description: "ZCode authentication provider for OpenCode.", license: "MIT", publisher: "magpie-community" },
+  "@magpie-community/opencode-qoder-auth": { description: "Qoder authentication provider for OpenCode.", license: "MIT", publisher: "magpie-community" },
+}
+
+const fakeUpdates = fakeState.plugins.map((entry) => {
+  const summary = summaries[entry.name] ?? { description: "", license: "", publisher: "" }
+  const latest = entry.name === "opencode-usage-center" ? "0.3.2" : entry.name === "opencode-timeline-gui" ? "0.2.8" : entry.version
+  return {
+    spec: entry.spec,
+    name: entry.name,
+    kind: entry.kind,
+    current: entry.version,
+    latest,
+    hasUpdate: latest !== entry.version,
+    managed: entry.kind !== "path",
+    description: entry.kind === "path" ? "本地 directory 插件，直接加载工作区里的实现。" : summary.description,
+    license: summary.license,
+    homepage: "",
+    repo: "",
+    publisher: summary.publisher,
+    error: entry.name === "opencode-trae-auth-multi" ? "不是 npm 包名，无法查询版本" : "",
+  }
+})
 
 function Button(props: { children?: unknown; onClick?: (event: MouseEvent) => void; busy?: boolean; disabled?: boolean; variant?: string; size?: string; icon?: string }) {
   return (
@@ -90,15 +130,7 @@ const ctx = {
   client: {},
   main: () => ({
     snapshot: async () => fakeState,
-    updates: async () => ({
-      items: [
-        { spec: "opencode-plugin-hub", name: "opencode-plugin-hub", kind: "package", current: "0.1.4", latest: "0.1.4", hasUpdate: false, managed: true, error: "" },
-        { spec: "opencode-usage-center", name: "opencode-usage-center", kind: "package", current: "0.2.0", latest: "0.2.1", hasUpdate: true, managed: true, error: "" },
-        { spec: "opencode-qoder-bridge", name: "opencode-qoder-bridge", kind: "package", current: "0.3.2", latest: "0.3.3", hasUpdate: true, managed: true, error: "" },
-        { spec: "/local/dev-plugin", name: "dev-plugin", kind: "path", current: "1.0.0", latest: "", hasUpdate: false, managed: false, error: "无法连接 npm registry，本次未检查" },
-      ],
-      error: "",
-    }),
+    updates: async () => ({ items: fakeUpdates, error: "" }),
     search: async (input: { query: string }) => {
       const text = input.query.trim() ? `${input.query.trim()} keywords:opencode-plugin` : "keywords:opencode-plugin"
       const response = await fetch(`https://registry.npmjs.org/-/v1/search?size=25&text=${encodeURIComponent(text)}`)
@@ -191,12 +223,15 @@ const ctx = {
     restart: async () => ({ ok: false }),
     // 预览里展示运行状态徽章：一条已加载、一条未知，用于核对 UI 呈现。
     runtime: async () => ({
-      items: fakeState.plugins.map((entry, index) => ({
+      items: fakeState.plugins.map((entry) => ({
         spec: entry.spec,
         name: entry.name,
-        status: index === 0 ? "loaded" : "unknown",
-        runtimeVersion: index === 0 ? entry.version : "",
-        error: "",
+        status: entry.name === "magpie-workbuddy-growth" ? "failed" : "loaded",
+        runtimeVersion: entry.version,
+        error:
+          entry.name === "magpie-workbuddy-growth"
+            ? "Plugin must export a default definition with an id and an effect or setup function."
+            : "",
         available: true,
       })),
       error: "",
@@ -218,7 +253,8 @@ const ctx = {
   layout: { settings: () => undefined },
 } as unknown as Context
 
-const embedded = new URLSearchParams(window.location.search).has("embedded")
+const params = new URLSearchParams(window.location.search)
+const embedded = params.has("embedded")
 render(
   () => (
     <>
@@ -228,3 +264,7 @@ render(
   ),
   document.getElementById("root")!,
 )
+// 截图/回归时可直接落到指定页签：?tab=installed
+if (params.get("tab") === "installed") {
+  setTimeout(() => document.querySelectorAll<HTMLButtonElement>(".ph-tab")[2]?.click(), 0)
+}
