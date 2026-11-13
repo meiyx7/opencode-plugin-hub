@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process"
 import { homedir, tmpdir } from "node:os"
-import { basename, join } from "node:path"
+import { basename, isAbsolute, join, resolve } from "node:path"
 import { copyFile, cp, mkdir, mkdtemp, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises"
 import { applyEdits, modify, parse, type ParseError } from "jsonc-parser"
 
@@ -179,7 +179,10 @@ function expandPath(spec: string): string {
   const trimmed = spec.trim()
   if (trimmed === "~") return homedir()
   if (trimmed.startsWith("~/")) return join(homedir(), trimmed.slice(2))
-  return trimmed
+  // The server resolves relative plugin paths against the opencode config
+  // directory (e.g. "./local-plugins/x" -> ~/.config/opencode/local-plugins/x),
+  // not the process cwd. Resolve the same way so identity comparisons match.
+  return isAbsolute(trimmed) ? trimmed : resolve(configDir(), trimmed)
 }
 
 interface Manifest {
@@ -1091,8 +1094,8 @@ export async function runtime(endpoint: { url: string; headers: Readonly<Record<
         if (source.type === "package" && typeof source.target === "string") {
           return splitSpec(source.target).name === name
         }
-        if (source.type === "local" && entry.kind === "path") {
-          return source.path === expandPath(entry.spec)
+        if (source.type === "local" && entry.kind === "path" && typeof source.path === "string") {
+          return resolve(source.path) === resolve(expandPath(entry.spec))
         }
         return false
       })

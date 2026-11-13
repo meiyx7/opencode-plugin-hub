@@ -431,6 +431,16 @@ const CSS = `
 .ph-card-main { display: flex; flex: 1; flex-direction: column; gap: 8px; min-width: 0; }
 .ph-card-body { display: flex; flex: 1; flex-direction: column; gap: 5px; min-width: 0; }
 .ph-card-body[role="button"] { cursor: pointer; border-radius: 6px; }
+/* 加载失败时把服务端给出的原因放在卡片里，而不是只留一个徽章。 */
+.ph-runtime-error {
+  display: flex;
+  align-items: flex-start;
+  gap: 4px;
+  color: var(--ph-danger);
+  font-size: 10.5px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
 .ph-card-head { display: flex; align-items: flex-start; gap: 9px; }
 .ph-card-titles { display: flex; flex: 1; flex-direction: column; gap: 2px; min-width: 0; }
 .ph-tile {
@@ -1700,6 +1710,12 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
                 <span>更新会覆盖目录内容，原文件自动备份</span>
               </Show>
             </div>
+            <Show when={runtimeInfo()?.error}>
+              <div class="ph-runtime-error" title={runtimeInfo()!.error}>
+                <ui.Icon name="circle-exclamation" size="small" />
+                <span>{runtimeInfo()!.error}</span>
+              </div>
+            </Show>
           </div>
         </div>
         <div class="ph-actions">
