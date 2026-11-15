@@ -433,6 +433,42 @@ test("启动失败能准确报告：launch 抛错与立即退出分别对应 lau
   assert.match(r2.detail, /launch-died/)
 })
 
+test("launch 返回被拒绝的 Promise（真实 spawn 的异步 error）：以 launch-failed:<原因> 收尾", async () => {
+  const world = baseWorld()
+  autoExit(world)
+  const ops = fakeOps(world)
+  const statuses: { phase: string; detail: string }[] = []
+  const withRecord = ops as Record<string, unknown>
+  withRecord.launch = () => {
+    const err = Object.assign(new Error("spawn node ENOENT"), { code: "ENOENT" })
+    return Promise.reject(err)
+  }
+  withRecord.writeStatus = (phase: string, detail: string) => {
+    statuses.push({ phase, detail })
+  }
+  const result = await run(basePayload(world), ops)
+  assert.equal(result.phase, "failed")
+  assert.match(result.detail, /launch-failed:ENOENT/)
+  assert.equal(world.launches.length, 0, "启动失败后不得进入验证循环")
+  assert.equal(statuses.at(-1)!.phase, "failed")
+})
+
+test("launch 的 Promise 在 spawn 事件后成功：流程照常进入验证", async () => {
+  const world = baseWorld()
+  autoExit(world)
+  const ops = fakeOps(world)
+  const withRecord = ops as Record<string, unknown>
+  withRecord.launch = (exe: string, args: readonly string[], cwd: string, env: Record<string, string>) => {
+    const pid = 53100
+    world.launches.push({ exe, args, cwd, env })
+    world.procs.set(pid, { pid, ppid: 1, uid: 501, lstart: "Sat Nov 15 19:00:00 2026", comm: exe })
+    world.lockTarget = `meiyxMac.local-${pid}`
+    return Promise.resolve({ pid })
+  }
+  const result = await run(basePayload(world), ops)
+  assert.equal(result.phase, "new-started")
+})
+
 // ---------------------------------------------------------------------------
 // 契约与解析
 // ---------------------------------------------------------------------------

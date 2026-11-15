@@ -18,6 +18,7 @@ const entries = [
   "restart-planner.test.ts",
   "restart-supervisor.test.ts",
   "restart-collect.test.ts",
+  "restart-launch.test.ts",
 ]
 
 await rm(outDir, { recursive: true, force: true })

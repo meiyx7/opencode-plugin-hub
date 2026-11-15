@@ -1,11 +1,12 @@
 import { execFileSync, spawn } from "node:child_process"
-import { existsSync, readlinkSync, writeFileSync } from "node:fs"
+import { existsSync, readlinkSync } from "node:fs"
 import { homedir, tmpdir } from "node:os"
 import { basename, dirname, isAbsolute, join, resolve } from "node:path"
 import { copyFile, cp, mkdir, mkdtemp, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises"
 import { applyEdits, modify, parse, type ParseError } from "jsonc-parser"
 import { downloadsFor, registryFetch, type Downloads } from "./registry"
 import { collectRestartSnapshot, parseProcLine, whitelistEnv, type CollectResult } from "./restart-collect"
+import { instanceStatusPath, launchRestartSupervisor, readRestartStatusFile, type SpawnChild } from "./restart-launch"
 import { SUPERVISOR_SOURCE } from "./restart-supervisor"
 
 export interface InstalledEntryValue {
@@ -1136,8 +1137,10 @@ export async function openConfig(): Promise<boolean> {
  *  - the actual execution is delegated to a detached supervisor
  *    (`restart-supervisor.ts`) that outlives this process and re-checks the
  *    instance credential (PID + start time) before EVERY signal, including
- *    KILL, so a recycled PID can never be mistaken for the original target;
- *  - "accepted" only means the supervisor was launched — the real outcome is
+ *    KILL, so a recycled PID is refused on any credential mismatch (the
+ *    second-resolution start time narrows, but does not eliminate, the
+ *    PID-reuse window — see the credential note in restart-collect.ts);
+ *  - "accepted" only means the supervisor spawn has taken — the real outcome is
  *    recorded in the status file and read back via `restartStatus()`.
  */
 export interface RestartOutcomeValue {
@@ -1155,22 +1158,28 @@ export interface RestartStatusValue {
   detail: string
 }
 
-function restartDir(): string {
-  const xdg = process.env.XDG_CACHE_HOME
-  return xdg ? join(xdg, "opencode", "plugin-hub") : join(homedir(), ".cache", "opencode", "plugin-hub")
-}
-
-function electronLockPath(): string | null {
+/**
+ * The user-data-dir of the CURRENT Electron instance — the stable per-instance
+ * identity (TASK-3). Null outside the Electron main process (tests, CLI-only);
+ * callers must fail closed instead of falling back to a shared location that
+ * side-by-side instances would read or overwrite.
+ */
+function electronUserDataPath(): string | null {
   try {
     // Resolved at runtime inside the Electron main process; the bundler never
     // sees it, and outside Electron (tests, servers) this returns null.
     const dynamicRequire = eval("require") as (id: string) => unknown
     const electron = dynamicRequire("electron") as { app?: { getPath?: (name: string) => string } } | undefined
     const userData = electron?.app?.getPath?.("userData")
-    return userData ? join(userData, "SingletonLock") : null
+    return typeof userData === "string" && userData.length > 0 ? userData : null
   } catch {
     return null
   }
+}
+
+function electronLockPath(): string | null {
+  const userData = electronUserDataPath()
+  return userData ? join(userData, "SingletonLock") : null
 }
 
 /** Locates a Node runtime able to host the detached supervisor script. */
@@ -1198,12 +1207,38 @@ function supervisorEnv(): Record<string, string> {
 let lastAcceptedAt = 0
 
 export async function restart(development = false): Promise<RestartOutcomeValue> {
-  const statusPath = join(restartDir(), "restart-status.json")
   const requestId = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
+  if (development) {
+    return {
+      ok: false,
+      phase: "refused",
+      requestId,
+      message: "开发模式下不执行自动重启，请手动完全退出 OpenCode 后重新打开。",
+    }
+  }
+  // Per-instance status file (TASK-3): keyed by THIS instance's user-data-dir.
+  // Null means no stable instance identity — fail closed, never fall back to a
+  // shared file another instance could read or overwrite.
+  const statusPath = instanceStatusPath(electronUserDataPath())
   // Duplicate guard: one supervisor per instance at a time; a very recent
   // accepted record means another restart is already in flight.
   if (Date.now() - lastAcceptedAt < 60_000) {
-    return { ok: false, phase: "refused", message: "已有一次重启请求在执行中，请稍候或查看其结果后再试。", requestId, statusPath }
+    return {
+      ok: false,
+      phase: "refused",
+      message: "已有一次重启请求在执行中，请稍候或查看其结果后再试。",
+      requestId,
+      statusPath: statusPath ?? undefined,
+    }
+  }
+  if (!statusPath) {
+    return {
+      ok: false,
+      phase: "refused",
+      message:
+        "无法确定当前实例的用户数据目录，无法为本次重启写入实例隔离的状态文件，已取消自动重启且未结束任何进程。",
+      requestId,
+    }
   }
   let collected: CollectResult
   try {
@@ -1274,51 +1309,45 @@ export async function restart(development = false): Promise<RestartOutcomeValue>
         "未找到可用的 Node 运行时来承载重启监督流程，已取消自动重启且未结束任何进程。请手动完全退出 OpenCode（并结束残留的 serve --service 后台服务）后重新打开。",
     }
   }
-  try {
-    mkdir(dirname(statusPath), { recursive: true })
-    writeFileSync(
-      statusPath,
-      JSON.stringify({ requestId, phase: "accepted", at: Date.now(), detail: "supervisor-launched" }),
-    )
-    const child = spawn(
-      collected.runtimePath,
-      ["-e", SUPERVISOR_SOURCE, "run", JSON.stringify(collected.payload)],
-      { detached: true, stdio: "ignore", env: supervisorEnv() },
-    )
-    if (!child.pid || child.pid <= 0) {
-      return { ok: false, phase: "failed", message: "重启监督流程启动失败，未结束任何进程。请手动重启。", requestId, statusPath }
-    }
-    child.unref()
-    lastAcceptedAt = Date.now()
-    return {
-      ok: true,
-      phase: "accepted",
-      message: "已受理重启请求：监督流程将退出当前实例并用原启动方式重新打开。",
-      requestId,
-      statusPath,
-    }
-  } catch (error) {
-    return { ok: false, phase: "failed", message: `重启监督流程启动失败：${describe(error)}`, requestId, statusPath }
+  // The launcher owns the status-file timing (TASK-1: synchronous directory
+  // creation before the first write) and the spawn semantics (TASK-2: wait for
+  // the spawn event or the async error event; never equate a returned pid with
+  // a started supervisor).
+  const launched = await launchRestartSupervisor({
+    runtimePath: collected.runtimePath,
+    source: SUPERVISOR_SOURCE,
+    payload: collected.payload,
+    statusPath,
+    requestId,
+    env: supervisorEnv(),
+    spawnChild: (exe, args, opts) => spawn(exe, args, opts),
+  })
+  if (launched.phase === "accepted") lastAcceptedAt = Date.now()
+  return {
+    ok: launched.ok,
+    phase: launched.phase,
+    message: launched.message,
+    requestId,
+    statusPath,
   }
 }
 
-/** Reads the restart status the supervisor recorded (best effort). */
+/**
+ * Reads the restart status the supervisor recorded (best effort).
+ *
+ * Reads ONLY this instance's own status file: the path comes from the exact
+ * same identity rule as `restart()` (`instanceStatusPath` over this
+ * instance's user-data-dir), so a record left by a side-by-side instance can
+ * never be reported here. The pre-isolation shared `restart-status.json` is
+ * deliberately never read again — its record could belong to any instance,
+ * which is precisely the bug this isolation removes. Consequence: a restart
+ * triggered by an older build leaves no report on the next page load.
+ */
 export async function restartStatus(): Promise<{ found: boolean; status?: RestartStatusValue }> {
-  try {
-    const raw = JSON.parse(await readFile(join(restartDir(), "restart-status.json"), "utf8")) as Record<string, unknown>
-    if (typeof raw.phase !== "string") return { found: false }
-    return {
-      found: true,
-      status: {
-        requestId: typeof raw.requestId === "string" ? raw.requestId : "",
-        phase: raw.phase,
-        at: typeof raw.at === "number" ? raw.at : 0,
-        detail: typeof raw.detail === "string" ? raw.detail : "",
-      },
-    }
-  } catch {
-    return { found: false }
-  }
+  const statusPath = instanceStatusPath(electronUserDataPath())
+  if (!statusPath) return { found: false }
+  const status = await readRestartStatusFile(statusPath)
+  return status ? { found: true, status } : { found: false }
 }
 
 /** Asks the CLI to reload its configuration. A full restart is still needed for provider snapshots. */

@@ -5,7 +5,7 @@
 import assert from "node:assert/strict"
 import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
-import { join } from "node:path"
+import { dirname, join } from "node:path"
 import { afterEach, beforeEach, test } from "node:test"
 import * as admin from "../src/gui/admin.ts"
 import {
@@ -15,6 +15,7 @@ import {
   type CollectDeps,
   type ParsedProc,
 } from "../src/gui/restart-collect.ts"
+import { instanceStatusPath, readRestartStatusFile } from "../src/gui/restart-launch.ts"
 
 const APP_EXE = "/Applications/OpenCode.app/Contents/MacOS/OpenCode"
 const SIDECAR_EXE =
@@ -227,45 +228,61 @@ test("环境变量白名单函数：基础键与前缀族保留", () => {
 })
 
 // ---------------------------------------------------------------------------
-// admin.restartStatus()：监督流程结果的状态文件回读
+// 状态回读：读取与校验逻辑在 restart-launch.readRestartStatusFile，
+// admin.restartStatus 只负责用「本实例」的路径调用它。
 // ---------------------------------------------------------------------------
 
-test("restartStatus：读到记录 / 无记录 / 坏记录都如实报告", async () => {
+test("状态回读：读到记录 / 无记录 / 坏记录都如实报告", async () => {
   const cacheHome = join(temp, "cache")
-  await mkdir(join(cacheHome, "opencode", "plugin-hub"), { recursive: true })
-  process.env.XDG_CACHE_HOME = cacheHome
-  try {
-    const missing = await admin.restartStatus()
-    assert.equal(missing.found, false)
+  const userData = join(temp, "userdata-A")
+  const statusPath = instanceStatusPath(userData, join(cacheHome, "opencode", "plugin-hub"))!
+  await mkdir(dirname(statusPath), { recursive: true })
+  assert.equal(await readRestartStatusFile(statusPath), null, "无记录")
 
-    const statusPath = join(cacheHome, "opencode", "plugin-hub", "restart-status.json")
-    await writeFile(
-      statusPath,
-      JSON.stringify({ requestId: "req-9", phase: "new-started", at: 1234, detail: "pid:123" }),
-    )
-    const found = await admin.restartStatus()
-    assert.equal(found.found, true)
-    assert.deepEqual(found.status, { requestId: "req-9", phase: "new-started", at: 1234, detail: "pid:123" })
+  await writeFile(statusPath, JSON.stringify({ requestId: "req-9", phase: "new-started", at: 1234, detail: "pid:123" }))
+  assert.deepEqual(await readRestartStatusFile(statusPath), {
+    requestId: "req-9",
+    phase: "new-started",
+    at: 1234,
+    detail: "pid:123",
+  })
 
-    await writeFile(statusPath, "not json at all {{{")
-    assert.equal((await admin.restartStatus()).found, false)
-  } finally {
-    if (process.env.XDG_CACHE_HOME === cacheHome) delete process.env.XDG_CACHE_HOME
-  }
+  await writeFile(statusPath, "not json at all {{{")
+  assert.equal(await readRestartStatusFile(statusPath), null, "坏记录")
+
+  await writeFile(statusPath, JSON.stringify({ at: 1 }))
+  assert.equal(await readRestartStatusFile(statusPath), null, "缺 phase 字段")
 })
 
-test("restartStatus 记录过旧时由页面负责判龄（文件本身完整保留）", async () => {
+test("状态回读：只认本实例的路径（由 user-data-dir 派生），过旧记录由页面判龄", async () => {
   const cacheHome = join(temp, "cache2")
-  await mkdir(join(cacheHome, "opencode", "plugin-hub"), { recursive: true })
+  const baseDir = join(cacheHome, "opencode", "plugin-hub")
+  // 同一 user-data-dir 派生路径稳定；换一个实例路径就是另一个文件
+  const statusPath = instanceStatusPath(join(temp, "userdata-A"), baseDir)!
+  assert.equal(statusPath, instanceStatusPath(join(temp, "userdata-A"), baseDir))
+  assert.notEqual(statusPath, instanceStatusPath(join(temp, "userdata-B"), baseDir))
+  await mkdir(dirname(statusPath), { recursive: true })
+  await writeFile(statusPath, JSON.stringify({ requestId: "old", phase: "failed", at: 1, detail: "x" }))
+  const status = await readRestartStatusFile(statusPath)
+  assert.equal(status!.at, 1)
+  const raw = JSON.parse(await readFile(statusPath, "utf8")) as { phase: string }
+  assert.equal(raw.phase, "failed")
+})
+
+test("admin.restartStatus（无 Electron 环境）：fail-closed，且不回读旧的共享 restart-status.json", async () => {
+  const cacheHome = join(temp, "cache-legacy")
+  const legacyDir = join(cacheHome, "opencode", "plugin-hub")
+  await mkdir(legacyDir, { recursive: true })
   process.env.XDG_CACHE_HOME = cacheHome
   try {
-    const statusPath = join(cacheHome, "opencode", "plugin-hub", "restart-status.json")
-    await writeFile(statusPath, JSON.stringify({ requestId: "old", phase: "failed", at: 1, detail: "x" }))
-    const found = await admin.restartStatus()
-    assert.equal(found.found, true)
-    assert.equal(found.status!.at, 1)
-    const raw = JSON.parse(await readFile(statusPath, "utf8")) as { phase: string }
-    assert.equal(raw.phase, "failed")
+    // 旧版（实例隔离前）把状态写在共享路径；这里故意放一条记录，
+    // 确保新实现绝不会把它当作本实例的重启结果误读。
+    await writeFile(
+      join(legacyDir, "restart-status.json"),
+      JSON.stringify({ requestId: "legacy", phase: "new-started", at: 42, detail: "someone-else" }),
+    )
+    const result = await admin.restartStatus()
+    assert.equal(result.found, false)
   } finally {
     if (process.env.XDG_CACHE_HOME === cacheHome) delete process.env.XDG_CACHE_HOME
   }

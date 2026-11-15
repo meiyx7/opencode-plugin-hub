@@ -20,8 +20,12 @@
  *   7. record every phase in the status file for the UI to pick up later.
  *
  * The instance credential against PID reuse is the process START TIME
- * (`ps -o lstart=`): a recycled PID gets a fresh start time, so any
- * pid+exe+uid coincidence without the same start time is refused. KILL is
+ * (`ps -o lstart=`, second-resolution): a recycled PID gets a fresh start
+ * time, so a pid+exe+uid coincidence without the same start time is refused.
+ * This narrows but does NOT eliminate the PID-reuse window (see the
+ * credential note in restart-collect.ts); the fail-closed posture — refuse on
+ * any mismatch, never reuse an earlier re-check — is what keeps signalling
+ * safe. KILL is
  * always preceded by a fresh re-check that re-reads the start time; results
  * from earlier re-checks are never reused.
  *
@@ -78,9 +82,27 @@ function makeRealOps(payload) {
       try { return fs.readlinkSync(p) } catch (e) { return null }
     },
     launch: function (exe, args, cwd, env) {
-      var child = cp.spawn(exe, args, { cwd: cwd, env: env, detached: true, stdio: 'ignore' })
-      child.unref()
-      return { pid: child.pid }
+      // Spawn proof, not a pid guess: Node reports launch failures (ENOENT,
+      // EACCES, ...) only asynchronously via the error event, so the flow
+      // awaits either the spawn event (the process really exists) or the
+      // error event before doing anything else. close/exit are deliberately
+      // not observed here — the verification loop below decides life or
+      // death from the process table, not from child events.
+      return new Promise(function (resolve, reject) {
+        var child = cp.spawn(exe, args, { cwd: cwd, env: env, detached: true, stdio: 'ignore' })
+        var settled = false
+        child.on('error', function (e) {
+          if (settled) return
+          settled = true
+          reject(e)
+        })
+        child.on('spawn', function () {
+          if (settled) return
+          settled = true
+          child.unref()
+          resolve({ pid: child.pid })
+        })
+      })
     },
     now: function () { return Date.now() },
     writeStatus: function (phase, detail) {
@@ -185,12 +207,18 @@ async function runSupervisorFlow(payload, ops) {
   if (foreignLockPid !== null) return done('failed', 'lock-held-by-live-pid:' + foreignLockPid, 1)
 
   // 5. relaunch the ORIGINAL executable with the ORIGINAL argv, cwd and the
-  //    whitelisted environment recorded at plan time.
+  //    whitelisted environment recorded at plan time. launch() resolves only
+  //    when the spawn has actually taken (spawn event) and rejects with the
+  //    real spawn error otherwise, so a launch failure is reported with its
+  //    reason instead of being mislabeled later as 'launch-died'.
   var child
   try {
-    child = ops.launch(app.exe, app.argv.slice(1), app.cwd, payload.env || {})
+    child = await ops.launch(app.exe, app.argv.slice(1), app.cwd, payload.env || {})
   } catch (e) {
-    return done('failed', 'launch-failed', 1)
+    return done('failed', 'launch-failed:' + ((e && e.code) || (e && e.message) || 'unknown'), 1)
+  }
+  if (!child || !isFinite(child.pid) || child.pid <= 0) {
+    return done('failed', 'launch-failed:no-pid', 1)
   }
   ops.writeStatus('relaunching', 'pid:' + child.pid)
 

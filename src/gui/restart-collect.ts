@@ -86,6 +86,21 @@ const ENV_PREFIXES = ["XDG_", "OPENCODE_"]
  * (four tokens, e.g. `Thu Nov 15 18:24:15 2026`) is kept as an opaque string:
  * it is the process-instance credential that PID-reuse protection compares.
  * Must stay in sync with the copy inside the supervisor source.
+ *
+ * Credential strength note (deliberate, do not "fix" by loosening):
+ * `lstart` renders at SECOND resolution and is therefore NOT a unique OS
+ * process identity. The kernel keeps a microsecond start time, but it is only
+ * reachable via `proc_pidinfo`/`sysctl` — native code, not available to a
+ * pure-JS plugin, and no `ps`-level field offers more precision on macOS.
+ * What the credential set (pid + ppid + uid + exe + second-resolution
+ * lstart) does guarantee: any PID reuse that survives all five checks must
+ * recycle the PID within the same calendar second for the same executable
+ * under the same UID — macOS allocates PIDs monotonically, so that requires
+ * wrapping the whole PID space in under a second. Every signal (TERM and
+ * KILL alike) is preceded by a FRESH re-check in the supervisor; a stale
+ * check is never trusted; any missing or contradictory field refuses
+ * outright (fail-closed). This narrows the reuse window far below anything
+ * exploitable, but it is not claimed to be zero.
  */
 export function parseProcLine(line: string): ParsedProc | null {
   const tokens = line.trim().split(/\s+/)
