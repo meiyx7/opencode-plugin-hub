@@ -112,7 +112,7 @@ function makeRealOps(payload) {
       if (lines.length === 0) return null
       return parseProcLine(lines[0])
     },
-    getPpid: function () { return process.getppid() },
+    getPpid: function () { return process.ppid },
     signal: function (pid, sig) { cp.spawnSync('kill', ['-' + sig, String(pid)], { stdio: 'ignore' }) },
     sleep: function (ms) { return new Promise(function (r) { setTimeout(r, ms) }) },
     readLink: function (p) {
@@ -307,7 +307,22 @@ var runMark = process.argv.indexOf('run', 1)
 if (runMark > 0) {
   var payload = JSON.parse(process.argv[runMark + 1])
   var ops = makeRealOps(payload)
-  runSupervisorFlow(payload, ops).then(function (r) { process.exit(r.exitCode) }, function () { process.exit(1) })
+  // A rejection here must never be silent: the status file is the only
+  // channel back to the UI, so an internal error is recorded as failed.
+  runSupervisorFlow(payload, ops).then(
+    function (r) { process.exit(r.exitCode) },
+    function (e) {
+      try {
+        require('node:fs').writeFileSync(payload.statusPath, JSON.stringify({
+          requestId: (payload && payload.requestId) || '',
+          phase: 'failed',
+          at: Date.now(),
+          detail: 'supervisor-internal-error:' + ((e && e.message) || String(e)),
+        }))
+      } catch (e2) { /* status path unknown — nothing else to report to */ }
+      process.exit(1)
+    },
+  )
 }
 
 module.exports = { runSupervisorFlow: runSupervisorFlow, makeRealOps: makeRealOps, parseProcLine: parseProcLine }

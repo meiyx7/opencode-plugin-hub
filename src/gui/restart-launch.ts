@@ -30,7 +30,7 @@
  * overwrite each other's restart records.
  */
 import { createHash } from "node:crypto"
-import { mkdirSync, writeFileSync } from "node:fs"
+import { mkdirSync, openSync, writeFileSync } from "node:fs"
 import { readFile } from "node:fs/promises"
 import { homedir } from "node:os"
 import { dirname, join } from "node:path"
@@ -109,7 +109,7 @@ export interface SpawnedChild {
 export type SpawnChild = (
   exe: string,
   args: readonly string[],
-  options: { detached: true; stdio: "ignore"; env: Record<string, string> },
+  options: { detached: true; stdio: "ignore" | [number, number, number]; env: Record<string, string> },
 ) => SpawnedChild
 
 export interface LaunchOutcome {
@@ -175,9 +175,23 @@ export async function launchRestartSupervisor(options: {
 
   let child: SpawnedChild
   try {
+    // Diagnostics escape hatch: when OPENCODE_PLUGIN_HUB_RESTART_DIAG is set
+    // (it survives the env whitelist because of the OPENCODE_ prefix), the
+    // supervisor's stderr is captured to that file instead of being dropped.
+    // Production default stays stdio:"ignore".
+    let stdio: "ignore" | [number, number, number] = "ignore"
+    const diag = process.env.OPENCODE_PLUGIN_HUB_RESTART_DIAG
+    if (diag) {
+      try {
+        const fd = openSync(diag, "a")
+        stdio = ["ignore", fd, fd]
+      } catch {
+        stdio = "ignore"
+      }
+    }
     child = options.spawnChild(options.runtimePath, ["-e", options.source, "run", JSON.stringify(options.payload)], {
       detached: true,
-      stdio: "ignore",
+      stdio,
       env: options.env,
     })
   } catch (error) {
