@@ -1,6 +1,7 @@
 import { createEffect, createMemo, createSignal, For, onMount, Show, Switch, Match } from "solid-js"
 import type { Context, IconName, IpcClient } from "@opencode/plugin/gui"
 import type { Admin } from "../contract"
+import { countTitle, countWithUnit, formatCount } from "./download-format"
 
 type AdminClient = IpcClient<typeof Admin.spec>
 type HubState = Awaited<ReturnType<AdminClient["snapshot"]>>
@@ -45,21 +46,6 @@ const SORTS = [
 type Sort = (typeof SORTS)[number]["value"]
 
 const SUGGESTIONS = ["qoder", "notify", "memory", "auth", "usage", "theme", "mcp"]
-
-const COMPACT = new Intl.NumberFormat("zh-CN", { notation: "compact", maximumFractionDigits: 1 })
-
-function formatCount(value: number): string {
-  // -1 marks "the download API could not be asked": unknown, never rendered as 0.
-  if (value < 0) return "—"
-  if (!Number.isFinite(value) || value <= 0) return "0"
-  return COMPACT.format(value)
-}
-
-/** The count is genuinely unknown (API failed), so the tooltip must not claim a number. */
-function countTitle(value: number, kind: string): string | undefined {
-  if (value < 0) return `${kind}暂不可用`
-  return `${kind} ${value.toLocaleString()} 次`
-}
 
 function formatBytes(value: number): string {
   if (!Number.isFinite(value) || value <= 0) return "—"
@@ -1694,10 +1680,10 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
             <div class="ph-meta">
               <span title={countTitle(hit.weekly, "周下载")}>
                 <ui.Icon name="download" size="small" />
-                {formatCount(hit.weekly)}/周
+                {countWithUnit(hit.weekly, "周")}
               </span>
               <span class="ph-dot" />
-              <span title={countTitle(hit.monthly, "月下载")}>{formatCount(hit.monthly)}/月</span>
+              <span title={countTitle(hit.monthly, "月下载")}>{countWithUnit(hit.monthly, "月")}</span>
               <Show when={hit.publisher}>
                 <span class="ph-dot" />
                 <span>by {hit.publisher}</span>

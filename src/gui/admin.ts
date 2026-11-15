@@ -687,7 +687,6 @@ interface RegistrySearchPackage {
 }
 
 interface RegistrySearchItem {
-  downloads?: { weekly?: number; monthly?: number; all?: number }
   package?: RegistrySearchPackage
 }
 
@@ -695,9 +694,9 @@ interface RegistrySearch {
   objects?: RegistrySearchItem[]
 }
 
-/** What one search hit needs beyond the search index: downloads and the manifest behind `links`. */
+/** What one search hit needs beyond the search index: official downloads and the manifest behind `links`. */
 interface SearchExtra {
-  counts: Downloads | undefined
+  counts: Downloads
   manifest: VersionLookup | undefined
 }
 
@@ -798,8 +797,7 @@ function trimReadme(raw: string): { text: string; truncated: boolean } {
 /** `-1` means the download API could not be asked: the UI must show 暂不可用, not 0. */
 async function loadDownloads(name: string, period: "last-week" | "last-month"): Promise<number> {
   const counts = await downloadsFor(name)
-  if (!counts) return -1
-  return period === "last-week" ? counts.weekly : counts.monthly
+  return (period === "last-week" ? counts.weekly : counts.monthly) ?? -1
 }
 
 /**
@@ -919,8 +917,9 @@ export async function detail(name: string): Promise<PackageDetailValue> {
     license: "",
     keywords: [],
     maintainers: [],
-    weekly: 0,
-    monthly: 0,
+    // A failed detail still carries unknown counts, never a fabricated zero.
+    weekly: -1,
+    monthly: -1,
     published: "",
     created: "",
     versions: 0,
@@ -1028,13 +1027,13 @@ export async function search(query: string): Promise<SearchResultValue> {
     const packages = (body.objects ?? [])
       .filter((item) => item.package?.name && isOpencodePlugin(item.package))
       .slice(0, SEARCH_LIMIT)
-    // The mirror's search index omits `links` and only reports all-time downloads. One extra
-    // request per package fills both in: the downloads series, and the `/latest` manifest for
-    // homepage/repo. Unknown stays -1 so the card says 暂不可用 instead of a fake 0.
+    // The mirror's search index omits `links` and reports its own traffic as `downloads`, so
+    // it is never a source of counts. One official lookup per package fills them in, alongside
+    // the `/latest` manifest for homepage/repo. Unknown stays -1 so the card says 暂不可用.
     const extra = await mapLimited<RegistrySearchItem, SearchExtra>(packages, LOOKUP_CONCURRENCY, async (item) => {
       const name = item.package!.name!
       const [counts, manifest] = await Promise.all([
-        item.downloads?.weekly !== undefined ? undefined : downloadsFor(name),
+        downloadsFor(name),
         item.package!.links?.homepage || item.package!.links?.repository ? undefined : npmLatest(name),
       ])
       return { counts, manifest }
@@ -1057,8 +1056,8 @@ export async function search(query: string): Promise<SearchResultValue> {
         installed: isInstalled,
         current,
         hasUpdate: isInstalled && isNewer(pkg.version ?? "", current),
-        weekly: item.downloads?.weekly ?? looked?.counts?.weekly ?? -1,
-        monthly: item.downloads?.monthly ?? looked?.counts?.monthly ?? -1,
+        weekly: looked?.counts.weekly ?? -1,
+        monthly: looked?.counts.monthly ?? -1,
         // Prefer a human maintainer: CI-published packages list "GitHub Actions" as the publisher.
         publisher: pkg.maintainers?.[0]?.username ?? pkg.publisher?.username ?? manifest?.publisher ?? "",
         license: licenseText(pkg.license) || manifest?.license || "",

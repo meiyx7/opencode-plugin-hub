@@ -47,9 +47,9 @@ export const SearchHit = Schema.Struct({
   current: Schema.String,
   /** True when the registry has a newer version than the installed one. */
   hasUpdate: Schema.Boolean,
-  /** Downloads in the last week. */
+  /** Official npm downloads in the last week; `-1` when the point API could not be asked. */
   weekly: Schema.Number,
-  /** Downloads in the last month. */
+  /** Official npm downloads in the last month; `-1` when the point API could not be asked. */
   monthly: Schema.Number,
   publisher: Schema.String,
   license: Schema.String,

@@ -57,6 +57,8 @@
     "build": "vite build && esbuild src/index.ts --bundle --platform=node --format=esm --external:@opencode/plugin --outfile=dist/index.js",
     "dev": "vite build --watch",
     "typecheck": "tsc --noEmit",
+    "test": "node scripts/test.mjs",
+    "verify:downloads": "node scripts/verify-downloads.mjs",
     "refresh": "node scripts/refresh-registry.mjs",
     "prepublishOnly": "node scripts/ensure-ci-publish.mjs && npm run typecheck && npm run build"
   }

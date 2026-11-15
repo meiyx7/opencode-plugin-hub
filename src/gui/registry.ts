@@ -6,26 +6,34 @@
  * Mirrors carry the same packuments and search API, so the page probes the candidates once and
  * only ever talks to the ones that answered. A base that dies mid-session is evicted and the
  * probe runs again, instead of paying its timeout on every request.
+ *
+ * Download counts are deliberately NOT part of this selection: they come only from npm's official
+ * downloads API. A mirror reports its own traffic, which is a different number, so falling back
+ * to one would silently replace the official figure instead of showing that it is unavailable.
  */
 
 export interface RegistryBase {
   /** Packuments, search and dist-tags. */
   registry: string
-  /** Download counts. Official npm serves them from another host; a mirror without one leaves this empty. */
-  downloads: string
 }
 
 /** Ordered by trust: the canonical copy first, then the mirror most networks here can reach. */
 const CANDIDATES: readonly RegistryBase[] = [
-  { registry: "https://registry.npmjs.org", downloads: "https://api.npmjs.org/downloads" },
-  { registry: "https://registry.npmmirror.com", downloads: "https://registry.npmmirror.com/downloads" },
+  { registry: "https://registry.npmjs.org" },
+  { registry: "https://registry.npmmirror.com" },
 ]
+
+/** The one and only source of download counts. Never a mirror, never a forced registry. */
+export const NPM_DOWNLOADS_API = "https://api.npmjs.org/downloads"
 
 /** A dead registry never answers, so a probe must give up quickly rather than hold the first paint. */
 const PROBE_TIMEOUT = 1_500
+/** Successful download counts are stable enough to reuse for five minutes. */
 const DOWNLOADS_TTL = 5 * 60 * 1000
 /** A failed download lookup is retried sooner than a good one: the network may simply have blinked. */
 const DOWNLOADS_FAILURE_TTL = 60 * 1000
+/** One slow point request must not hold the whole card/detail view hostage. */
+const DOWNLOADS_TIMEOUT_MS = 8_000
 
 export class RegistryUnavailable extends Error {
   constructor(readonly tried: readonly string[]) {
@@ -62,7 +70,7 @@ let probing: Promise<RegistryBase[]> | undefined
 export function forcedBase(): RegistryBase | undefined {
   const raw = (process.env.OPENCODE_PLUGIN_HUB_REGISTRY ?? "").trim().replace(/\/+$/, "")
   if (!/^https?:\/\//i.test(raw)) return undefined
-  return { registry: raw, downloads: `${raw}/downloads` }
+  return { registry: raw }
 }
 
 async function ping(registry: string): Promise<boolean> {
@@ -158,53 +166,106 @@ export async function registryFetch(
   throw new RegistryUnavailable(bases.map((base) => base.registry))
 }
 
+/**
+ * A field is absent when its own point request could not be answered. Callers turn that into
+ * `-1` on the IPC wire, which the UI renders as 暂不可用 — never as a fabricated 0.
+ */
 export interface Downloads {
-  weekly: number
-  monthly: number
+  weekly?: number
+  monthly?: number
 }
 
-const downloadsCache = new Map<string, { at: number; value: Downloads | undefined }>()
+type Period = "last-week" | "last-month"
+type Metric = "weekly" | "monthly"
+
+const POINTS: readonly { metric: Metric; period: Period }[] = [
+  { metric: "weekly", period: "last-week" },
+  { metric: "monthly", period: "last-month" },
+]
+
+interface CachedCount {
+  at: number
+  /** `undefined` is a remembered failure, cached for the shorter failure TTL. */
+  value: number | undefined
+}
 
 /**
- * Weekly and monthly downloads from one `range/last-month` call: the daily series is summed,
- * which is how the official API itself derives the two numbers. `undefined` means "could not be
- * asked" — the UI renders that as 暂不可用, never as 0.
+ * One entry per metric, not one per package: a successful week and a failed month must keep
+ * their own expiry, so a single flaky response never poisons the other number.
  */
-export async function downloadsFor(name: string): Promise<Downloads | undefined> {
-  const cached = downloadsCache.get(name)
-  if (cached) {
-    const ttl = cached.value ? DOWNLOADS_TTL : DOWNLOADS_FAILURE_TTL
-    if (Date.now() - cached.at < ttl) return cached.value
-  }
-  const value = await fetchDownloads(name)
-  downloadsCache.set(name, { at: Date.now(), value })
-  return value
+const downloadsCache = new Map<string, CachedCount>()
+/** Coalesce concurrent lookups: the list and the detail dialog often ask for the same package. */
+const inFlight = new Map<string, Promise<number | undefined>>()
+
+function cacheKey(metric: Metric, name: string): string {
+  return `${metric}\u0000${name}`
 }
 
-async function fetchDownloads(name: string): Promise<Downloads | undefined> {
-  let bases: RegistryBase[]
+/**
+ * One official point request. Any bad status, malformed body, wrong package or timeout is an
+ * unknown count, not a zero. This function never throws, so week and month stay independent.
+ */
+async function fetchPoint(name: string, period: Period): Promise<number | undefined> {
+  const url = `${NPM_DOWNLOADS_API}/point/${period}/${encodeURIComponent(name)}`
   try {
-    bases = await registryBases()
+    const response = await fetch(url, {
+      signal: AbortSignal.timeout(DOWNLOADS_TIMEOUT_MS),
+      headers: { accept: "application/json" },
+    })
+    if (!response.ok) return undefined
+    let body: unknown
+    try {
+      body = await response.json()
+    } catch {
+      return undefined
+    }
+    if (!body || typeof body !== "object" || Array.isArray(body)) return undefined
+    const record = body as { downloads?: unknown; package?: unknown }
+    // A proxy answering with somebody else's count is bad data, not a valid count.
+    if (record.package !== undefined && record.package !== name) return undefined
+    const count = record.downloads
+    if (typeof count !== "number" || !Number.isFinite(count) || !Number.isInteger(count) || count < 0) {
+      return undefined
+    }
+    return count
   } catch {
+    // Timeout, DNS failure, TLS reset, aborted body: all mean "unknown".
     return undefined
   }
-  for (const base of bases) {
-    if (!base.downloads) continue
-    try {
-      const response = await fetch(`${base.downloads}/range/last-month/${encodeURIComponent(name)}`, {
-        signal: AbortSignal.timeout(8_000),
-        headers: { accept: "application/json" },
-      })
-      if (!response.ok) continue
-      const body = (await response.json()) as { downloads?: { downloads?: number }[] }
-      const days = body.downloads ?? []
-      if (days.length === 0) continue
-      const sum = (list: readonly { downloads?: number }[]) =>
-        list.reduce((total, day) => total + (Number(day.downloads) || 0), 0)
-      return { weekly: sum(days.slice(-7)), monthly: sum(days) }
-    } catch {
-      // Try the next base; a mirror without a downloads API also lands here via its 404 above.
-    }
+}
+
+async function cachedPoint(name: string, metric: Metric, period: Period): Promise<number | undefined> {
+  const key = cacheKey(metric, name)
+  const cached = downloadsCache.get(key)
+  if (cached) {
+    const ttl = cached.value === undefined ? DOWNLOADS_FAILURE_TTL : DOWNLOADS_TTL
+    if (Date.now() - cached.at < ttl) return cached.value
   }
-  return undefined
+  const pending = inFlight.get(key)
+  if (pending) return pending
+  const request = fetchPoint(name, period)
+    .then((value) => {
+      downloadsCache.set(key, { at: Date.now(), value })
+      return value
+    })
+    .finally(() => {
+      inFlight.delete(key)
+    })
+  inFlight.set(key, request)
+  return request
+}
+
+/**
+ * Weekly and monthly counts from two separate official point requests. Both run concurrently;
+ * a failure in one only leaves that one field absent. The cache and request coalescing here are
+ * the single source shared by the search list and the detail dialog.
+ */
+export async function downloadsFor(name: string): Promise<Downloads> {
+  const [weekly, monthly] = await Promise.all(
+    POINTS.map((point) => cachedPoint(name, point.metric, point.period)),
+  )
+  const counts: Downloads = {}
+  if (weekly !== undefined) counts.weekly = weekly
+  if (monthly !== undefined) counts.monthly = monthly
+  return counts
 }
