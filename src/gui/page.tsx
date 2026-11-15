@@ -2,6 +2,7 @@ import { createEffect, createMemo, createSignal, For, onMount, Show, Switch, Mat
 import type { Context, IconName, IpcClient } from "@opencode/plugin/gui"
 import type { Admin } from "../contract"
 import { countTitle, countWithUnit, formatCount } from "./download-format"
+import { RESTART_CONFIRM, restartNote, runSelfUpdateRestart, type HubNote, type RestartAttempt } from "./self-update"
 
 type AdminClient = IpcClient<typeof Admin.spec>
 type HubState = Awaited<ReturnType<AdminClient["snapshot"]>>
@@ -1224,6 +1225,20 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
     }, 450)
   }
 
+  /**
+   * One restart call without its own confirmation: the toolbar entry point and the
+   * self-update flow share it, so a failed restart always yields the same manual hint.
+   */
+  const performRestart = async (): Promise<RestartAttempt> =>
+    track("restart", async () => {
+      try {
+        const result = await props.admin.restart()
+        return result.ok ? "started" : "unavailable"
+      } catch {
+        return "failed"
+      }
+    })
+
   const install = async (name: string, version = "") => {
     await track(`install:${name}`, async () => {
       try {
@@ -1233,16 +1248,19 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
           notify(result.message, "error")
           return
         }
-        // A self-update rewrites the config but the running bundle is still the previous
-        // version. Restarting is the only way to load the new one — and if we defer it the
-        // hub's entry point can vanish before the user gets a chance to trigger the restart,
-        // leaving no way back. So restart right here.
         if (result.selfUpdated) {
-          notify("插件中心已更新，正在重启 OpenCode 以加载新版本…", "info")
-          await restartApp()
-          return
+          // The config now points at the new bundle, but the window and the background
+          // service still run the old one. Ask before restarting. Even when the user
+          // declines, fall through to the state sync below: no early return, so the
+          // toolbar entry, cards, update map and runtime badges stay consistent.
+          await runSelfUpdateRestart({
+            confirm: (options) => props.ctx.dialogs.confirm(options),
+            restart: performRestart,
+            notify: (note: HubNote) => notify(note.text, note.tone),
+          })
+        } else {
+          notify(`${result.message}。配置需重启后生效：点「彻底重启 OpenCode」完成加载`, "success")
         }
-        notify(`${result.message}。配置需重启后生效：点「彻底重启 OpenCode」完成加载`, "success")
         const latest = version || hits().find((hit) => hit.name === name)?.version || ""
         setCatalog((prev) => prev.map((entry) => (entry.pkg === name ? { ...entry, installed: true } : entry)))
         setHits((prev) =>
@@ -1311,28 +1329,10 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
 
   /** Quits the app, clears a stale service and opens the app again. The session is restored by OpenCode. */
   const restartApp = async () => {
-    const ok = await props.ctx.dialogs.confirm({
-      title: "彻底重启 OpenCode？",
-      description:
-        "应用会退出并自动重新打开，让插件代码和后台 serve --service 一起换成最新版本。当前会话通常会自动恢复。",
-      confirm: "重启",
-    })
+    const ok = await props.ctx.dialogs.confirm(RESTART_CONFIRM)
     if (!ok) return
-    await track("restart", async () => {
-      try {
-        const result = await props.admin.restart()
-        if (!result.ok) {
-          notify("无法自动重启，请手动完全退出 OpenCode 再打开。", "error")
-          return
-        }
-        notify("正在重启 OpenCode…如果没有自动打开，请手动启动。", "info")
-      } catch {
-        notify(
-          "自动重启调用失败，后台服务可能还是旧版本。请先手动完全退出 OpenCode（并结束 serve --service）再打开一次。",
-          "error",
-        )
-      }
-    })
+    const note = restartNote(await performRestart())
+    notify(note.text, note.tone)
   }
 
   const openUrl = async (url: string) => {

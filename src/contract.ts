@@ -175,8 +175,8 @@ export const Mutation = Schema.Struct({
   state: HubState,
   /**
    * True when the mutation replaced this plugin itself (a self-update). The window keeps
-   * rendering the old bundle, so the UI must restart the app right away instead of packing
-   * the "restart manually" hint into the message — a full restart swaps the running bundle
+   * rendering the old bundle, so the UI must offer an immediate (confirmed) restart instead
+   * of only hinting that a restart is needed later — a full restart swaps the running bundle
    * and the background `serve --service` to the freshly installed version.
    * Optional so a window and a service built from different revisions still decode each other.
    */

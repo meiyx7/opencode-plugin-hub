@@ -11,7 +11,7 @@ import { build } from "esbuild"
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..")
 const outDir = join(root, "node_modules", ".cache", "plugin-hub-tests")
-const entries = ["downloads.test.ts"]
+const entries = ["downloads.test.ts", "self-update.test.ts", "release-guard.test.ts"]
 
 await rm(outDir, { recursive: true, force: true })
 await mkdir(outDir, { recursive: true })

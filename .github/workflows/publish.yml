@@ -34,41 +34,29 @@ jobs:
           registry-url: https://registry.npmjs.org
           cache: npm
 
-      # One guard for both triggers. A manual run has no tag, so it must state the version
-      # explicitly; an empty input is a failure, never a reason to skip the check.
-      - name: Verify release version
+      # Manual releases must come from main. This runs before anything is installed or
+      # published, so a dispatch from another ref fails explicitly at the very start.
+      # Tag pushes are untouched: the tag's own commit is what gets published.
+      - name: Restrict manual dispatch to main
+        if: github.event_name == 'workflow_dispatch'
         env:
-          INPUT_VERSION: ${{ inputs.version }}
+          DISPATCH_REF: ${{ github.ref }}
         run: |
           set -euo pipefail
-          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
-            expected="${GITHUB_REF_NAME#v}"
-            source="tag $GITHUB_REF_NAME"
-          else
-            expected="$INPUT_VERSION"
-            source="workflow_dispatch input"
-          fi
-          if [ -z "$expected" ]; then
-            echo "No release version supplied ($source); a manual run needs the version input" >&2
+          if [ "$DISPATCH_REF" != "refs/heads/main" ]; then
+            echo "Manual publish is only allowed from refs/heads/main, got $DISPATCH_REF" >&2
             exit 1
           fi
-          if ! printf '%s' "$expected" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$'; then
-            echo "Invalid version '$expected' from $source" >&2
-            exit 1
-          fi
-          version="$(node -p "require('./package.json').version")"
-          if [ "$expected" != "$version" ]; then
-            echo "$source says $expected but package.json is $version" >&2
-            exit 1
-          fi
-          # Both triggers also refuse to republish a version that is already on npm. A registry
-          # lookup failure is not fatal: npm publish itself still rejects a duplicate version.
-          name="$(node -p "require('./package.json').name")"
-          if published="$(npm view "$name@$expected" version --registry=https://registry.npmjs.org/ 2>/dev/null)"; then
-            echo "Version $expected is already published ($published)" >&2
-            exit 1
-          fi
-          echo "Release version verified: $expected (from $source)"
+          echo "Manual dispatch confirmed on main"
+
+      # One guard for both triggers. It re-checks the dispatch branch (defense in depth),
+      # keeps the tag/input-to-package.json agreement and SemVer check, and replaces the old
+      # CLI probe: a 404 allows, a 200 blocks, and ANY other answer (timeout, 5xx,
+      # auth error, socket failure) blocks too. A registry outage never skips this check.
+      - name: Verify release version and npm availability
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: node scripts/verify-release.mjs
 
       - name: Use npm with Trusted Publishing support
         run: npm install -g npm@latest

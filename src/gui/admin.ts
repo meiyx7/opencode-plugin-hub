@@ -119,8 +119,8 @@ export interface MutationValue {
   message: string
   state: HubStateValue
   /**
-   * When installing or updating replaced this plugin itself, the window must restart the
-   * app immediately (the running bundle is still the previous version). See contract.ts.
+   * When installing or updating replaced this plugin itself, the window must offer a
+   * confirmed restart (the running bundle is still the previous version). See contract.ts.
    */
   selfUpdated?: boolean
 }
@@ -661,8 +661,8 @@ export async function install(spec: string, version: string): Promise<MutationVa
       message: index >= 0 ? `已更新 ${wanted}` : `已添加 ${wanted}`,
       // Updating this very package the window is running only rewrites the config: the
       // running bundle (and the background service) still hold the old version until the
-      // app restarts. Flag it so the UI restarts immediately, never leaving a half-updated
-      // hub with a vanishing entry point.
+      // app restarts. Flag it so the UI can ask for an immediate restart, never leaving a
+      // half-updated hub with a vanishing entry point.
       selfUpdated: name === SELF_PACKAGE || undefined,
       state,
     }
@@ -1127,6 +1127,22 @@ export async function openConfig(): Promise<boolean> {
  * used instead of `pgrep -f` for the app PID: on macOS the packaged Electron main process is not
  * visible to `pgrep -f`, while `ps -axo args` lists it. The bracket in each pattern (`[/]…`,
  * `[s]erve`) keeps this script's own command line from matching the kill target.
+ *
+ * Known scope (the confirmation dialog in page.tsx must state this accurately):
+ *  - `ps -axo` lists EVERY user's processes and every matching OpenCode main process is
+ *    signalled, so more than one running instance / window set is ended, not just this one.
+ *  - the service pattern is a bare command-line substring with no owner check, so it also
+ *    signals other instances' services and ANY unrelated process whose command line happens
+ *    to contain that text.
+ *  - only one app is opened afterwards (`open -b`), so extra instances are not restored.
+ *  - app PIDs are waited on (6s, then SIGKILL), but service PIDs only get SIGTERM and their
+ *    exit is never verified; the final SIGKILL is not followed by a re-check either. A slow
+ *    service or a still-shutting-down app can therefore race with the relaunch.
+ *
+ * Minimal fix proposed (needs real-device verification before changing process management):
+ *  - `ps -xo` instead of `ps -axo` to stay within the current user;
+ *  - require an OpenCode-owned command line for the service match;
+ *  - wait until both app and service PIDs are gone, re-check after SIGKILL, before `open`.
  */
 export function restart(): boolean {
   if (process.platform !== "darwin") return false
