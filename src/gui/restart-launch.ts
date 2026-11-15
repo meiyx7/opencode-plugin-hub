@@ -109,7 +109,7 @@ export interface SpawnedChild {
 export type SpawnChild = (
   exe: string,
   args: readonly string[],
-  options: { detached: true; stdio: "ignore" | [number, number, number]; env: Record<string, string> },
+  options: { detached: true; stdio: "ignore" | ["ignore", number, number]; env: Record<string, string> },
 ) => SpawnedChild
 
 export interface LaunchOutcome {
@@ -179,7 +179,7 @@ export async function launchRestartSupervisor(options: {
     // (it survives the env whitelist because of the OPENCODE_ prefix), the
     // supervisor's stderr is captured to that file instead of being dropped.
     // Production default stays stdio:"ignore".
-    let stdio: "ignore" | [number, number, number] = "ignore"
+    let stdio: "ignore" | ["ignore", number, number] = "ignore"
     const diag = process.env.OPENCODE_PLUGIN_HUB_RESTART_DIAG
     if (diag) {
       try {
