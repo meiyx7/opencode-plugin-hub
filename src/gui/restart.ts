@@ -76,13 +76,19 @@ export interface SignalRecheck {
   requirements: readonly string[]
 }
 
-export const SIGNAL_RECHECK_REQUIREMENTS: readonly string[] = [
+/**
+ * 运行时不可变的执行前复核契约：后续执行器在任何信号操作之前必须按这五项重新
+ * 确认目标进程身份。仅凭 PID 存活、PID 与原记录一致、命令行包含 opencode、或
+ * SingletonLock 记录的 PID，都不构成发送信号的理由；复核失败必须放弃信号
+ * 操作，也不得退化为模糊匹配。数组已冻结，防止被意外修改。
+ */
+export const SIGNAL_RECHECK_REQUIREMENTS: readonly string[] = Object.freeze([
   "目标 PID 仍然存在",
   "目标 PID 对应的可执行文件与规划时的原始身份一致",
   "目标 PID 对应的 UID 与规划时的原始身份一致",
   "目标进程仍是原始目标本身，而不是 PID 复用后产生的新进程",
   "进程身份信息完整且没有矛盾",
-]
+] as readonly string[])
 
 /**
  * 启动能力状态：规划器目前只能确认目标实例身份并生成候选动作。真实重启还

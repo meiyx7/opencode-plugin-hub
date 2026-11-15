@@ -280,10 +280,13 @@ test("确认之后才允许提示正在重启", async () => {
 
 test("确认弹窗准确说明实际影响范围", () => {
   for (const dialog of [SELF_UPDATE_CONFIRM, RESTART_CONFIRM]) {
-    assert.match(dialog.description, /所有/)
+    // 新机制只影响当前实例；弹窗必须如实说明，不得再宣称"结束所有进程"。
+    assert.match(dialog.description, /当前 OpenCode 实例|当前实例|当前应用主进程/)
     assert.match(dialog.description, /serve --service/)
     assert.match(dialog.description, /其他/)
-    assert.match(dialog.description, /窗口|实例/)
+    assert.match(dialog.description, /实例|窗口/)
+    assert.ok(!dialog.description.includes("所有正在运行的 OpenCode"), "不得再宣称影响范围是全部实例")
+    assert.match(dialog.description, /无法安全确认/, "fail-closed 行为必须写进弹窗")
   }
 })
 

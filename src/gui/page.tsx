@@ -1228,16 +1228,41 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
   /**
    * One restart call without its own confirmation: the toolbar entry point and the
    * self-update flow share it, so a failed restart always yields the same manual hint.
+   * `ok`/accepted only means the detached supervisor took over — the real outcome is
+   * recorded by the supervisor and reported on the next page load (see reportLastRestart).
    */
   const performRestart = async (): Promise<RestartAttempt> =>
     track("restart", async () => {
       try {
         const result = await props.admin.restart()
-        return result.ok ? "started" : "unavailable"
+        if (result.ok) return "started"
+        notify(result.message || "自动重启未受理，未结束任何进程。", "error")
+        return "unavailable"
       } catch {
         return "failed"
       }
     })
+
+  /**
+   * The supervisor records the real restart outcome in a status file (the main
+   * process that would otherwise report it is gone). The next page load picks
+   * it up and tells the truth instead of guessing; older services without this
+   * method are silently ignored.
+   */
+  const reportLastRestart = async () => {
+    try {
+      const result = await props.admin.restartStatus()
+      if (!result.found || !result.status) return
+      if (Date.now() - result.status.at > 10 * 60 * 1000) return
+      if (result.status.phase === "new-started") {
+        notify("上次自动重启已成功完成。", "success")
+      } else if (result.status.phase === "failed" || result.status.phase === "unknown" || result.status.phase === "accepted") {
+        notify("上次自动重启未确认成功。如当前实例状态异常，请手动完全退出 OpenCode（并结束残留的 serve --service 后台服务）后重新打开。", "warning")
+      }
+    } catch {
+      // service predates restartStatus: nothing to report
+    }
+  }
 
   const install = async (name: string, version = "") => {
     await track(`install:${name}`, async () => {
@@ -1492,6 +1517,7 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
     void loadCatalog(false)
     void checkUpdates(true)
     void loadRuntime()
+    void reportLastRestart()
   })
 
   const tabButton = (id: Tab, label: string, icon: IconName, count?: number | string, alert?: number) => (

@@ -71,7 +71,9 @@ export default Plugin.define({
       install: (input) => admin.install(input.spec, input.version),
       remove: (input) => admin.remove(input.spec),
       reload: () => admin.reload(ctx.cli.command),
-      restart: () => ({ ok: admin.restart() }),
+      // Development mode (running from source) must never auto-restart the app.
+      restart: () => admin.restart(ctx.cli.development === true),
+      restartStatus: () => admin.restartStatus(),
       // 运行事实来自应用自己的 sidecar；读不到时页面如实显示“未知”。
       runtime: () => admin.runtime(ctx.serverEndpoints.get("sidecar")),
     })

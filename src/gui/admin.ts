@@ -1,9 +1,12 @@
-import { spawn } from "node:child_process"
+import { execFileSync, spawn } from "node:child_process"
+import { existsSync, readlinkSync, writeFileSync } from "node:fs"
 import { homedir, tmpdir } from "node:os"
-import { basename, isAbsolute, join, resolve } from "node:path"
+import { basename, dirname, isAbsolute, join, resolve } from "node:path"
 import { copyFile, cp, mkdir, mkdtemp, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises"
 import { applyEdits, modify, parse, type ParseError } from "jsonc-parser"
 import { downloadsFor, registryFetch, type Downloads } from "./registry"
+import { collectRestartSnapshot, parseProcLine, whitelistEnv, type CollectResult } from "./restart-collect"
+import { SUPERVISOR_SOURCE } from "./restart-supervisor"
 
 export interface InstalledEntryValue {
   spec: string
@@ -1120,73 +1123,201 @@ export async function openConfig(): Promise<boolean> {
 }
 
 /**
- * Fully restarts the desktop app: quit it, make sure no stale `serve --service` keeps the old
- * plugin bundle alive, then open it again.
+ * Fully restarts the CURRENT desktop app instance only: quit it, make sure its
+ * own `serve --service` sidecar is gone, then relaunch the ORIGINAL executable
+ * with the ORIGINAL argv, cwd and a whitelisted environment.
  *
- * The shell has to be detached because this process is one of the things being killed. `ps` is
- * used instead of `pgrep -f` for the app PID: on macOS the packaged Electron main process is not
- * visible to `pgrep -f`, while `ps -axo args` lists it. The bracket in each pattern (`[/]…`,
- * `[s]erve`) keeps this script's own command line from matching the kill target.
- *
- * Known scope (the confirmation dialog in page.tsx must state this accurately):
- *  - `ps -axo` lists EVERY user's processes and every matching OpenCode main process is
- *    signalled, so more than one running instance / window set is ended, not just this one.
- *  - the service pattern is a bare command-line substring with no owner check, so it also
- *    signals other instances' services and ANY unrelated process whose command line happens
- *    to contain that text.
- *  - only one app is opened afterwards (`open -b`), so extra instances are not restored.
- *  - app PIDs are waited on (6s, then SIGKILL), but service PIDs only get SIGTERM and their
- *    exit is never verified; the final SIGKILL is not followed by a re-check either. A slow
- *    service or a still-shutting-down app can therefore race with the relaunch.
- *
- * Minimal fix proposed (needs real-device verification before changing process management):
- *  - `ps -xo` instead of `ps -axo` to stay within the current user;
- *  - require an OpenCode-owned command line for the service match;
- *  - wait until both app and service PIDs are gone, re-check after SIGKILL, before `open`.
+ * Safety model:
+ *  - the target is identified from this process itself (`process.*` in the
+ *    Electron main process), never by scanning the machine or by fuzzy
+ *    command-line matching;
+ *  - the plan comes from the pure planner (`restart.ts`); a refusal means no
+ *    signal of any kind is sent;
+ *  - the actual execution is delegated to a detached supervisor
+ *    (`restart-supervisor.ts`) that outlives this process and re-checks the
+ *    instance credential (PID + start time) before EVERY signal, including
+ *    KILL, so a recycled PID can never be mistaken for the original target;
+ *  - "accepted" only means the supervisor was launched — the real outcome is
+ *    recorded in the status file and read back via `restartStatus()`.
  */
-export function restart(): boolean {
-  if (process.platform !== "darwin") return false
-  const script = `
-export PATH=/usr/bin:/bin:/usr/sbin:/sbin
-log="$HOME/.cache/opencode/plugin-hub/restart.log"
-mkdir -p "$HOME/.cache/opencode/plugin-hub" 2>/dev/null
-say() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "$log" 2>/dev/null; }
+export interface RestartOutcomeValue {
+  ok: boolean
+  phase: "accepted" | "refused" | "failed"
+  message: string
+  requestId?: string
+  statusPath?: string
+}
 
-sleep 1
-say "restart requested"
+export interface RestartStatusValue {
+  requestId: string
+  phase: string
+  at: number
+  detail: string
+}
 
-app_pids=$(ps -axo pid=,args= | grep -E '[/]OpenCode\\.app/Contents/MacOS/OpenCode($| )' | grep -v 'Helper' | awk '{print $1}')
-say "app pids: \${app_pids:-none}"
-[ -n "$app_pids" ] && kill -TERM $app_pids 2>/dev/null
+function restartDir(): string {
+  const xdg = process.env.XDG_CACHE_HOME
+  return xdg ? join(xdg, "opencode", "plugin-hub") : join(homedir(), ".cache", "opencode", "plugin-hub")
+}
 
-sleep 2
-
-# The service survives window closes, so it has to be stopped explicitly.
-service_pids=$(ps -axo pid=,args= | grep '[s]erve --service' | awk '{print $1}')
-say "service pids: \${service_pids:-none}"
-[ -n "$service_pids" ] && kill -TERM $service_pids 2>/dev/null
-
-sleep 1
-
-i=0
-while [ "$i" -lt 6 ]; do
-  app_pids=$(ps -axo pid=,args= | grep -E '[/]OpenCode\\.app/Contents/MacOS/OpenCode($| )' | grep -v 'Helper' | awk '{print $1}')
-  [ -z "$app_pids" ] && break
-  sleep 1
-  i=$((i + 1))
-done
-[ -n "$app_pids" ] && kill -KILL $app_pids 2>/dev/null
-
-sleep 1
-say "opening app"
-open -b ai.opencode.desktop 2>/dev/null || open -a OpenCode
-`
+function electronLockPath(): string | null {
   try {
-    const child = spawn("/bin/sh", ["-c", script], { detached: true, stdio: "ignore" })
-    child.unref()
-    return true
+    // Resolved at runtime inside the Electron main process; the bundler never
+    // sees it, and outside Electron (tests, servers) this returns null.
+    const dynamicRequire = eval("require") as (id: string) => unknown
+    const electron = dynamicRequire("electron") as { app?: { getPath?: (name: string) => string } } | undefined
+    const userData = electron?.app?.getPath?.("userData")
+    return userData ? join(userData, "SingletonLock") : null
   } catch {
-    return false
+    return null
+  }
+}
+
+/** Locates a Node runtime able to host the detached supervisor script. */
+function findNodeRuntime(): string | null {
+  const candidates: string[] = []
+  for (const dir of (process.env.PATH ?? "").split(":")) {
+    if (dir) candidates.push(join(dir, "node"))
+  }
+  candidates.push("/usr/local/bin/node", "/opt/homebrew/bin/node", "/usr/bin/node", "/opt/local/bin/node")
+  for (const candidate of candidates) {
+    try {
+      if (existsSync(candidate)) return candidate
+    } catch {
+      // ignore unreadable entries
+    }
+  }
+  return null
+}
+
+/** The supervisor and the relaunch run on this minimal environment. */
+function supervisorEnv(): Record<string, string> {
+  return whitelistEnv(process.env as Record<string, string | undefined>)
+}
+
+let lastAcceptedAt = 0
+
+export async function restart(development = false): Promise<RestartOutcomeValue> {
+  const statusPath = join(restartDir(), "restart-status.json")
+  const requestId = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
+  // Duplicate guard: one supervisor per instance at a time; a very recent
+  // accepted record means another restart is already in flight.
+  if (Date.now() - lastAcceptedAt < 60_000) {
+    return { ok: false, phase: "refused", message: "已有一次重启请求在执行中，请稍候或查看其结果后再试。", requestId, statusPath }
+  }
+  let collected: CollectResult
+  try {
+    collected = collectRestartSnapshot({
+      platform: process.platform,
+      procInfo: (pid) => {
+        try {
+          const out = execFileSync(
+            "ps",
+            ["-p", String(pid), "-o", "pid=,ppid=,uid=,lstart=,comm="],
+            { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: 5_000 },
+          )
+          return parseProcLine(out)
+        } catch {
+          return null
+        }
+      },
+      childPids: (pid) => {
+        try {
+          const out = execFileSync("pgrep", ["-P", String(pid)], {
+            encoding: "utf8",
+            stdio: ["ignore", "pipe", "ignore"],
+            timeout: 5_000,
+          })
+          return out
+            .split("\n")
+            .map((line) => parseInt(line.trim(), 10))
+            .filter((value) => Number.isInteger(value) && value > 0)
+        } catch {
+          return null
+        }
+      },
+      self: {
+        pid: process.pid,
+        ppid: process.ppid,
+        // getuid is unavailable in some typings/environments; -1 fails the
+        // planner's UID validation and refuses the restart (fail-closed).
+        uid: typeof process.getuid === "function" ? process.getuid() : -1,
+        execPath: process.execPath,
+        argv: process.argv,
+        cwd: process.cwd(),
+      },
+      env: process.env as Record<string, string | undefined>,
+      lockPath: electronLockPath(),
+      readLink: (path) => {
+        try {
+          return readlinkSync(path)
+        } catch {
+          return null
+        }
+      },
+      runtimePath: findNodeRuntime(),
+      statusPath,
+      requestId,
+      development,
+    })
+  } catch (error) {
+    return { ok: false, phase: "failed", message: `重启准备失败：${describe(error)}` }
+  }
+  if (!collected.payload) {
+    return { ok: false, phase: "refused", message: `已取消自动重启，未结束任何进程。原因：${collected.message}` }
+  }
+  if (!collected.runtimePath) {
+    return {
+      ok: false,
+      phase: "refused",
+      message:
+        "未找到可用的 Node 运行时来承载重启监督流程，已取消自动重启且未结束任何进程。请手动完全退出 OpenCode（并结束残留的 serve --service 后台服务）后重新打开。",
+    }
+  }
+  try {
+    mkdir(dirname(statusPath), { recursive: true })
+    writeFileSync(
+      statusPath,
+      JSON.stringify({ requestId, phase: "accepted", at: Date.now(), detail: "supervisor-launched" }),
+    )
+    const child = spawn(
+      collected.runtimePath,
+      ["-e", SUPERVISOR_SOURCE, "run", JSON.stringify(collected.payload)],
+      { detached: true, stdio: "ignore", env: supervisorEnv() },
+    )
+    if (!child.pid || child.pid <= 0) {
+      return { ok: false, phase: "failed", message: "重启监督流程启动失败，未结束任何进程。请手动重启。", requestId, statusPath }
+    }
+    child.unref()
+    lastAcceptedAt = Date.now()
+    return {
+      ok: true,
+      phase: "accepted",
+      message: "已受理重启请求：监督流程将退出当前实例并用原启动方式重新打开。",
+      requestId,
+      statusPath,
+    }
+  } catch (error) {
+    return { ok: false, phase: "failed", message: `重启监督流程启动失败：${describe(error)}`, requestId, statusPath }
+  }
+}
+
+/** Reads the restart status the supervisor recorded (best effort). */
+export async function restartStatus(): Promise<{ found: boolean; status?: RestartStatusValue }> {
+  try {
+    const raw = JSON.parse(await readFile(join(restartDir(), "restart-status.json"), "utf8")) as Record<string, unknown>
+    if (typeof raw.phase !== "string") return { found: false }
+    return {
+      found: true,
+      status: {
+        requestId: typeof raw.requestId === "string" ? raw.requestId : "",
+        phase: raw.phase,
+        at: typeof raw.at === "number" ? raw.at : 0,
+        detail: typeof raw.detail === "string" ? raw.detail : "",
+      },
+    }
+  } catch {
+    return { found: false }
   }
 }
 

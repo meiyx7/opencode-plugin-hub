@@ -24,12 +24,14 @@ export interface ConfirmOptions {
 export type RestartAttempt = "started" | "unavailable" | "failed"
 
 /**
- * Scope of admin.restart(): it enumerates ALL processes with `ps -axo` and signals every
- * OpenCode main process plus every command line containing `serve --service`. It is not
- * scoped to the current window, so the dialog says so instead of implying otherwise.
+ * Scope of the new restart mechanism: only the CURRENT desktop instance and
+ * the `serve --service` sidecar it spawned are ended. Other instances, other
+ * users' processes and unrelated processes are never touched, because the
+ * target is identified from the plugin's own main process and re-verified
+ * (PID + process start time) before every signal.
  */
 const SCOPE =
-  "重启会结束本机上所有正在运行的 OpenCode 应用进程和后台 serve --service 服务（包括其他已打开的窗口或实例），然后重新打开一个应用窗口"
+  "重启只影响当前 OpenCode 实例：退出当前应用主进程并结束它启动的后台 serve --service 服务；本机上其他 OpenCode 实例和其他窗口不受影响。若无法安全确认实例身份，自动重启会取消且不结束任何进程。"
 
 export const SELF_UPDATE_CONFIRM: ConfirmOptions = {
   title: "重启 OpenCode 以加载插件中心新版本？",
@@ -55,9 +57,9 @@ const CANCELLED: HubNote = {
   tone: "warning",
 }
 
-/** Step 2 (confirmed): only now is the app actually being restarted. */
+/** Step 2 (confirmed): the request was accepted and the supervisor is taking over. */
 const RESTARTING: HubNote = {
-  text: "正在重启 OpenCode…如果没有自动打开，请手动启动一次。",
+  text: "已受理重启请求，OpenCode 正在重启：当前实例将退出并由独立的监督流程用原启动方式重新打开。若长时间未自动打开，请手动启动一次。",
   tone: "info",
 }
 
@@ -65,7 +67,7 @@ const MANUAL =
   "请手动完全退出 OpenCode（并结束残留的 serve --service 后台服务）后重新打开；也可用「更多操作 → 彻底重启 OpenCode」重试。"
 
 const UNAVAILABLE: HubNote = {
-  text: `自动重启失败，${MANUAL}`,
+  text: `无法安全确认当前实例身份，已取消自动重启且未结束任何进程。${MANUAL}`,
   tone: "error",
 }
 
