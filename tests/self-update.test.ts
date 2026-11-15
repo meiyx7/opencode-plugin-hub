@@ -8,10 +8,20 @@
 import test, { after, afterEach, beforeEach } from "node:test"
 import assert from "node:assert/strict"
 import { spawnSync } from "node:child_process"
+import { readFileSync } from "node:fs"
 import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import * as admin from "../src/gui/admin.ts"
+
+/**
+ * 当前版本取自 package.json：发版不用改测试，断言也不会随着发版过时。
+ * `scripts/test.mjs` 以仓库根为 cwd 运行 node --test，所以这里直接读 cwd。
+ */
+const SELF_VERSION = (
+  JSON.parse(readFileSync(join(process.cwd(), "package.json"), "utf8")) as { version: string }
+).version
+const LATER_VERSION = SELF_VERSION.replace(/\.(\d+)$/, (_match, patch: string) => `.${Number(patch) + 1}`)
 
 const REAL_FETCH = globalThis.fetch
 const ENV_KEYS = ["XDG_CONFIG_HOME", "XDG_CACHE_HOME", "OPENCODE_PLUGIN_HUB_REGISTRY"] as const
@@ -105,19 +115,19 @@ test("2. 普通 npm 插件更新不触发 selfUpdated", async () => {
 })
 
 test("3. 插件中心自身安装触发 selfUpdated", async () => {
-  const result = await admin.install("opencode-plugin-hub", "0.3.7")
+  const result = await admin.install("opencode-plugin-hub", LATER_VERSION)
   assert.equal(result.ok, true)
   assert.equal(result.selfUpdated, true)
-  assert.deepEqual(await readConfigSpecs(), ["opencode-plugin-hub@0.3.7"])
+  assert.deepEqual(await readConfigSpecs(), [`opencode-plugin-hub@${LATER_VERSION}`])
 })
 
 test("4. 插件中心自身更新触发 selfUpdated", async () => {
-  await writeConfig(["opencode-plugin-hub@0.3.6"])
-  const result = await admin.install("opencode-plugin-hub", "0.3.7")
+  await writeConfig([`opencode-plugin-hub@${SELF_VERSION}`])
+  const result = await admin.install("opencode-plugin-hub", LATER_VERSION)
   assert.equal(result.ok, true)
   assert.equal(result.selfUpdated, true)
   assert.match(result.message, /已更新/)
-  assert.deepEqual(await readConfigSpecs(), ["opencode-plugin-hub@0.3.7"])
+  assert.deepEqual(await readConfigSpecs(), [`opencode-plugin-hub@${LATER_VERSION}`])
 })
 
 test("5. 本地目录插件更新不误判为插件中心自身更新", async () => {
@@ -125,28 +135,28 @@ test("5. 本地目录插件更新不误判为插件中心自身更新", async ()
   await mkdir(pluginDir, { recursive: true })
   await writeFile(
     join(pluginDir, "package.json"),
-    JSON.stringify({ name: "opencode-plugin-hub", version: "0.3.6" }),
+    JSON.stringify({ name: "opencode-plugin-hub", version: SELF_VERSION }),
   )
   await writeConfig([pluginDir])
-  tarball = await makeTarball(join(temp, "tarball-work"), "0.3.7")
+  tarball = await makeTarball(join(temp, "tarball-work"), LATER_VERSION)
   route = (url) => {
     if (url.endsWith("/-/ping")) return json({ ok: true })
     if (url.endsWith("/opencode-plugin-hub")) {
       return json({
-        "dist-tags": { latest: "0.3.7" },
-        versions: { "0.3.7": { dist: { tarball: "http://plugin-hub.test/pkg.tgz" } } },
+        "dist-tags": { latest: LATER_VERSION },
+        versions: { [LATER_VERSION]: { dist: { tarball: "http://plugin-hub.test/pkg.tgz" } } },
       })
     }
     if (url.endsWith("/pkg.tgz")) return new Response(tarball, { status: 200 })
     return new Response("", { status: 404 })
   }
-  const result = await admin.install("opencode-plugin-hub", "0.3.7")
+  const result = await admin.install("opencode-plugin-hub", LATER_VERSION)
   assert.equal(result.ok, true, `目录更新应成功：${result.message}`)
   assert.equal(result.selfUpdated, undefined, "目录插件走文件替换分支，不能触发自更新")
-  assert.match(result.message, /已更新到 0\.3\.7/)
+  assert.match(result.message, new RegExp(`已更新到 ${LATER_VERSION.replace(/\./g, "\\.")}`))
   assert.equal(
     (JSON.parse(await readFile(join(pluginDir, "package.json"), "utf8")) as { version: string }).version,
-    "0.3.7",
+    LATER_VERSION,
   )
   assert.deepEqual(await readConfigSpecs(), [pluginDir], "目录插件不应改写配置")
 })
@@ -160,7 +170,7 @@ test("6. 安装失败不触发 selfUpdated", async () => {
   await mkdir(pluginDir, { recursive: true })
   await writeFile(
     join(pluginDir, "package.json"),
-    JSON.stringify({ name: "opencode-plugin-hub", version: "0.3.6" }),
+    JSON.stringify({ name: "opencode-plugin-hub", version: SELF_VERSION }),
   )
   await writeConfig([pluginDir])
   const failed = await admin.install("opencode-plugin-hub", "9.9.9")
@@ -188,11 +198,11 @@ test("普通插件安装、更新、移除流程没有回归", async () => {
 })
 
 test("插件中心自身仍然不能移除", async () => {
-  await writeConfig(["opencode-plugin-hub@0.3.6"])
-  const result = await admin.remove("opencode-plugin-hub@0.3.6")
+  await writeConfig([`opencode-plugin-hub@${SELF_VERSION}`])
+  const result = await admin.remove(`opencode-plugin-hub@${SELF_VERSION}`)
   assert.equal(result.ok, false)
   assert.match(result.message, /不能移除/)
-  assert.deepEqual(await readConfigSpecs(), ["opencode-plugin-hub@0.3.6"])
+  assert.deepEqual(await readConfigSpecs(), [`opencode-plugin-hub@${SELF_VERSION}`])
 })
 
 // ---------------------------------------------------------------------------
