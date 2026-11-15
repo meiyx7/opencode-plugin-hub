@@ -1248,7 +1248,7 @@ export async function restart(development = false): Promise<RestartOutcomeValue>
         try {
           const out = execFileSync(
             "ps",
-            ["-p", String(pid), "-o", "pid=,ppid=,uid=,lstart=,comm="],
+            ["-p", String(pid), "-o", "pid=,ppid=,uid=,lstart=,etime=,comm="],
             { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: 5_000 },
           )
           return parseProcLine(out)

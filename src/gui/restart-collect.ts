@@ -7,13 +7,15 @@
  */
 import { planRestart, singletonLockPidFromTarget, DEFAULT_APP_EXE, DEFAULT_SIDECAR_SUFFIX } from "./restart"
 
-/** One row of `ps -p PID -o pid=,ppid=,uid=,lstart=,comm=`. */
+/** One row of `ps -p PID -o pid=,ppid=,uid=,lstart=,etime=,comm=`. */
 export interface ParsedProc {
   pid: number
   ppid: number
   uid: number
   /** Opaque instance credential: the process start time as `ps` renders it. */
   lstart: string
+  /** Elapsed time since process start (`[[dd-]hh:]mm:ss`), the age credential. */
+  etime: string
   /** Full executable path. */
   comm: string
 }
@@ -46,11 +48,12 @@ export interface SupervisorPayload {
     ppid: number
     uid: number
     lstart: string
+    etime: string
     exe: string
     argv: readonly string[]
     cwd: string
   }
-  sidecar: { pid: number; uid: number; lstart: string; exe: string } | null
+  sidecar: { pid: number; uid: number; lstart: string; etime: string; exe: string } | null
   env: Record<string, string>
   timeouts: SupervisorTimeouts
 }
@@ -82,38 +85,81 @@ const EXACT_ENV_KEYS = ["HOME", "PATH", "TMPDIR", "TEMP", "TMP", "USER", "LOGNAM
 const ENV_PREFIXES = ["XDG_", "OPENCODE_"]
 
 /**
- * Parses one `ps -p PID -o pid=,ppid=,uid=,lstart=,comm=` line. The start time
- * (four tokens, e.g. `Thu Nov 15 18:24:15 2026`) is kept as an opaque string:
- * it is the process-instance credential that PID-reuse protection compares.
- * Must stay in sync with the copy inside the supervisor source.
+ * Parses one `ps -p PID -o pid=,ppid=,uid=,lstart=,etime=,comm=` line. The
+ * start time (five tokens, e.g. `Thu Nov 15 18:24:15 2026`) is kept as an
+ * opaque string: it is the process-instance credential that PID-reuse
+ * protection compares. `etime` is the age credential consumed by the
+ * minimum-age gate and monotonicity check. Must stay in sync with the copy
+ * inside the supervisor source.
  *
- * Credential strength note (deliberate, do not "fix" by loosening):
- * `lstart` renders at SECOND resolution and is therefore NOT a unique OS
- * process identity. The kernel keeps a microsecond start time, but it is only
- * reachable via `proc_pidinfo`/`sysctl` — native code, not available to a
- * pure-JS plugin, and no `ps`-level field offers more precision on macOS.
- * What the credential set (pid + ppid + uid + exe + second-resolution
- * lstart) does guarantee: any PID reuse that survives all five checks must
- * recycle the PID within the same calendar second for the same executable
- * under the same UID — macOS allocates PIDs monotonically, so that requires
- * wrapping the whole PID space in under a second. Every signal (TERM and
- * KILL alike) is preceded by a FRESH re-check in the supervisor; a stale
- * check is never trusted; any missing or contradictory field refuses
- * outright (fail-closed). This narrows the reuse window far below anything
- * exploitable, but it is not claimed to be zero.
+ * 身份凭据分层（TASK-2 最终裁定；三层不是一回事，不得混为一谈）：
+ *
+ *  1. 能够采集 —— ps 可用并返回完整字段（pid/ppid/uid/lstart/etime/comm）。
+ *  2. 大概率是原进程 —— 各字段与规划记录一致，这只是统计意义上的强关联。
+ *  3. 满足发破坏性信号（TERM/KILL）前的安全要求 —— 必须由下列内核级证据
+ *     支撑，缺任何一项监督流程即拒发信号（fail-closed）：
+ *
+ *     a. 内核父子关系（主进程专用）：监督进程由目标 app 亲自 spawn，
+ *        `getppid() === app.pid` 是内核保证的事实；原父进程死后 ppid 变为
+ *        launchd，PID 复用产生的新进程不可能重新成为监督进程的父进程，
+ *        因此该证据无法被复用伪造。
+ *
+ *     b. 最小年龄门 + 存活时间单调性（主进程与服务进程通用）：`lstart`
+ *        只有秒级精度，单独使用无法区分「同一秒内启动」的复用进程。因此
+ *        要求被记录进程在采集时已存活 ≥ MIN_SIGNAL_AGE_SECONDS，且每次
+ *        复核时新鲜 etime ≥ 记录 etime。复用者必然在原进程死后启动，其
+ *        启动秒 ≥ 记录秒 + 年龄门，lstart 显示值必然不同、etime 必然更小
+ *        ——「同秒复用」由构造排除，不再依赖概率论证。
+ *
+ *  macOS 的微秒级启动时间只有 proc_pidinfo 原生接口可得，纯 JS 插件无法
+ *  使用；上述证据缺失、字段异常或目标过新时一律拒绝，并向 UI 返回可理解
+ *  的失败原因（提示手动重启），绝不为了成功率降低校验标准。
  */
 export function parseProcLine(line: string): ParsedProc | null {
   const tokens = line.trim().split(/\s+/)
-  if (tokens.length < 9) return null
+  if (tokens.length < 10) return null
   const pid = Number.parseInt(tokens[0]!, 10)
   const ppid = Number.parseInt(tokens[1]!, 10)
   const uid = Number.parseInt(tokens[2]!, 10)
   const lstart = tokens.slice(3, 8).join(" ")
-  const comm = tokens.slice(8).join(" ")
+  const etime = tokens[8]!
+  const comm = tokens.slice(9).join(" ")
   if (!Number.isInteger(pid) || pid <= 0 || !Number.isInteger(ppid) || !Number.isInteger(uid)) return null
-  if (!lstart || !comm) return null
-  return { pid, ppid, uid, lstart, comm }
+  if (!lstart || !etime || !comm) return null
+  return { pid, ppid, uid, lstart, etime, comm }
 }
+
+/**
+ * Parses `ps etime` (`[[dd-]hh:]mm:ss`) into total seconds; null when the
+ * value is malformed. Fields are strictly digit-checked (hh/mm/ss two digits,
+ * days one or more) so a garbage value can never masquerade as a valid age —
+ * a malformed age is treated as "credential missing" and refuses the restart.
+ */
+export function etimeSeconds(etime: string): number | null {
+  let rest = String(etime ?? "").trim()
+  let days = 0
+  const dash = rest.indexOf("-")
+  if (dash >= 0) {
+    const dayPart = rest.slice(0, dash)
+    rest = rest.slice(dash + 1)
+    if (!/^\d+$/.test(dayPart)) return null
+    days = Number.parseInt(dayPart, 10)
+  }
+  const parts = rest.split(":")
+  if (parts.length < 2 || parts.length > 3) return null
+  if (!parts.every((part) => /^\d{2}$/.test(part))) return null
+  let seconds = 0
+  for (const part of parts) seconds = seconds * 60 + Number.parseInt(part, 10)
+  return days * 86_400 + seconds
+}
+
+/**
+ * Minimum age (seconds) a process must have at credential-capture time before
+ * its second-resolution `lstart` may be trusted for signalling decisions.
+ * Below this age a PID reused within the same calendar second could not be
+ * distinguished, so the restart refuses outright (fail-closed).
+ */
+export const MIN_SIGNAL_AGE_SECONDS = 2
 
 /**
  * Minimal necessary environment for the relaunched app: identity, temp and
@@ -154,6 +200,17 @@ export function collectRestartSnapshot(deps: CollectDeps): CollectResult {
   }
   if (!psSelf.lstart) return refuse("无法读取当前进程启动时间（进程实例凭据缺失），拒绝自动重启。")
 
+  // 最小年龄门（TASK-2）：秒级 lstart 只有配合「记录时进程已存在足够久」
+  // 才能构造性排除同秒 PID 复用。目标过新 = 凭据不足 = fail-closed。
+  const selfAge = etimeSeconds(psSelf.etime)
+  if (selfAge === null) return refuse("无法解析当前进程存活时间（年龄凭据缺失或格式异常），拒绝自动重启。")
+  if (selfAge < MIN_SIGNAL_AGE_SECONDS) {
+    return refuse(
+      `当前进程刚启动 ${selfAge} 秒，低于建立可靠进程身份凭据所需的最小年龄（${MIN_SIGNAL_AGE_SECONDS} 秒），` +
+        "无法排除 PID 复用风险，拒绝自动重启。请稍后重试或手动重启。",
+    )
+  }
+
   // macOS 桌面主进程校验：必须是某个 .app bundle 的主可执行文件。开发用的
   // Electron 二进制虽符合路径形态，但 development 标志已在上方拒绝。
   if (!/\/[^/]+\.app\/Contents\/MacOS\/[^/]+$/.test(deps.self.execPath)) {
@@ -163,12 +220,22 @@ export function collectRestartSnapshot(deps: CollectDeps): CollectResult {
   // --- sidecar: the app's own `serve --service` child -----------------------
   const children = deps.childPids(deps.self.pid)
   if (children === null) return refuse("无法枚举当前进程的直接子进程，服务归属不明，拒绝自动重启。")
-  const sidecars: { pid: number; ppid: number; uid: number; lstart: string; exe: string }[] = []
+  const sidecars: { pid: number; ppid: number; uid: number; lstart: string; etime: string; exe: string }[] = []
   for (const pid of children) {
     const info = deps.procInfo(pid)
     if (!info) continue
     if (info.comm.endsWith(DEFAULT_SIDECAR_SUFFIX)) {
-      sidecars.push({ pid, ppid: info.ppid, uid: info.uid, lstart: info.lstart, exe: info.comm })
+      const scAge = etimeSeconds(info.etime)
+      if (scAge === null) {
+        return refuse("无法解析服务进程存活时间（年龄凭据缺失或格式异常），拒绝自动重启。")
+      }
+      if (scAge < MIN_SIGNAL_AGE_SECONDS) {
+        return refuse(
+          `服务进程刚启动 ${scAge} 秒，低于建立可靠进程身份凭据所需的最小年龄（${MIN_SIGNAL_AGE_SECONDS} 秒），` +
+            "无法排除 PID 复用风险，拒绝自动重启。请稍后重试或手动重启。",
+        )
+      }
+      sidecars.push({ pid, ppid: info.ppid, uid: info.uid, lstart: info.lstart, etime: info.etime, exe: info.comm })
     }
   }
   if (sidecars.length === 0) {
@@ -207,13 +274,20 @@ export function collectRestartSnapshot(deps: CollectDeps): CollectResult {
         ppid: deps.self.ppid,
         uid: deps.self.uid,
         lstart: psSelf.lstart,
+        etime: psSelf.etime,
         exe: deps.self.execPath,
         argv: deps.self.argv,
         cwd: deps.self.cwd,
       },
       // 载荷里的 sidecar 不带 ppid：主进程退出后它会被 launchd 重新挂靠，
-      // 监督流程的身份复核只依赖 exe/UID/启动时间（PID 复用防护）。
-      sidecar: { pid: sidecars[0]!.pid, uid: sidecars[0]!.uid, lstart: sidecars[0]!.lstart, exe: sidecars[0]!.exe },
+      // 监督流程对它的身份复核依赖 exe/UID/启动时间/年龄门（PID 复用防护）。
+      sidecar: {
+        pid: sidecars[0]!.pid,
+        uid: sidecars[0]!.uid,
+        lstart: sidecars[0]!.lstart,
+        etime: sidecars[0]!.etime,
+        exe: sidecars[0]!.exe,
+      },
       env: whitelistEnv(deps.env),
       timeouts: RESTART_TIMEOUTS,
     },

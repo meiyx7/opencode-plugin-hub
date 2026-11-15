@@ -1,7 +1,8 @@
 /**
  * 重启状态文件与监督进程启动器测试（TASK-1/2/3 的自动化覆盖）：
  *  - 状态目录创建时序（同步创建先于首次写入，失败不得误报 accepted）；
- *  - supervisor spawn 的异步 error 事件处理（pid 存在不等于启动成功）；
+ *  - supervisor spawn 的成功判定（只有真实 spawn 事件才算启动成功；
+ *    error 与 settle 超时一律 failed，pid 存在不等于启动成功）；
  *  - 状态文件按实例隔离（user-data-dir 派生路径，两个实例互不覆盖）。
  * 全部使用临时目录与假 spawn，不接触真实进程、不发信号。
  */
@@ -70,7 +71,9 @@ interface Harness {
 
 let counter = 0
 
-async function harness(childSetup: (child: FakeChild) => void = () => {}): Promise<Harness> {
+async function harness(
+  childSetup: (child: FakeChild) => void = (child) => setTimeout(() => child.emit("spawn"), 5),
+): Promise<Harness> {
   const baseDir = join(tmpdir(), `ph-launch-test-${process.pid}-${Date.now()}-${counter++}`)
   const statusPath = join(baseDir, "restart-status-abc.json")
   const children: FakeChild[] = []
@@ -220,14 +223,19 @@ test("spawn 成功（spawn 事件）：accepted，状态文件为 accepted，并
   assert.equal(h.children[0]!.unrefd, true)
 })
 
-test("事件迟迟不来但 pid 存在：settle 超时后按 accepted 处理", async () => {
-  const h = await harness() // 不触发任何事件，pid=4242
+test("超时且 child.pid 存在：未收到 spawn 事件不得报 accepted，必须 failed", async () => {
+  const h = await harness(() => {}) // pid=4242 存在，但 spawn/error 事件都不来
   const result = await h.launch({ settleMs: 30 })
-  assert.equal(result.phase, "accepted")
-  assert.equal(h.children[0]!.unrefd, true)
+  assert.equal(result.phase, "failed")
+  assert.equal(result.ok, false)
+  assert.match(result.message, /限定时间内确认启动/)
+  const record = await readStatus(h.statusPath)
+  assert.equal(record.phase, "failed")
+  assert.equal(record.detail, "supervisor-spawn-error:settle-timeout")
+  assert.equal(h.children[0]!.unrefd, false, "未确认启动不得 unref")
 })
 
-test("无事件且无 pid：不得虚报 accepted", async () => {
+test("超时且没有 child.pid：同样 failed（settle-timeout）", async () => {
   const h = await harness((child) => {
     child.pid = undefined
   })
@@ -235,6 +243,28 @@ test("无事件且无 pid：不得虚报 accepted", async () => {
   assert.equal(result.phase, "failed")
   const record = await readStatus(h.statusPath)
   assert.equal(record.phase, "failed")
+  assert.equal(record.detail, "supervisor-spawn-error:settle-timeout")
+})
+
+test("超时 failed 之后迟到的 error：不覆盖已有 failed 记录，也不崩溃", async () => {
+  const h = await harness((child) => {
+    setTimeout(() => child.emit("error", new Error("late after timeout") as never), 60)
+  })
+  const result = await h.launch({ settleMs: 20 })
+  assert.equal(result.phase, "failed")
+  await new Promise((resolve) => setTimeout(resolve, 80))
+  const record = await readStatus(h.statusPath)
+  assert.equal(record.detail, "supervisor-spawn-error:settle-timeout", "迟到事件不得改写最终状态")
+})
+
+test("spawn 事件已发生但拿不到 pid（契约被破坏）：仍 fail-closed", async () => {
+  const h = await harness((child) => {
+    child.pid = undefined
+    setTimeout(() => child.emit("spawn"), 5)
+  })
+  const result = await h.launch()
+  assert.equal(result.phase, "failed")
+  const record = await readStatus(h.statusPath)
   assert.equal(record.detail, "supervisor-spawn-error:no-pid")
 })
 

@@ -14,7 +14,14 @@ import { SUPERVISOR_SOURCE } from "../src/gui/restart-supervisor.ts"
 
 interface Evaluated {
   runSupervisorFlow: (payload: unknown, ops: unknown) => Promise<{ phase: string; detail: string; exitCode: number }>
-  parseProcLine: (line: string) => { pid: number; ppid: number; uid: number; lstart: string; comm: string } | null
+  parseProcLine: (line: string) => {
+    pid: number
+    ppid: number
+    uid: number
+    lstart: string
+    etime: string
+    comm: string
+  } | null
 }
 
 const evaluated: Evaluated = (() => {
@@ -42,12 +49,16 @@ const SIDECAR_EXE =
   "/Users/meiyx/Library/Application Support/ai.opencode.desktop/cli/2.3.0-arm64/opencode-cli"
 const APP_LSTART = "Sat Nov 15 18:24:15 2026"
 const SC_LSTART = "Sat Nov 15 18:24:16 2026"
+// 年龄凭据：记录时进程已存活 ≥ 2 秒（最小年龄门），复核时只能更大。
+const APP_ETIME = "12:34"
+const SC_ETIME = "12:33"
 
 interface WorldProc {
   pid: number
   ppid: number
   uid: number
   lstart: string
+  etime: string
   comm: string
 }
 
@@ -64,6 +75,9 @@ interface World {
 function fakeOps(world: World) {
   return {
     procInfo: (pid: number): WorldProc | null => world.procs.get(pid) ?? null,
+    // 监督进程由目标 app 亲自 spawn：内核父子关系是 PID 复用无法伪造的
+    // 身份证据。fake 世界里 app 的 PID 是 53046。
+    getPpid: (): number => 53046,
     signal: (pid: number, sig: string): void => {
       world.signals.push({ pid, sig })
       world.onSignal?.(world, pid, sig)
@@ -77,7 +91,7 @@ function fakeOps(world: World) {
       const pid = 53100 + world.launches.length
       world.launches.push({ exe, args, cwd, env })
       if (world.launchBehavior !== "die") {
-        world.procs.set(pid, { pid, ppid: 1, uid: 501, lstart: "Sat Nov 15 19:00:00 2026", comm: exe })
+        world.procs.set(pid, { pid, ppid: 1, uid: 501, lstart: "Sat Nov 15 19:00:00 2026", etime: "00:10", comm: exe })
         // 新实例正常启动后会创建自己的 SingletonLock（接管/重建）
         if (!world.lockNeverUpdates) world.lockTarget = `meiyxMac.local-${pid}`
       }
@@ -91,8 +105,8 @@ function fakeOps(world: World) {
 
 function baseWorld(): World {
   const procs = new Map<number, WorldProc>()
-  procs.set(53046, { pid: 53046, ppid: 1, uid: 501, lstart: APP_LSTART, comm: APP_EXE })
-  procs.set(53062, { pid: 53062, ppid: 53046, uid: 501, lstart: SC_LSTART, comm: SIDECAR_EXE })
+  procs.set(53046, { pid: 53046, ppid: 1, uid: 501, lstart: APP_LSTART, etime: APP_ETIME, comm: APP_EXE })
+  procs.set(53062, { pid: 53062, ppid: 53046, uid: 501, lstart: SC_LSTART, etime: SC_ETIME, comm: SIDECAR_EXE })
   return { procs, signals: [], launches: [], lockTarget: "meiyxMac.local-53046" }
 }
 
@@ -106,11 +120,12 @@ function basePayload(world: World, over: Record<string, unknown> = {}) {
       ppid: 1,
       uid: 501,
       lstart: APP_LSTART,
+      etime: APP_ETIME,
       exe: APP_EXE,
       argv: [APP_EXE, "--user-data-dir=/tmp/ph-profile"],
       cwd: "/Users/meiyx",
     },
-    sidecar: { pid: 53062, uid: 501, lstart: SC_LSTART, exe: SIDECAR_EXE },
+    sidecar: { pid: 53062, uid: 501, lstart: SC_LSTART, etime: SC_ETIME, exe: SIDECAR_EXE },
     env: { HOME: "/Users/meiyx", PATH: "/usr/bin:/bin", XDG_CACHE_HOME: "/tmp/ph-cache" },
     timeouts: { appExitMs: 500, sidecarGraceMs: 50, sidecarExitMs: 500, launchVerifyMs: 400, overallMs: 60_000 },
     ...over,
@@ -270,13 +285,129 @@ test("主进程 PPID 不一致（被重新挂靠）：fail-closed 拒绝", async
   assert.equal(world.signals.length, 0)
 })
 
+// ---------------------------------------------------------------------------
+// TASK-2：发破坏性信号前的身份安全要求（三层分离：能采集 / 大概率是 / 可发信号）
+// ---------------------------------------------------------------------------
+
+test("内核父子关系不符（getppid ≠ app.pid）：fail-closed，不发 TERM", async () => {
+  const world = baseWorld()
+  autoExit(world)
+  const ops = fakeOps(world)
+  ;(ops as Record<string, unknown>).getPpid = () => 99999
+  const result = await run(basePayload(world), ops)
+  assert.equal(result.phase, "failed")
+  assert.match(result.detail, /app-parent-mismatch:99999/)
+  assert.equal(world.signals.length, 0, "缺少内核父子证据时不得发送任何信号")
+  assert.equal(world.launches.length, 0)
+})
+
+test("ops 缺少 getPpid（无法提供父子证据）：同样拒绝", async () => {
+  const world = baseWorld()
+  autoExit(world)
+  const ops = fakeOps(world) as Record<string, unknown>
+  delete ops.getPpid
+  const result = await run(basePayload(world), ops)
+  assert.equal(result.phase, "failed")
+  assert.match(result.detail, /app-parent-mismatch:null/)
+  assert.equal(world.signals.length, 0)
+})
+
+test("身份凭据过新（记录 etime < 最小年龄门）：拒发 TERM", async () => {
+  const world = baseWorld()
+  autoExit(world)
+  const payload = basePayload(world)
+  ;(payload as { app: { etime: string } }).app.etime = "00:01"
+  const result = await run(payload, fakeOps(world))
+  assert.equal(result.phase, "failed")
+  assert.match(result.detail, /app-recheck-failed:credential-too-young/)
+  assert.equal(world.signals.length, 0)
+})
+
+test("复核时存活时间变小（PID 已被更年轻的进程顶替）：拒发 TERM", async () => {
+  const world = baseWorld()
+  autoExit(world)
+  const recycled = world.procs.get(53046)!
+  world.procs.set(53046, { ...recycled, etime: "00:00" }) // lstart 同、etime 更小
+  const result = await run(basePayload(world), fakeOps(world))
+  assert.equal(result.phase, "failed")
+  assert.match(result.detail, /app-recheck-failed:etime-shrunk/)
+  assert.equal(world.signals.length, 0)
+})
+
+test("记录 etime 无法解析（年龄凭据格式异常）：拒发 TERM", async () => {
+  const world = baseWorld()
+  autoExit(world)
+  const payload = basePayload(world)
+  ;(payload as { app: { etime: string } }).app.etime = "bogus"
+  const result = await run(payload, fakeOps(world))
+  assert.equal(result.phase, "failed")
+  assert.match(result.detail, /app-recheck-failed:etime-unparseable/)
+  assert.equal(world.signals.length, 0)
+})
+
+test("sidecar 身份在 TERM 前已变化：拒绝向 sidecar 发送 TERM", async () => {
+  const world = baseWorld()
+  world.onSignal = (w, pid) => {
+    if (pid === 53046) w.procs.delete(53046) // 主进程正常退出，sidecar 保留
+  }
+  const sc = world.procs.get(53062)!
+  world.procs.set(53062, { ...sc, lstart: "Sun Nov 16 10:00:00 2026" })
+  const result = await run(basePayload(world), fakeOps(world))
+  assert.equal(result.phase, "failed")
+  assert.match(result.detail, /sidecar-recheck-failed:instance-mismatch/)
+  assert.ok(!world.signals.some((s) => s.pid === 53062), "复核失败后不得向 sidecar 发送 TERM")
+  assert.equal(world.launches.length, 0)
+})
+
+test("sidecar 记录凭据过新（etime < 最小年龄门）：拒绝向 sidecar 发送 TERM", async () => {
+  const world = baseWorld()
+  world.onSignal = (w, pid) => {
+    if (pid === 53046) w.procs.delete(53046)
+  }
+  const payload = basePayload(world)
+  ;(payload as { sidecar: { etime: string } }).sidecar.etime = "00:01"
+  const result = await run(payload, fakeOps(world))
+  assert.equal(result.phase, "failed")
+  assert.match(result.detail, /sidecar-recheck-failed:credential-too-young/)
+  assert.ok(!world.signals.some((s) => s.pid === 53062))
+})
+
+test("sidecar 在 KILL 前存活时间变小（被更年轻进程顶替）：拒绝 KILL", async () => {
+  const world = baseWorld()
+  world.onSignal = (w, pid, sig) => {
+    if (pid === 53046) w.procs.delete(53046)
+    if (pid === 53062 && sig === "TERM") {
+      const sc = w.procs.get(53062)!
+      w.procs.set(53062, { ...sc, etime: "00:00" }) // 复用者必然更年轻
+    }
+  }
+  const result = await run(basePayload(world), fakeOps(world))
+  assert.equal(result.phase, "failed")
+  assert.match(result.detail, /sidecar-recheck-before-kill-failed:etime-shrunk/)
+  assert.ok(!world.signals.some((s) => s.sig === "KILL"), "复核失败后不得发送 KILL")
+  assert.equal(world.launches.length, 0)
+})
+
+test("sidecar 已经提前退出：不向其发送任何信号，流程照常重启", async () => {
+  const world = baseWorld()
+  world.onSignal = (w, pid) => {
+    if (pid === 53046) {
+      w.procs.delete(53046)
+      w.procs.delete(53062) // sidecar 随主进程一起消失
+    }
+  }
+  const result = await run(basePayload(world), fakeOps(world))
+  assert.equal(result.phase, "new-started")
+  assert.ok(!world.signals.some((s) => s.pid === 53062), "sidecar 已退出时不得误发信号")
+})
+
 test("sidecar 的 PID 在 TERM 后被复用：KILL 前的二次复核拒绝，绝不误杀", async () => {
   const world = baseWorld()
   world.onSignal = (w, pid, sig) => {
     if (pid === 53046) w.procs.delete(53046)
     if (pid === 53062 && sig === "TERM") {
       // PID 复用：同 PID、同 exe、同 UID，但启动时间已变——是新进程
-      w.procs.set(53062, { pid: 53062, ppid: 1, uid: 501, lstart: "Sun Nov 16 10:00:00 2026", comm: SIDECAR_EXE })
+      w.procs.set(53062, { pid: 53062, ppid: 1, uid: 501, lstart: "Sun Nov 16 10:00:00 2026", etime: "00:00", comm: SIDECAR_EXE })
     }
   }
   const result = await run(basePayload(world), fakeOps(world))
@@ -291,8 +422,10 @@ test("载荷缺失或自相矛盾：invalid-payload，且一个信号都不发",
     null,
     {},
     basePayload(baseWorld(), { app: {} }),
-    basePayload(baseWorld(), { app: { pid: 0, exe: "", lstart: "", argv: [], cwd: "" } }),
+    basePayload(baseWorld(), { app: { pid: 0, exe: "", lstart: "", etime: "", argv: [], cwd: "" } }),
+    basePayload(baseWorld(), { app: { pid: 53046, ppid: 1, uid: 501, lstart: APP_LSTART, exe: APP_EXE, argv: [APP_EXE], cwd: "/tmp", etime: "" } }),
     basePayload(baseWorld(), { sidecar: { pid: 53046, uid: 501, lstart: SC_LSTART, exe: SIDECAR_EXE } }),
+    basePayload(baseWorld(), { sidecar: { pid: 53062, uid: 501, lstart: SC_LSTART, etime: "", exe: SIDECAR_EXE } }),
   ]) {
     const world = baseWorld()
     const result = await run(payload, fakeOps(world))
@@ -309,7 +442,7 @@ test("载荷缺失或自相矛盾：invalid-payload，且一个信号都不发",
 test("锁被其他存活进程持有：放弃启动，如实报告", async () => {
   const world = baseWorld()
   autoExit(world)
-  world.procs.set(70000, { pid: 70000, ppid: 1, uid: 501, lstart: "Sat Nov 15 10:00:00 2026", comm: "/usr/sbin/sshd" })
+  world.procs.set(70000, { pid: 70000, ppid: 1, uid: 501, lstart: "Sat Nov 15 10:00:00 2026", etime: "05:00", comm: "/usr/sbin/sshd" })
   world.lockTarget = "meiyxMac.local-70000"
   const result = await run(basePayload(world), fakeOps(world))
   assert.equal(result.phase, "failed")
@@ -461,7 +594,7 @@ test("launch 的 Promise 在 spawn 事件后成功：流程照常进入验证", 
   withRecord.launch = (exe: string, args: readonly string[], cwd: string, env: Record<string, string>) => {
     const pid = 53100
     world.launches.push({ exe, args, cwd, env })
-    world.procs.set(pid, { pid, ppid: 1, uid: 501, lstart: "Sat Nov 15 19:00:00 2026", comm: exe })
+    world.procs.set(pid, { pid, ppid: 1, uid: 501, lstart: "Sat Nov 15 19:00:00 2026", etime: "00:10", comm: exe })
     world.lockTarget = `meiyxMac.local-${pid}`
     return Promise.resolve({ pid })
   }
@@ -475,18 +608,19 @@ test("launch 的 Promise 在 spawn 事件后成功：流程照常进入验证", 
 
 test("SIGNAL_RECHECK_REQUIREMENTS 是运行时不可变数据", () => {
   assert.ok(Object.isFrozen(SIGNAL_RECHECK_REQUIREMENTS))
-  assert.equal(SIGNAL_RECHECK_REQUIREMENTS.length, 5)
+  assert.equal(SIGNAL_RECHECK_REQUIREMENTS.length, 7)
 })
 
-test("监督脚本的 ps 行解析与 TS 侧一致（PID/PPID/UID/启动时间/可执行文件）", () => {
+test("监督脚本的 ps 行解析与 TS 侧一致（PID/PPID/UID/启动时间/存活时间/可执行文件）", () => {
   const line =
-    "  53046     1  501 Sat Nov 15 18:24:15 2026 /Applications/OpenCode.app/Contents/MacOS/OpenCode"
+    "  53046     1  501 Sat Nov 15 18:24:15 2026 12:34 /Applications/OpenCode.app/Contents/MacOS/OpenCode"
   const parsed = parseProcLine(line)
   assert.deepEqual(parsed, {
     pid: 53046,
     ppid: 1,
     uid: 501,
     lstart: "Sat Nov 15 18:24:15 2026",
+    etime: "12:34",
     comm: "/Applications/OpenCode.app/Contents/MacOS/OpenCode",
   })
   assert.equal(parseProcLine("garbage"), null)

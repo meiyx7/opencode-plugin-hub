@@ -12,11 +12,15 @@
  *
  * TASK-2 (spawn error handling): the detached supervisor spawn is settled by
  * waiting for either the `spawn` event (the child really exists) or the
- * `error` event (launch failed) before answering "accepted". `child.pid`
- * alone is not evidence: Node reports spawn failures (ENOENT, EACCES) only
- * asynchronously via `error`. `close`/`exit` are deliberately NOT observed:
- * the supervisor exiting is its normal way of finishing its job, and the
- * status file — not the parent's event view — is the source of truth.
+ * `error` event (launch failed) before answering. ONLY the real `spawn` event
+ * counts as success: `child.pid` alone is not evidence — Node reports spawn
+ * failures (ENOENT, EACCES) asynchronously via `error`, and a spawned-but-
+ * unconfirmed pid proves nothing about the OS having started the program.
+ * The settle TIMEOUT is therefore a failure too: if neither event arrived in
+ * time, the outcome is `failed` (supervisor-spawn-error:settle-timeout), even
+ * when a pid happens to be present. `close`/`exit` are deliberately NOT
+ * observed: the supervisor exiting is its normal way of finishing its job,
+ * and the status file — not the parent's event view — is the source of truth.
  *
  * TASK-3 (per-instance status isolation): the status file name is derived
  * from the instance's user-data-dir (the stable per-instance identity the
@@ -114,7 +118,7 @@ export interface LaunchOutcome {
   message: string
 }
 
-/** How long to wait for the spawn to prove itself before trusting `pid`. */
+/** How long to wait for the real `spawn`/`error` event before giving up. */
 const DEFAULT_SETTLE_MS = 250
 
 function errorTag(error: unknown): string {
@@ -129,9 +133,11 @@ function errorTag(error: unknown): string {
 
 /**
  * Writes the accepted record, spawns the detached supervisor and answers
- * "accepted" only once the spawn has actually taken (spawn event, or the
- * settle window passed with a real pid). Any failure writes an accurate
- * `failed` status record and never reports accepted.
+ * "accepted" ONLY on the real `spawn` event — the OS-level proof that the
+ * supervisor process exists. An `error` event, a settle timeout (even with a
+ * pid present) or a missing pid all write an accurate `failed` status record
+ * and never report accepted. "accepted" means the supervisor has been
+ * confirmed started by the OS; it never means the restart is done.
  */
 export async function launchRestartSupervisor(options: {
   runtimePath: string
@@ -187,22 +193,26 @@ export async function launchRestartSupervisor(options: {
     }
   }
 
-  // Wait for the spawn to prove itself. Node reports spawn failures only via
-  // the async `error` event — a present `child.pid` alone proves nothing. The
-  // error listener intentionally stays attached after settling: an `error`
-  // event with no listener would crash the Electron main process, and after
-  // settle it is a no-op because the status file is already authoritative.
+  // Wait for the spawn to prove itself. ONLY the real `spawn` event counts:
+  // Node reports spawn failures via the async `error` event, and a present
+  // `child.pid` alone is never OS-level evidence of a started process. If
+  // neither event arrives within the settle window the outcome is `failed`
+  // (supervisor-spawn-error:settle-timeout) — fail-closed, even when a pid
+  // happens to be present. The error listener intentionally stays attached
+  // after settling: an `error` event with no listener would crash the
+  // Electron main process, and after settle it is a no-op because the status
+  // file is already authoritative (late events never rewrite it).
   const settleMs = options.settleMs ?? DEFAULT_SETTLE_MS
-  const settled = await new Promise<{ error?: Error }>((resolve) => {
+  const settled = await new Promise<{ error?: Error; spawned: boolean }>((resolve) => {
     let done = false
-    const finish = (error?: Error) => {
+    const finish = (outcome: { error?: Error; spawned?: boolean }) => {
       if (done) return
       done = true
-      resolve({ error })
+      resolve({ error: outcome.error, spawned: outcome.spawned === true })
     }
-    child.on("error", (err: Error) => finish(err))
-    child.on("spawn", () => finish())
-    setTimeout(() => finish(), settleMs)
+    child.on("error", (err: Error) => finish({ error: err }))
+    child.on("spawn", () => finish({ spawned: true }))
+    setTimeout(() => finish({}), settleMs)
   })
 
   if (settled.error) {
@@ -218,8 +228,25 @@ export async function launchRestartSupervisor(options: {
     }
   }
 
-  // Belt and braces: after the settle window there must be a real pid. Without
-  // it, "accepted" would be a guess, so report failure instead.
+  // No spawn event within the settle window: not confirmed by the OS, so the
+  // outcome is failed regardless of child.pid. A pid without the spawn event
+  // is a guess, and guesses never escalate to "accepted".
+  if (!settled.spawned) {
+    try {
+      write(statusPath, record("failed", "supervisor-spawn-error:settle-timeout"))
+    } catch {
+      // best effort
+    }
+    return {
+      ok: false,
+      phase: "failed",
+      message: "重启监督流程未能在限定时间内确认启动（settle-timeout），未结束任何进程。请手动重启。",
+    }
+  }
+
+  // Defensive: after a real spawn event Node always exposes a positive pid.
+  // If a fake/odd implementation ever violates that, fail closed instead of
+  // reporting accepted without an addressable process.
   if (typeof child.pid !== "number" || child.pid <= 0) {
     try {
       write(statusPath, record("failed", "supervisor-spawn-error:no-pid"))

@@ -88,6 +88,8 @@ export const SIGNAL_RECHECK_REQUIREMENTS: readonly string[] = Object.freeze([
   "目标 PID 对应的 UID 与规划时的原始身份一致",
   "目标进程仍是原始目标本身，而不是 PID 复用后产生的新进程",
   "进程身份信息完整且没有矛盾",
+  "主进程信号前必须确认内核父子关系（监督进程 getppid 与目标 PID 一致，PID 复用无法伪造）",
+  "全部目标信号前必须确认最小年龄门与存活时间单调性（记录时已存活 ≥ 2 秒，复核时 etime 不小于记录值）",
 ] as readonly string[])
 
 /**

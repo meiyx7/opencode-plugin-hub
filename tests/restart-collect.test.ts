@@ -10,6 +10,7 @@ import { afterEach, beforeEach, test } from "node:test"
 import * as admin from "../src/gui/admin.ts"
 import {
   collectRestartSnapshot,
+  etimeSeconds,
   parseProcLine,
   whitelistEnv,
   type CollectDeps,
@@ -28,6 +29,7 @@ function proc(partial: Partial<ParsedProc> & { pid: number }): ParsedProc {
     ppid: partial.pid === 53046 ? 1 : 53046,
     uid: 501,
     lstart: partial.pid === 53046 ? APP_LSTART : SC_LSTART,
+    etime: partial.pid === 53046 ? "12:34" : "12:33",
     comm: partial.pid === 53046 ? APP_EXE : SIDECAR_EXE,
     ...partial,
   }
@@ -78,10 +80,12 @@ test("证据齐全时产出监督载荷", () => {
   assert.equal(payload.requestId, "req-1")
   assert.equal(payload.app.pid, 53046)
   assert.equal(payload.app.lstart, APP_LSTART)
+  assert.equal(payload.app.etime, "12:34")
   assert.deepEqual(payload.app.argv, [APP_EXE])
   assert.equal(payload.app.cwd, "/Users/meiyx")
   assert.equal(payload.sidecar!.pid, 53062)
   assert.equal(payload.sidecar!.lstart, SC_LSTART)
+  assert.equal(payload.sidecar!.etime, "12:33")
   assert.equal(payload.lockPath!.endsWith("SingletonLock"), true)
   assert.ok(payload.timeouts.overallMs > 0)
 })
@@ -203,16 +207,68 @@ test("环境变量白名单：XDG_/OPENCODE_ 前缀与基础键保留，凭据�
 
 test("ps 行解析：完整字段与脏数据", () => {
   const parsed = parseProcLine(
-    "  53062 53046  501 Sat Nov 15 18:24:16 2026 /Users/meiyx/Library/Application Support/ai.opencode.desktop/cli/2.3.0-arm64/opencode-cli",
+    "  53062 53046  501 Sat Nov 15 18:24:16 2026 12:33 /Users/meiyx/Library/Application Support/ai.opencode.desktop/cli/2.3.0-arm64/opencode-cli",
   )
   assert.ok(parsed)
   assert.equal(parsed!.pid, 53062)
   assert.equal(parsed!.ppid, 53046)
   assert.equal(parsed!.uid, 501)
   assert.equal(parsed!.lstart, "Sat Nov 15 18:24:16 2026")
+  assert.equal(parsed!.etime, "12:33")
   assert.ok(parsed!.comm.endsWith("/opencode-cli"))
   assert.equal(parseProcLine("nope"), null)
   assert.equal(parseProcLine("abc def ghi jkl"), null)
+})
+
+test("etimeSeconds：[[dd-]hh:]mm:ss 解析与异常值", () => {
+  assert.equal(etimeSeconds("12:33"), 753)
+  assert.equal(etimeSeconds("01:02:03"), 3723)
+  assert.equal(etimeSeconds("2-03:04:05"), 2 * 86400 + 3 * 3600 + 4 * 60 + 5)
+  assert.equal(etimeSeconds("00:00"), 0)
+  assert.equal(etimeSeconds(""), null)
+  assert.equal(etimeSeconds("bogus"), null)
+  assert.equal(etimeSeconds("1:2"), null)
+  assert.equal(etimeSeconds("x:zz"), null)
+})
+
+test("自身进程过新（etime 低于最小年龄门）：拒绝自动重启", () => {
+  const deps = baseDeps()
+  const result = collectRestartSnapshot({
+    ...deps,
+    procInfo: (pid) => (pid === 53046 ? proc({ pid, etime: "00:01" }) : deps.procInfo(pid)),
+  })
+  assert.equal(result.payload, null)
+  assert.match(result.message, /最小年龄/)
+})
+
+test("自身 etime 无法解析（年龄凭据缺失或格式异常）：拒绝", () => {
+  const deps = baseDeps()
+  const result = collectRestartSnapshot({
+    ...deps,
+    procInfo: (pid) => (pid === 53046 ? proc({ pid, etime: "bogus" }) : deps.procInfo(pid)),
+  })
+  assert.equal(result.payload, null)
+  assert.match(result.message, /年龄凭据/)
+})
+
+test("sidecar 过新（etime 低于最小年龄门）：拒绝自动重启", () => {
+  const deps = baseDeps()
+  const result = collectRestartSnapshot({
+    ...deps,
+    procInfo: (pid) => (pid === 53062 ? proc({ pid, etime: "00:00" }) : deps.procInfo(pid)),
+  })
+  assert.equal(result.payload, null)
+  assert.match(result.message, /最小年龄/)
+})
+
+test("sidecar etime 无法解析：拒绝自动重启", () => {
+  const deps = baseDeps()
+  const result = collectRestartSnapshot({
+    ...deps,
+    procInfo: (pid) => (pid === 53062 ? proc({ pid, etime: "bogus" }) : deps.procInfo(pid)),
+  })
+  assert.equal(result.payload, null)
+  assert.match(result.message, /年龄凭据/)
 })
 
 test("环境变量白名单函数：基础键与前缀族保留", () => {
