@@ -1,23 +1,17 @@
 /**
- * 自更新专项测试：admin.install() 的 selfUpdated 判定 + 重启确认流程的每条分支。
+ * 自更新专项测试：admin.install() 的 selfUpdated 判定。
  * 只用 Node 内置 node:test、临时目录和 fetch 桩，不引入第三方依赖。
+ *
+ * selfUpdated 只表示「配置已指向新版本、当前窗口仍是旧构建」；加载交给 OpenCode，
+ * 插件中心不重启宿主，因此这里不再有重启确认/状态回传的用例。
  */
 import test, { after, afterEach, beforeEach } from "node:test"
 import assert from "node:assert/strict"
 import { spawnSync } from "node:child_process"
-import { readFileSync } from "node:fs"
 import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import * as admin from "../src/gui/admin.ts"
-import {
-  RESTART_CONFIRM,
-  SELF_UPDATE_CONFIRM,
-  restartNote,
-  runSelfUpdateRestart,
-  type HubNote,
-  type RestartAttempt,
-} from "../src/gui/self-update.ts"
 
 const REAL_FETCH = globalThis.fetch
 const ENV_KEYS = ["XDG_CONFIG_HOME", "XDG_CACHE_HOME", "OPENCODE_PLUGIN_HUB_REGISTRY"] as const
@@ -202,106 +196,44 @@ test("插件中心自身仍然不能移除", async () => {
 })
 
 // ---------------------------------------------------------------------------
-// 重启确认流程（纯逻辑，无需 DOM）
+// 配置控制项：`-id` 禁用规则与 `*` 通配是规则，不是已安装的插件包
 // ---------------------------------------------------------------------------
 
-interface DriveResult {
-  notes: HubNote[]
-  events: string[]
-  confirmCalls: number
-  restartCalls: number
-}
-
-async function drive(options: { confirmed: boolean; attempt?: RestartAttempt }): Promise<DriveResult> {
-  const notes: HubNote[] = []
-  const events: string[] = []
-  let confirmCalls = 0
-  let restartCalls = 0
-  await runSelfUpdateRestart({
-    confirm: async () => {
-      confirmCalls += 1
-      events.push("confirm")
-      return options.confirmed
-    },
-    restart: async () => {
-      restartCalls += 1
-      events.push("restart")
-      return options.attempt ?? "started"
-    },
-    notify: (note) => {
-      notes.push(note)
-      events.push(`note:${note.text}`)
-    },
-  })
-  return { notes, events, confirmCalls, restartCalls }
-}
-
-test("7. 用户取消重启：不显示正在重启或重启成功，明确提示尚未重启", async () => {
-  const result = await drive({ confirmed: false })
-  assert.equal(result.confirmCalls, 1)
-  assert.equal(result.restartCalls, 0, "取消时不得调用重启")
-  const all = result.notes.map((note) => note.text).join("\n")
-  assert.ok(!all.includes("正在重启"))
-  assert.ok(!all.includes("重启成功"))
-  assert.match(result.notes.at(-1)!.text, /尚未重启/)
-  assert.match(result.notes.at(-1)!.text, /更多操作 → 彻底重启 OpenCode/, "取消后仍告知重启入口")
-  assert.equal(result.notes.at(-1)!.tone, "warning")
+test("7. 禁用规则与通配项按规则展示，不伪装成插件包", async () => {
+  await writeConfig(["-acme.reviewer", "*", "opencode-notify"])
+  const state = await admin.snapshot()
+  const bySpec = new Map(state.plugins.map((entry) => [entry.spec, entry]))
+  assert.equal(bySpec.get("-acme.reviewer")!.kind, "control")
+  assert.equal(bySpec.get("-acme.reviewer")!.name, "acme.reviewer", "规则名不带 - 前缀")
+  assert.equal(bySpec.get("*")!.kind, "control")
+  assert.equal(bySpec.get("opencode-notify")!.kind, "package")
 })
 
-test("8. 自动重启失败：保留明确的手动重启提示", async () => {
-  for (const attempt of ["unavailable", "failed"] as const) {
-    const result = await drive({ confirmed: true, attempt })
-    assert.equal(result.restartCalls, 1)
-    const last = result.notes.at(-1)!
-    assert.equal(last.tone, "error")
-    assert.match(last.text, /手动/)
-    assert.match(last.text, /完全退出/)
-    assert.match(last.text, /serve --service/)
-    assert.match(last.text, /重新打开/)
-    assert.match(last.text, /彻底重启 OpenCode/)
-    assert.ok(!last.text.includes("重启成功"))
+test("8. 控制项不触发 registry 查询，也不会被判定为可更新", async () => {
+  await writeConfig(["-acme.reviewer", "*"])
+  let calls = 0
+  route = () => {
+    calls += 1
+    return new Response("", { status: 404 })
   }
-  assert.match(restartNote("unavailable").text, /手动/)
-  assert.match(restartNote("failed").text, /手动/)
-  assert.match(restartNote("started").text, /正在重启/)
+  const result = await admin.updates()
+  assert.equal(calls, 0, "控制项不应发任何 registry 请求")
+  assert.equal(
+    result.items.every((item) => item.hasUpdate === false && item.error === ""),
+    true,
+  )
 })
 
-test("确认之后才允许提示正在重启", async () => {
-  const result = await drive({ confirmed: true, attempt: "started" })
-  assert.equal(result.notes.length, 2)
-  assert.match(result.notes[0]!.text, /需要/)
-  assert.ok(!result.notes[0]!.text.includes("正在重启"))
-  assert.match(result.notes[1]!.text, /正在重启/)
-  const confirmAt = result.events.indexOf("confirm")
-  const restartingAt = result.events.findIndex((event) => event.includes("正在重启"))
-  assert.ok(confirmAt >= 0 && restartingAt > confirmAt, "确认必须发生在『正在重启』之前")
-  assert.ok(result.events.indexOf("restart") > restartingAt)
+test("9. 移除禁用规则只删掉这一条，其他条目保留", async () => {
+  await writeConfig(["-acme.reviewer", "opencode-notify"])
+  const result = await admin.remove("-acme.reviewer")
+  assert.equal(result.ok, true)
+  assert.deepEqual(await readConfigSpecs(), ["opencode-notify"])
 })
 
-test("确认弹窗准确说明实际影响范围", () => {
-  for (const dialog of [SELF_UPDATE_CONFIRM, RESTART_CONFIRM]) {
-    // 新机制只影响当前实例；弹窗必须如实说明，不得再宣称"结束所有进程"。
-    assert.match(dialog.description, /当前 OpenCode 实例|当前实例|当前应用主进程/)
-    assert.match(dialog.description, /serve --service/)
-    assert.match(dialog.description, /其他/)
-    assert.match(dialog.description, /实例|窗口/)
-    assert.ok(!dialog.description.includes("所有正在运行的 OpenCode"), "不得再宣称影响范围是全部实例")
-    assert.match(dialog.description, /无法安全确认/, "fail-closed 行为必须写进弹窗")
-  }
-})
-
-test("页面接入可测流程，且自更新分支不提前 return", () => {
-  const page = readFileSync(join(process.cwd(), "src/gui/page.tsx"), "utf8")
-  assert.match(page, /runSelfUpdateRestart\(\{/)
-  assert.ok(!page.includes("插件中心已更新，正在重启"), "不得在确认前提示正在重启")
-  const start = page.indexOf("if (result.selfUpdated)")
-  const end = page.indexOf("const latest = version")
-  assert.ok(start > 0 && end > start)
-  const block = page.slice(start, end)
-  const code = block
-    .split("\n")
-    .filter((line) => !/^\s*(\/\/|\*|\/\*)/.test(line))
-    .join("\n")
-  assert.ok(!/\breturn\b/.test(code), "自更新分支不得提前 return，状态同步必须继续")
-  assert.match(page, /彻底重启 OpenCode…/, "工具栏重启入口保留")
+test("10. 安装同名插件时追加启用条目，不改写已有禁用规则", async () => {
+  await writeConfig(["-acme.reviewer"])
+  const result = await admin.install("opencode-notify", "")
+  assert.equal(result.ok, true)
+  assert.deepEqual(await readConfigSpecs(), ["-acme.reviewer", "opencode-notify"])
 })

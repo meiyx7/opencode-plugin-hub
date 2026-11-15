@@ -325,7 +325,6 @@ const ctx = {
     install: async () => ({ ok: false, message: "预览模式不执行安装", state: fakeState }),
     remove: async () => ({ ok: false, message: "预览模式不执行移除", state: fakeState }),
     reload: async () => ({ ok: true, message: "预览模式", state: fakeState }),
-    restart: async () => ({ ok: false }),
     // 预览里展示运行状态徽章：一条已加载、一条未知，用于核对 UI 呈现。
     runtime: async () => ({
       items: fakeState.plugins.map((entry) => ({

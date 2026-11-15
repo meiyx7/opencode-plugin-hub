@@ -2,7 +2,6 @@ import { createEffect, createMemo, createSignal, For, onMount, Show, Switch, Mat
 import type { Context, IconName, IpcClient } from "@opencode/plugin/gui"
 import type { Admin } from "../contract"
 import { countTitle, countWithUnit, formatCount } from "./download-format"
-import { RESTART_CONFIRM, restartNote, runSelfUpdateRestart, type HubNote, type RestartAttempt } from "./self-update"
 
 type AdminClient = IpcClient<typeof Admin.spec>
 type HubState = Awaited<ReturnType<AdminClient["snapshot"]>>
@@ -100,10 +99,10 @@ function noteIcon(tone: Tone): IconName {
 function readableError(error: unknown): string {
   const text = error instanceof Error ? error.message : String(error)
   if (/SchemaError|Missing key at/i.test(text)) {
-    return "插件窗口与后台服务版本不一致。点工具栏的「彻底重启」让两边换成同一版本。"
+    return "插件窗口与后台服务版本不一致，需要 OpenCode 重新加载（插件中心不重启宿主）。"
   }
   if (/unknown method|not implemented|no such method|method.*not.*found/i.test(text)) {
-    return "后台服务还是旧版本，暂时没有「彻底重启」能力。请先手动完全退出 OpenCode（并结束 serve --service）再打开一次。"
+    return "后台服务还在跑旧版本，没有这个接口。请让 OpenCode 重新加载插件后重试。"
   }
   return text
 }
@@ -570,7 +569,7 @@ const CSS = `
   border-color: color-mix(in srgb, var(--ph-danger) 30%, transparent);
   background: color-mix(in srgb, var(--ph-danger) 9%, transparent);
 }
-/* 运行状态徽章：加载成功用成功色，失败用危险色，待重启/未知保持中性——
+/* 运行状态徽章：加载成功用成功色，失败用危险色，待加载/未知保持中性——
    待生效不是错误，不能一进列表就满屏红色。 */
 .ph-badge[data-runtime="loaded"] {
   color: var(--ph-success);
@@ -1073,14 +1072,15 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
   // 运行事实（服务端已加载/失败/未知），与“已在配置中”分开表达。
   const [runtime, setRuntime] = createSignal<Map<string, RuntimeInfo>>(new Map())
   const [runtimeError, setRuntimeError] = createSignal("")
-  /** 配置与上一次已知运行状态不一致的条目数：安装/移除后等待重启生效的数量。 */
+  /** 配置与上一次已知运行状态不一致的条目数：安装/移除后等待宿主加载的数量。 */
   const pendingCount = createMemo(() => {
     const map = runtime()
     if (map.size === 0) return 0 // 从未拿到过运行事实：不虚构“待生效”数量
     return (state()?.plugins ?? []).filter((entry) => {
+      if (entry.kind === "control") return false // 禁用/通配规则不参与加载状态统计
       const info = map.get(entry.spec)
       // unknown：服务端已应答但没加载它；info 缺失：刚改过配置，尚未重新读取。
-      // failed 是“已加载但报错”，不算等待重启。
+      // failed 是“已加载但报错”，不算等待加载。
       return !info || info.status === "unknown"
     }).length
   })
@@ -1225,45 +1225,6 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
     }, 450)
   }
 
-  /**
-   * One restart call without its own confirmation: the toolbar entry point and the
-   * self-update flow share it, so a failed restart always yields the same manual hint.
-   * `ok`/accepted only means the detached supervisor took over — the real outcome is
-   * recorded by the supervisor and reported on the next page load (see reportLastRestart).
-   */
-  const performRestart = async (): Promise<RestartAttempt> =>
-    track("restart", async () => {
-      try {
-        const result = await props.admin.restart()
-        if (result.ok) return "started"
-        notify(result.message || "自动重启未受理，未结束任何进程。", "error")
-        return "unavailable"
-      } catch {
-        return "failed"
-      }
-    })
-
-  /**
-   * The supervisor records the real restart outcome in a status file (the main
-   * process that would otherwise report it is gone). The next page load picks
-   * it up and tells the truth instead of guessing; older services without this
-   * method are silently ignored.
-   */
-  const reportLastRestart = async () => {
-    try {
-      const result = await props.admin.restartStatus()
-      if (!result.found || !result.status) return
-      if (Date.now() - result.status.at > 10 * 60 * 1000) return
-      if (result.status.phase === "new-started") {
-        notify("上次自动重启已成功完成。", "success")
-      } else if (result.status.phase === "failed" || result.status.phase === "unknown" || result.status.phase === "accepted") {
-        notify("上次自动重启未确认成功。如当前实例状态异常，请手动完全退出 OpenCode（并结束残留的 serve --service 后台服务）后重新打开。", "warning")
-      }
-    } catch {
-      // service predates restartStatus: nothing to report
-    }
-  }
-
   const install = async (name: string, version = "") => {
     await track(`install:${name}`, async () => {
       try {
@@ -1274,17 +1235,12 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
           return
         }
         if (result.selfUpdated) {
-          // The config now points at the new bundle, but the window and the background
-          // service still run the old one. Ask before restarting. Even when the user
-          // declines, fall through to the state sync below: no early return, so the
-          // toolbar entry, cards, update map and runtime badges stay consistent.
-          await runSelfUpdateRestart({
-            confirm: (options) => props.ctx.dialogs.confirm(options),
-            restart: performRestart,
-            notify: (note: HubNote) => notify(note.text, note.tone),
-          })
+          // The config now names the new version, but this window (and the background
+          // service) still run the previous bundle. Say exactly that and leave loading to
+          // OpenCode's own mechanism — the hub never restarts the host.
+          notify(`${result.message}。插件中心的新版本已写入配置，当前窗口仍运行旧构建，OpenCode 重新加载后生效。`, "warning")
         } else {
-          notify(`${result.message}。配置需重启后生效：点「彻底重启 OpenCode」完成加载`, "success")
+          notify(`${result.message}。配置已写入，OpenCode 加载后生效。`, "success")
         }
         const latest = version || hits().find((hit) => hit.name === name)?.version || ""
         setCatalog((prev) => prev.map((entry) => (entry.pkg === name ? { ...entry, installed: true } : entry)))
@@ -1294,7 +1250,7 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
           ),
         )
         // 配置变了：之前的运行事实已过期，重新读取；新 spec 在服务端列表里
-        // 出现之前，卡片会如实显示“待重启生效”。
+        // 出现之前，卡片会如实显示“待加载”。
         await checkUpdates(true)
         void loadRuntime()
       } catch (error) {
@@ -1319,7 +1275,7 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
           notify(result.message, "error")
           return
         }
-        notify(`${result.message}。配置需重启后生效：点「彻底重启 OpenCode」完成移除`, "success")
+        notify(`${result.message}。配置已写入，OpenCode 加载后生效。`, "success")
         setCatalog((prev) =>
           prev.map((item) => (item.pkg === entry.name ? { ...item, installed: false } : item)),
         )
@@ -1350,14 +1306,6 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
         notify(readableError(error), "error")
       }
     })
-  }
-
-  /** Quits the app, clears a stale service and opens the app again. The session is restored by OpenCode. */
-  const restartApp = async () => {
-    const ok = await props.ctx.dialogs.confirm(RESTART_CONFIRM)
-    if (!ok) return
-    const note = restartNote(await performRestart())
-    notify(note.text, note.tone)
   }
 
   const openUrl = async (url: string) => {
@@ -1440,8 +1388,10 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
   // 未能检查的条目数：失败不能被总结成“全部已是最新”。
   const uncheckedCount = createMemo(() => [...updates().values()].filter((item) => item.error).length)
 
-  /** 运行事实：服务端已加载 / 加载失败 / 待重启 / 未验证。 */
-  const runtimeState = (entry: PluginEntry): "loaded" | "failed" | "pending" | "unknown" => {
+  /** 运行事实：服务端已加载 / 加载失败 / 待加载 / 未验证 / 禁用规则（非插件包）。 */
+  const runtimeState = (entry: PluginEntry): "loaded" | "failed" | "pending" | "unknown" | "control" => {
+    // `-id` / `*` 是配置里的启用规则，不参与“是否已加载”的判断。
+    if (entry.kind === "control") return "control"
     const info = runtime().get(entry.spec)
     if (!info) return runtimeError() ? "unknown" : "pending"
     if (info.status === "failed") return "failed"
@@ -1465,9 +1415,10 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
     pending: pendingRuntimeCount(),
     unknown: unknownCount(),
   }))
-  /** 问题项排前面：加载失败 → 待重启 → 可更新 → 未验证 → 正常，同级保持配置顺序。 */
+  /** 问题项排前面：加载失败 → 待加载 → 可更新 → 未验证 → 正常 → 禁用规则，同级保持配置顺序。 */
   const severity = (entry: PluginEntry): number => {
     const status = runtimeState(entry)
+    if (status === "control") return 5
     if (status === "failed") return 0
     if (status === "pending") return 1
     if (updates().get(entry.spec)?.hasUpdate) return 2
@@ -1517,7 +1468,6 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
     void loadCatalog(false)
     void checkUpdates(true)
     void loadRuntime()
-    void reportLastRestart()
   })
 
   const tabButton = (id: Tab, label: string, icon: IconName, count?: number | string, alert?: number) => (
@@ -1790,6 +1740,7 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
     const info = () => bySpec(entry.spec)
     const stale = () => info()?.hasUpdate === true
     const busy = () => isBusy(`install:${entry.name}`)
+    const control = () => entry.kind === "control"
     const current = () => info()?.current || entry.version
     const unchecked = () => entry.kind !== "path" && (info()?.error ?? "") !== ""
     /**
@@ -1806,9 +1757,11 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
         ? "运行中"
         : runtimeStatus() === "failed"
           ? "加载失败"
-          : runtimeStatus() === "pending"
-            ? "待重启"
-            : "未验证"
+          : runtimeStatus() === "control"
+            ? "禁用规则"
+            : runtimeStatus() === "pending"
+              ? "待加载"
+              : "未验证"
     const runtimeHint = () => {
       const status = runtimeStatus()
       if (status === "loaded") {
@@ -1816,7 +1769,8 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
         return loaded ? `已加载 v${loaded}` : "宿主已报告加载成功"
       }
       if (status === "failed") return runtimeInfo()?.error || "宿主报告加载失败"
-      if (status === "pending") return "配置已写入，重启 OpenCode 后才会加载"
+      if (status === "control") return "配置里的禁用/通配规则，不是已安装的插件包"
+      if (status === "pending") return "配置已写入，宿主尚未加载（OpenCode 启动或重载时读取）"
       return "没有取得宿主的加载证据，不当作已生效"
     }
     return (
@@ -1833,7 +1787,9 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
                 </span>
               </div>
               <div class="ph-installed-meta" title={entry.spec}>
-                <span>{current() ? `v${current()}` : "版本未知"}</span>
+                <Show when={!control()} fallback={<span>禁用/通配规则</span>}>
+                  <span>{current() ? `v${current()}` : "版本未知"}</span>
+                </Show>
                 <Show when={stale()}>
                   <span class="ph-version-arrow">→ v{info()!.latest}</span>
                 </Show>
@@ -1883,7 +1839,7 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
           </div>
         </div>
         <div class="ph-actions">
-          <Show when={entry.kind !== "path" && NPM_LIKE.test(entry.name)}>
+          <Show when={!control() && entry.kind !== "path" && NPM_LIKE.test(entry.name)}>
             <ui.Button
               variant="ghost"
               size="small"
@@ -1981,7 +1937,7 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
           </div>
         </Show>
 
-        {/* 待生效变更常驻在工具栏上方，直到重启完成；不能只在安装后提示一次。 */}
+        {/* 待生效变更常驻在工具栏上方，直到宿主加载为止；不能只在安装后提示一次。 */}
         <Show when={runtimeError()}>
           <div class="ph-notice" data-tone="warning">
             <ui.Icon name="circle-exclamation" size="small" />
@@ -1994,10 +1950,9 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
         <Show when={hasPendingChanges()}>
           <div class="ph-notice" data-tone="info">
             <ui.Icon name="outline-rotate-clockwise" size="small" />
-            <span>有 {pendingChangesCount()} 项配置变更待重启生效。插件在应用启动时加载，重启后才能运行新配置。</span>
-            <ui.Button size="small" variant="ghost" icon="outline-rotate-clockwise" onClick={() => void restartApp()}>
-              彻底重启 OpenCode
-            </ui.Button>
+            <span>
+              有 {pendingChangesCount()} 项配置变更尚未被宿主加载。插件在 OpenCode 启动/重载时读取，插件中心只写配置、不接管宿主进程。
+            </span>
           </div>
         </Show>
 
@@ -2061,12 +2016,6 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
                 { label: "打开配置文件", icon: "open-file", onSelect: () => void openConfig() },
                 { label: "重载配置", icon: "refresh", onSelect: () => void reload() },
               ],
-            },
-            { type: "separator" },
-            {
-              label: "彻底重启 OpenCode…",
-              icon: "outline-rotate-clockwise",
-              onSelect: () => void restartApp(),
             },
           ]}
         />
@@ -2268,7 +2217,7 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
                 {installedFilterButton("all", "全部")}
                 {installedFilterButton("update", "可更新")}
                 {installedFilterButton("failed", "加载失败")}
-                {installedFilterButton("pending", "待重启")}
+                {installedFilterButton("pending", "待加载")}
                 {installedFilterButton("unknown", "未验证")}
               </div>
               <span class="ph-spacer" />
@@ -2333,7 +2282,7 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
 
       <footer class="ph-footer">
         <div class="ph-footer-note">
-          安装和移除只改配置，不会立即生效：插件与模型目录都是启动时快照的。改完点右上角「更多操作 → 彻底重启 OpenCode」，应用会自动退出并重新打开。
+          安装、更新和移除只改全局配置，不会立即生效：插件列表由 OpenCode 在启动或重载时读取。插件中心不重启宿主；需要立刻生效时，用 OpenCode 自己的重载/服务重启入口。
         </div>
       </footer>
     </div>

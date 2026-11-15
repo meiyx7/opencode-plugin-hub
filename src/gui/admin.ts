@@ -1,13 +1,9 @@
-import { execFileSync, spawn } from "node:child_process"
-import { existsSync, readlinkSync } from "node:fs"
+import { spawn } from "node:child_process"
 import { homedir, tmpdir } from "node:os"
-import { basename, dirname, isAbsolute, join, resolve } from "node:path"
+import { basename, isAbsolute, join, resolve } from "node:path"
 import { copyFile, cp, mkdir, mkdtemp, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises"
 import { applyEdits, modify, parse, type ParseError } from "jsonc-parser"
 import { downloadsFor, registryFetch, type Downloads } from "./registry"
-import { collectRestartSnapshot, parseProcLine, whitelistEnv, type CollectResult } from "./restart-collect"
-import { instanceStatusPath, launchRestartSupervisor, readRestartStatusFile, type SpawnChild } from "./restart-launch"
-import { SUPERVISOR_SOURCE } from "./restart-supervisor"
 
 export interface InstalledEntryValue {
   spec: string
@@ -123,8 +119,9 @@ export interface MutationValue {
   message: string
   state: HubStateValue
   /**
-   * When installing or updating replaced this plugin itself, the window must offer a
-   * confirmed restart (the running bundle is still the previous version). See contract.ts.
+   * When installing or updating replaced this plugin itself, the config now names the new
+   * version while this window still renders the previous bundle. The UI says so and leaves
+   * loading to OpenCode's own mechanism; the hub never restarts the host. See contract.ts.
    */
   selfUpdated?: boolean
 }
@@ -184,6 +181,17 @@ function isPackageName(name: string): boolean {
   if (name.includes("..")) return false
   const base = name.split("/").pop() ?? name
   return base.length > 0 && !base.startsWith(".")
+}
+
+/**
+ * A config control entry instead of a plugin: `-id` disables a plugin, `*` / `.*` are
+ * wildcards (see OpenCode's plugin config docs). These are user rules, not installable
+ * packages, so they are shown as rules and are never resolved, updated or sent to the
+ * registry.
+ */
+export function isControlSpec(spec: string): boolean {
+  const trimmed = spec.trim()
+  return trimmed.startsWith("-") || trimmed.includes("*")
 }
 
 export function splitSpec(spec: string): { name: string; range: string; kind: string } {
@@ -367,6 +375,21 @@ interface ResolvedEntry {
 
 /** Normalizes one config entry, looking inside directory plugins for their real identity. */
 async function resolveEntry(spec: string): Promise<ResolvedEntry> {
+  // Control entries carry no installable identity: `-acme.reviewer` is a disable rule for
+  // the plugin ID `acme.reviewer`, and `*` / `.*` are wildcards. Reporting them as
+  // installed packages (with a `-` prefix) would misstate what is actually loading.
+  if (isControlSpec(spec)) {
+    return {
+      spec,
+      name: spec.trim().replace(/^-/, ""),
+      kind: "control",
+      version: "",
+      description: "",
+      license: "",
+      homepage: "",
+      repo: "",
+    }
+  }
   const parsed = splitSpec(spec)
   if (parsed.kind !== "path") {
     // Read the installed manifest first: it carries the summary that the installed cards show,
@@ -438,6 +461,24 @@ export async function updates(): Promise<UpdatesResultValue> {
     const resolved = await resolveAll(file)
     const items = await Promise.all(
       resolved.map(async (entry): Promise<UpdateInfoValue> => {
+        // A control entry (`-id`, `*`) is a rule, not a package: no registry question to ask.
+        if (entry.kind === "control") {
+          return {
+            spec: entry.spec,
+            name: entry.name,
+            kind: entry.kind,
+            current: "",
+            latest: "",
+            hasUpdate: false,
+            managed: false,
+            description: "",
+            license: "",
+            homepage: "",
+            repo: "",
+            publisher: "",
+            error: "",
+          }
+        }
         const lookupable = isPackageName(entry.name)
         const lookup: VersionLookup = lookupable ? await npmLatest(entry.name) : emptyLookup(false)
         return {
@@ -664,9 +705,9 @@ export async function install(spec: string, version: string): Promise<MutationVa
       ok: true,
       message: index >= 0 ? `已更新 ${wanted}` : `已添加 ${wanted}`,
       // Updating this very package the window is running only rewrites the config: the
-      // running bundle (and the background service) still hold the old version until the
-      // app restarts. Flag it so the UI can ask for an immediate restart, never leaving a
-      // half-updated hub with a vanishing entry point.
+      // running bundle (and the background service) still hold the old version until
+      // OpenCode reloads it. Flag it so the UI can say the running build is stale instead
+      // of implying the new version is already loaded.
       selfUpdated: name === SELF_PACKAGE || undefined,
       state,
     }
@@ -1124,240 +1165,17 @@ export async function openConfig(): Promise<boolean> {
 }
 
 /**
- * Fully restarts the CURRENT desktop app instance only: quit it, make sure its
- * own `serve --service` sidecar is gone, then relaunch the ORIGINAL executable
- * with the ORIGINAL argv, cwd and a whitelisted environment.
- *
- * Safety model:
- *  - the target is identified from this process itself (`process.*` in the
- *    Electron main process), never by scanning the machine or by fuzzy
- *    command-line matching;
- *  - the plan comes from the pure planner (`restart.ts`); a refusal means no
- *    signal of any kind is sent;
- *  - the actual execution is delegated to a detached supervisor
- *    (`restart-supervisor.ts`) that outlives this process and re-checks the
- *    instance credential (PID + start time) before EVERY signal, including
- *    KILL, so a recycled PID is refused on any credential mismatch (the
- *    second-resolution start time narrows, but does not eliminate, the
- *    PID-reuse window — see the credential note in restart-collect.ts);
- *  - "accepted" only means the supervisor spawn has taken — the real outcome is
- *    recorded in the status file and read back via `restartStatus()`.
+ * Asks the CLI to reload its configuration. This reloads config only: changes to provider
+ * snapshots still take effect when OpenCode itself restarts, which is the host's call, not
+ * the hub's.
  */
-export interface RestartOutcomeValue {
-  ok: boolean
-  phase: "accepted" | "refused" | "failed"
-  message: string
-  requestId?: string
-  statusPath?: string
-}
-
-export interface RestartStatusValue {
-  requestId: string
-  phase: string
-  at: number
-  detail: string
-}
-
-/**
- * The user-data-dir of the CURRENT Electron instance — the stable per-instance
- * identity (TASK-3). Null outside the Electron main process (tests, CLI-only);
- * callers must fail closed instead of falling back to a shared location that
- * side-by-side instances would read or overwrite.
- */
-function electronUserDataPath(): string | null {
-  try {
-    // Resolved at runtime inside the Electron main process; the bundler never
-    // sees it, and outside Electron (tests, servers) this returns null.
-    const dynamicRequire = eval("require") as (id: string) => unknown
-    const electron = dynamicRequire("electron") as { app?: { getPath?: (name: string) => string } } | undefined
-    const userData = electron?.app?.getPath?.("userData")
-    return typeof userData === "string" && userData.length > 0 ? userData : null
-  } catch {
-    return null
-  }
-}
-
-function electronLockPath(): string | null {
-  const userData = electronUserDataPath()
-  return userData ? join(userData, "SingletonLock") : null
-}
-
-/** Locates a Node runtime able to host the detached supervisor script. */
-function findNodeRuntime(): string | null {
-  const candidates: string[] = []
-  for (const dir of (process.env.PATH ?? "").split(":")) {
-    if (dir) candidates.push(join(dir, "node"))
-  }
-  candidates.push("/usr/local/bin/node", "/opt/homebrew/bin/node", "/usr/bin/node", "/opt/local/bin/node")
-  for (const candidate of candidates) {
-    try {
-      if (existsSync(candidate)) return candidate
-    } catch {
-      // ignore unreadable entries
-    }
-  }
-  return null
-}
-
-/** The supervisor and the relaunch run on this minimal environment. */
-function supervisorEnv(): Record<string, string> {
-  return whitelistEnv(process.env as Record<string, string | undefined>)
-}
-
-let lastAcceptedAt = 0
-
-export async function restart(development = false): Promise<RestartOutcomeValue> {
-  const requestId = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
-  if (development) {
-    return {
-      ok: false,
-      phase: "refused",
-      requestId,
-      message: "开发模式下不执行自动重启，请手动完全退出 OpenCode 后重新打开。",
-    }
-  }
-  // Per-instance status file (TASK-3): keyed by THIS instance's user-data-dir.
-  // Null means no stable instance identity — fail closed, never fall back to a
-  // shared file another instance could read or overwrite.
-  const statusPath = instanceStatusPath(electronUserDataPath())
-  // Duplicate guard: one supervisor per instance at a time; a very recent
-  // accepted record means another restart is already in flight.
-  if (Date.now() - lastAcceptedAt < 60_000) {
-    return {
-      ok: false,
-      phase: "refused",
-      message: "已有一次重启请求在执行中，请稍候或查看其结果后再试。",
-      requestId,
-      statusPath: statusPath ?? undefined,
-    }
-  }
-  if (!statusPath) {
-    return {
-      ok: false,
-      phase: "refused",
-      message:
-        "无法确定当前实例的用户数据目录，无法为本次重启写入实例隔离的状态文件，已取消自动重启且未结束任何进程。",
-      requestId,
-    }
-  }
-  let collected: CollectResult
-  try {
-    collected = collectRestartSnapshot({
-      platform: process.platform,
-      procInfo: (pid) => {
-        try {
-          const out = execFileSync(
-            "ps",
-            ["-p", String(pid), "-o", "pid=,ppid=,uid=,lstart=,etime=,comm="],
-            { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: 5_000 },
-          )
-          return parseProcLine(out)
-        } catch {
-          return null
-        }
-      },
-      childPids: (pid) => {
-        try {
-          const out = execFileSync("pgrep", ["-P", String(pid)], {
-            encoding: "utf8",
-            stdio: ["ignore", "pipe", "ignore"],
-            timeout: 5_000,
-          })
-          return out
-            .split("\n")
-            .map((line) => parseInt(line.trim(), 10))
-            .filter((value) => Number.isInteger(value) && value > 0)
-        } catch {
-          return null
-        }
-      },
-      self: {
-        pid: process.pid,
-        ppid: process.ppid,
-        // getuid is unavailable in some typings/environments; -1 fails the
-        // planner's UID validation and refuses the restart (fail-closed).
-        uid: typeof process.getuid === "function" ? process.getuid() : -1,
-        execPath: process.execPath,
-        argv: process.argv,
-        cwd: process.cwd(),
-      },
-      env: process.env as Record<string, string | undefined>,
-      lockPath: electronLockPath(),
-      readLink: (path) => {
-        try {
-          return readlinkSync(path)
-        } catch {
-          return null
-        }
-      },
-      runtimePath: findNodeRuntime(),
-      statusPath,
-      requestId,
-      development,
-    })
-  } catch (error) {
-    return { ok: false, phase: "failed", message: `重启准备失败：${describe(error)}` }
-  }
-  if (!collected.payload) {
-    return { ok: false, phase: "refused", message: `已取消自动重启，未结束任何进程。原因：${collected.message}` }
-  }
-  if (!collected.runtimePath) {
-    return {
-      ok: false,
-      phase: "refused",
-      message:
-        "未找到可用的 Node 运行时来承载重启监督流程，已取消自动重启且未结束任何进程。请手动完全退出 OpenCode（并结束残留的 serve --service 后台服务）后重新打开。",
-    }
-  }
-  // The launcher owns the status-file timing (TASK-1: synchronous directory
-  // creation before the first write) and the spawn semantics (TASK-2: wait for
-  // the spawn event or the async error event; never equate a returned pid with
-  // a started supervisor).
-  const launched = await launchRestartSupervisor({
-    runtimePath: collected.runtimePath,
-    source: SUPERVISOR_SOURCE,
-    payload: collected.payload,
-    statusPath,
-    requestId,
-    env: supervisorEnv(),
-    spawnChild: (exe, args, opts) => spawn(exe, args, opts),
-  })
-  if (launched.phase === "accepted") lastAcceptedAt = Date.now()
-  return {
-    ok: launched.ok,
-    phase: launched.phase,
-    message: launched.message,
-    requestId,
-    statusPath,
-  }
-}
-
-/**
- * Reads the restart status the supervisor recorded (best effort).
- *
- * Reads ONLY this instance's own status file: the path comes from the exact
- * same identity rule as `restart()` (`instanceStatusPath` over this
- * instance's user-data-dir), so a record left by a side-by-side instance can
- * never be reported here. The pre-isolation shared `restart-status.json` is
- * deliberately never read again — its record could belong to any instance,
- * which is precisely the bug this isolation removes. Consequence: a restart
- * triggered by an older build leaves no report on the next page load.
- */
-export async function restartStatus(): Promise<{ found: boolean; status?: RestartStatusValue }> {
-  const statusPath = instanceStatusPath(electronUserDataPath())
-  if (!statusPath) return { found: false }
-  const status = await readRestartStatusFile(statusPath)
-  return status ? { found: true, status } : { found: false }
-}
-
-/** Asks the CLI to reload its configuration. A full restart is still needed for provider snapshots. */
 export async function reload(argv: readonly string[]): Promise<MutationValue> {
   const state = await snapshot()
   try {
     if (argv.length === 0) return { ok: false, message: "找不到 opencode CLI", state }
     const child = spawn(argv[0]!, [...argv.slice(1), "reload"], { detached: true, stdio: "ignore" })
     child.unref()
-    return { ok: true, message: "已请求重载配置；插件列表变化建议完全退出应用再打开", state }
+    return { ok: true, message: "已请求重载配置；插件列表变化由 OpenCode 自行加载，必要时请重启服务", state }
   } catch (error) {
     return { ok: false, message: describe(error), state }
   }

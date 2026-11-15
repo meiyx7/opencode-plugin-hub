@@ -169,43 +169,14 @@ export const Opened = Schema.Struct({
   ok: Schema.Boolean,
 })
 
-/**
- * Outcome of one restart request. `ok`/`phase: "accepted"` only means the
- * detached supervisor took over — the real outcome (new instance started,
- * failed, unknown) is recorded in the status file the supervisor writes, and
- * read back through `restartStatus`. Extra fields are optional so a window and
- * a service built from different revisions still decode each other.
- */
-export const RestartResult = Schema.Struct({
-  ok: Schema.Boolean,
-  phase: Schema.String,
-  message: Schema.String,
-  requestId: Schema.optional(Schema.String),
-  statusPath: Schema.optional(Schema.String),
-})
-
-/** One status record the detached supervisor wrote for the last restart. */
-export const RestartStatus = Schema.Struct({
-  requestId: Schema.String,
-  phase: Schema.String,
-  at: Schema.Number,
-  detail: Schema.String,
-})
-
-export const RestartStatusResult = Schema.Struct({
-  found: Schema.Boolean,
-  status: Schema.optional(RestartStatus),
-})
-
 export const Mutation = Schema.Struct({
   ok: Schema.Boolean,
   message: Schema.String,
   state: HubState,
   /**
-   * True when the mutation replaced this plugin itself (a self-update). The window keeps
-   * rendering the old bundle, so the UI must offer an immediate (confirmed) restart instead
-   * of only hinting that a restart is needed later — a full restart swaps the running bundle
-   * and the background `serve --service` to the freshly installed version.
+   * True when the mutation replaced this plugin itself (a self-update). This window still
+   * renders the previous bundle, so the UI must say the running build is stale and leave
+   * loading to OpenCode's own mechanism — the hub never restarts the host.
    * Optional so a window and a service built from different revisions still decode each other.
    */
   selfUpdated: Schema.optional(Schema.Boolean),
@@ -257,8 +228,6 @@ export const Admin = Ipc.define({
     install: { input: Target, output: Mutation },
     remove: { input: Target, output: Mutation },
     reload: { output: Mutation },
-    restart: { output: RestartResult },
-    restartStatus: { output: RestartStatusResult },
     runtime: { output: RuntimeResult },
   },
 })
