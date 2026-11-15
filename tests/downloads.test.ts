@@ -9,7 +9,7 @@ import test, { after, afterEach, beforeEach } from "node:test"
 import assert from "node:assert/strict"
 import { readFileSync } from "node:fs"
 import { join } from "node:path"
-import { NPM_DOWNLOADS_API, downloadsFor } from "../src/gui/registry.ts"
+import { NPM_DOWNLOADS_API, downloadsFor, peekCachedCount } from "../src/gui/registry.ts"
 import * as admin from "../src/gui/admin.ts"
 import { countTitle, countWithUnit, formatCount } from "../src/gui/download-format.ts"
 
@@ -389,4 +389,154 @@ test("暂不可用的渲染契约", () => {
   assert.equal(formatCount(0), "0")
   assert.equal(countWithUnit(0, "月"), "0/月")
   assert.match(countTitle(1511, "周下载") ?? "", /周下载 1,?511 次/)
+})
+
+// ---------------------------------------------------------------------------
+// 第二轮：详情缓存（10min）不再决定下载量；统计值统一来自 downloadsFor（5min）
+// ---------------------------------------------------------------------------
+
+test("详情先行：统计缓存过期后，详情必须跟随列表的新值，元数据缓存仍保留", async () => {
+  const name = "fixture-detail-then-list"
+  const values = { week: 101, month: 202 }
+  route = adminRoute(name, {
+    point: (url) => pointOk(url, url.includes("last-week") ? values.week : values.month),
+  })
+  const packumentUrl = `https://registry.npmjs.org/${name}`
+
+  const first = await admin.detail(name)
+  assert.equal(first.error, "")
+  assert.deepEqual([first.weekly, first.monthly], [101, 202])
+  const packumentHits = calls.filter((url) => url === packumentUrl).length
+  assert.equal(packumentHits, 1)
+
+  // 5 分钟：统计缓存刚好过期，10 分钟的元数据/README 缓存仍然有效。
+  clock += 5 * 60 * 1000
+  values.week = 303
+  values.month = 404
+  const hit = (await admin.search("fixture")).hits[0]!
+  assert.deepEqual([hit.weekly, hit.monthly], [303, 404])
+
+  const second = await admin.detail(name)
+  assert.deepEqual([second.weekly, second.monthly], [303, 404])
+  assert.equal(second.weekly, hit.weekly)
+  assert.equal(second.monthly, hit.monthly)
+  assert.equal(second.readme, first.readme)
+  assert.equal(calls.filter((url) => url === packumentUrl).length, packumentHits, "元数据缓存未被取消")
+})
+
+test("反向顺序：列表先行时详情同样跟随刷新后的统计值", async () => {
+  const name = "fixture-list-then-detail"
+  const values = { week: 505, month: 606 }
+  route = adminRoute(name, {
+    point: (url) => pointOk(url, url.includes("last-week") ? values.week : values.month),
+  })
+
+  const hit1 = (await admin.search("fixture")).hits[0]!
+  const detail1 = await admin.detail(name)
+  assert.deepEqual([detail1.weekly, detail1.monthly], [hit1.weekly, hit1.monthly])
+  assert.deepEqual([hit1.weekly, hit1.monthly], [505, 606])
+
+  clock += 5 * 60 * 1000
+  values.week = 707
+  values.month = 808
+  const hit2 = (await admin.search("fixture")).hits[0]!
+  const detail2 = await admin.detail(name)
+  assert.deepEqual([hit2.weekly, hit2.monthly], [707, 808])
+  assert.deepEqual([detail2.weekly, detail2.monthly], [707, 808])
+  assert.equal(detail2.weekly, hit2.weekly)
+  assert.equal(detail2.monthly, hit2.monthly)
+})
+
+test("详情缓存结构不含下载量，统计值在返回前统一注入", () => {
+  const source = readFileSync(join(process.cwd(), "src/gui/admin.ts"), "utf8")
+  assert.match(source, /"weekly" \| "monthly"/)
+  assert.match(source, /Promise\.all\(\[loadRemoteDetail\(name\), downloadsFor\(name\)\]\)/)
+  assert.match(source, /const DETAIL_TTL = 10 \* 60 \* 1000/)
+})
+
+// ---------------------------------------------------------------------------
+// 第二轮：成功值与失败重试分开，失败不覆盖旧值、过期值不冒充最新
+// ---------------------------------------------------------------------------
+
+test("过期后刷新失败：旧值保留、重试冷却生效、恢复后取到新值", async () => {
+  const name = "fixture-failure-preserves-good"
+  let healthy = true
+  let weekValue = 100
+  route = (url) => {
+    if (!isPoint(url)) return new Response("", { status: 404 })
+    if (!healthy) return new Response("", { status: 503 })
+    return pointOk(url, url.includes("last-week") ? weekValue : 900)
+  }
+
+  assert.deepEqual(await downloadsFor(name), { weekly: 100, monthly: 900 })
+  const firstAt = peekCachedCount("weekly", name).at
+  assert.equal(peekCachedCount("weekly", name).value, 100)
+
+  clock += 5 * 60 * 1000
+  healthy = false
+  weekValue = 777
+  assert.deepEqual(await downloadsFor(name), {}, "过期旧值不得伪装成最新数据")
+  assert.equal(peekCachedCount("weekly", name).value, 100, "旧有效值未被删除或覆盖")
+  assert.equal(peekCachedCount("weekly", name).at, firstAt, "旧值时间戳未被改写")
+  assert.ok(peekCachedCount("weekly", name).failedAt !== undefined, "失败重试状态已记录")
+
+  const callsAfterFailure = pointCalls().length
+  healthy = true
+  clock += 60 * 1000 - 1
+  assert.deepEqual(await downloadsFor(name), {}, "冷却期内不重试，也不返回过期值")
+  assert.equal(pointCalls().length, callsAfterFailure)
+  assert.equal(peekCachedCount("weekly", name).value, 100)
+
+  clock += 1
+  assert.deepEqual(await downloadsFor(name), { weekly: 777, monthly: 900 })
+  assert.equal(peekCachedCount("weekly", name).value, 777)
+  assert.equal(peekCachedCount("weekly", name).failedAt, undefined, "成功后清除重试状态")
+})
+
+test("周/月各自保留失败前的有效值；并发请求合并与缓存过期边界", async () => {
+  const name = "fixture-split-failure"
+  let weekHealthy = true
+  let weekValue = 11
+  let monthValue = 22
+  route = (url) => {
+    if (!isPoint(url)) return new Response("", { status: 404 })
+    if (url.includes("last-week")) {
+      return weekHealthy ? pointOk(url, weekValue) : new Response("", { status: 503 })
+    }
+    return pointOk(url, monthValue)
+  }
+
+  assert.deepEqual(await downloadsFor(name), { weekly: 11, monthly: 22 })
+  const weekAt = peekCachedCount("weekly", name).at
+  const initialCalls = pointCalls().length
+
+  // 边界：差 1ms 仍命中成功缓存。
+  clock += 5 * 60 * 1000 - 1
+  await downloadsFor(name)
+  assert.equal(pointCalls().length, initialCalls)
+
+  // 刚好过期：周失败、月成功；两次并发查询合并成一组请求。
+  clock += 1
+  weekHealthy = false
+  weekValue = 77
+  monthValue = 88
+  const [a, b] = await Promise.all([downloadsFor(name), downloadsFor(name)])
+  assert.deepEqual(a, b)
+  assert.deepEqual(a, { monthly: 88 })
+  assert.equal(peekCachedCount("weekly", name).value, 11)
+  assert.equal(peekCachedCount("weekly", name).at, weekAt)
+  assert.equal(peekCachedCount("monthly", name).value, 88)
+  assert.ok(peekCachedCount("weekly", name).failedAt !== undefined)
+  assert.equal(peekCachedCount("monthly", name).failedAt, undefined, "月成功不受周失败影响")
+  assert.equal(pointCalls().length, initialCalls + 2, "并发只发起一组请求")
+
+  // 冷却结束后并发查询：只补周请求，月仍在自己的 5 分钟有效期内。
+  weekHealthy = true
+  clock += 60 * 1000
+  const [c, d] = await Promise.all([downloadsFor(name), downloadsFor(name)])
+  assert.deepEqual(c, { weekly: 77, monthly: 88 })
+  assert.deepEqual(d, c)
+  assert.equal(peekCachedCount("weekly", name).value, 77)
+  assert.equal(peekCachedCount("weekly", name).failedAt, undefined)
+  assert.equal(pointCalls().length, initialCalls + 3)
 })

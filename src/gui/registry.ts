@@ -176,7 +176,7 @@ export interface Downloads {
 }
 
 type Period = "last-week" | "last-month"
-type Metric = "weekly" | "monthly"
+export type Metric = "weekly" | "monthly"
 
 const POINTS: readonly { metric: Metric; period: Period }[] = [
   { metric: "weekly", period: "last-week" },
@@ -185,20 +185,34 @@ const POINTS: readonly { metric: Metric; period: Period }[] = [
 
 interface CachedCount {
   at: number
-  /** `undefined` is a remembered failure, cached for the shorter failure TTL. */
-  value: number | undefined
+  value: number
 }
 
 /**
- * One entry per metric, not one per package: a successful week and a failed month must keep
- * their own expiry, so a single flaky response never poisons the other number.
+ * Success values and failure retries are two different pieces of state, kept in two maps.
+ * A failed refresh must never overwrite the last good value: doing so would erase data that is
+ * still useful (and would make a later recovery look like a brand-new package). A failure only
+ * opens a short cooldown during which the same request is not repeated. While that cooldown is
+ * active, an expired value is NOT served — an old number must not be presented as a fresh one.
+ * Both maps are keyed per metric, so week and month stay independent.
  */
-const downloadsCache = new Map<string, CachedCount>()
+const successCache = new Map<string, CachedCount>()
+const failureCache = new Map<string, { at: number }>()
 /** Coalesce concurrent lookups: the list and the detail dialog often ask for the same package. */
 const inFlight = new Map<string, Promise<number | undefined>>()
 
 function cacheKey(metric: Metric, name: string): string {
   return `${metric}\u0000${name}`
+}
+
+/** Read-only diagnostic view, used by the tests to prove a failure preserved the last good value. */
+export function peekCachedCount(
+  metric: Metric,
+  name: string,
+): { value?: number; at?: number; failedAt?: number } {
+  const key = cacheKey(metric, name)
+  const good = successCache.get(key)
+  return { value: good?.value, at: good?.at, failedAt: failureCache.get(key)?.at }
 }
 
 /**
@@ -236,16 +250,28 @@ async function fetchPoint(name: string, period: Period): Promise<number | undefi
 
 async function cachedPoint(name: string, metric: Metric, period: Period): Promise<number | undefined> {
   const key = cacheKey(metric, name)
-  const cached = downloadsCache.get(key)
-  if (cached) {
-    const ttl = cached.value === undefined ? DOWNLOADS_FAILURE_TTL : DOWNLOADS_TTL
-    if (Date.now() - cached.at < ttl) return cached.value
-  }
+  const now = Date.now()
+  const good = successCache.get(key)
+  const failed = failureCache.get(key)
+
+  // A still-valid good value wins, even if a concurrent refresh happened to fail.
+  if (good && now - good.at < DOWNLOADS_TTL) return good.value
+  // In the retry cooldown: do not re-request, and do not serve the now-expired value.
+  if (failed && now - failed.at < DOWNLOADS_FAILURE_TTL) return undefined
+
+  // Concurrent callers share the same request, whichever of them got here first.
   const pending = inFlight.get(key)
   if (pending) return pending
   const request = fetchPoint(name, period)
     .then((value) => {
-      downloadsCache.set(key, { at: Date.now(), value })
+      if (value === undefined) {
+        // Keep successCache untouched: the previous good value stays in place (though expired,
+        // so it will never be displayed as current). Only the retry window is refreshed.
+        failureCache.set(key, { at: Date.now() })
+      } else {
+        successCache.set(key, { at: Date.now(), value })
+        failureCache.delete(key)
+      }
       return value
     })
     .finally(() => {

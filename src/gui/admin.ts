@@ -779,7 +779,15 @@ interface NpmPackument extends RegistryManifest {
   versions?: Record<string, RegistryManifest>
 }
 
-type RemoteDetail = Omit<PackageDetailValue, "npm" | "installed" | "current" | "hasUpdate" | "error">
+/**
+ * Metadata and README only. Download counts are deliberately excluded: this is cached for ten
+ * minutes while statistics are cached for five, so caching the counts here would let the detail
+ * dialog show a stale number long after the list moved on.
+ */
+type RemoteDetail = Omit<
+  PackageDetailValue,
+  "npm" | "installed" | "current" | "hasUpdate" | "error" | "weekly" | "monthly"
+>
 
 const DETAIL_TTL = 10 * 60 * 1000
 const README_LIMIT = 30_000
@@ -792,12 +800,6 @@ function trimReadme(raw: string): { text: string; truncated: boolean } {
   const cut = head.lastIndexOf("\n")
   const text = cut > README_LIMIT * 0.75 ? head.slice(0, cut) : head
   return { text: `${text}\n\n…`, truncated: true }
-}
-
-/** `-1` means the download API could not be asked: the UI must show 暂不可用, not 0. */
-async function loadDownloads(name: string, period: "last-week" | "last-month"): Promise<number> {
-  const counts = await downloadsFor(name)
-  return (period === "last-week" ? counts.weekly : counts.monthly) ?? -1
 }
 
 /**
@@ -860,10 +862,6 @@ async function buildRemoteDetail(name: string): Promise<RemoteDetail | { error: 
   const manifest = version ? versions[version] ?? {} : (doc as RegistryManifest)
   const repo = repository(manifest.repository ?? doc.repository)
   const readme = trimReadme(typeof doc.readme === "string" ? doc.readme : "")
-  const [weekly, monthly] = await Promise.all([
-    loadDownloads(name, "last-week"),
-    loadDownloads(name, "last-month"),
-  ])
   const maintainers = (doc.maintainers ?? [])
     .map((person) => person.name ?? person.username ?? "")
     .filter((value) => value !== "")
@@ -881,8 +879,6 @@ async function buildRemoteDetail(name: string): Promise<RemoteDetail | { error: 
     license: licenseText(manifest.license ?? doc.license),
     keywords: keywordList(manifest.keywords ?? doc.keywords),
     maintainers,
-    weekly,
-    monthly,
     published: doc.time?.[version] ?? "",
     created: doc.time?.created ?? "",
     versions: Object.keys(versions).length,
@@ -948,10 +944,16 @@ export async function detail(name: string): Promise<PackageDetailValue> {
     // The detail still loads when the config cannot be read; only the installed badge is missing.
   }
 
-  const remote = await loadRemoteDetail(name)
-  if ("error" in remote) return { ...base(), installed, current, error: remote.error }
+  // Counts are attached on every return, never read back from the ten-minute metadata cache.
+  // downloadsFor() is the same cache the search list uses, so both views always agree.
+  const [remote, counts] = await Promise.all([loadRemoteDetail(name), downloadsFor(name)])
+  const downloads = { weekly: counts.weekly ?? -1, monthly: counts.monthly ?? -1 }
+  if ("error" in remote) {
+    return { ...base(), ...downloads, installed, current, error: remote.error }
+  }
   return {
     ...remote,
+    ...downloads,
     npm: base().npm,
     installed,
     current,
