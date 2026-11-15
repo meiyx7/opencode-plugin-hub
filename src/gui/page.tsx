@@ -1233,6 +1233,15 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
           notify(result.message, "error")
           return
         }
+        // A self-update rewrites the config but the running bundle is still the previous
+        // version. Restarting is the only way to load the new one — and if we defer it the
+        // hub's entry point can vanish before the user gets a chance to trigger the restart,
+        // leaving no way back. So restart right here.
+        if (result.selfUpdated) {
+          notify("插件中心已更新，正在重启 OpenCode 以加载新版本…", "info")
+          await restartApp()
+          return
+        }
         notify(`${result.message}。配置需重启后生效：点「彻底重启 OpenCode」完成加载`, "success")
         const latest = version || hits().find((hit) => hit.name === name)?.version || ""
         setCatalog((prev) => prev.map((entry) => (entry.pkg === name ? { ...entry, installed: true } : entry)))

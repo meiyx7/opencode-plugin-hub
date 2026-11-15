@@ -118,6 +118,11 @@ export interface MutationValue {
   ok: boolean
   message: string
   state: HubStateValue
+  /**
+   * When installing or updating replaced this plugin itself, the window must restart the
+   * app immediately (the running bundle is still the previous version). See contract.ts.
+   */
+  selfUpdated?: boolean
 }
 
 const SELF_PACKAGE = "opencode-plugin-hub"
@@ -651,7 +656,16 @@ export async function install(spec: string, version: string): Promise<MutationVa
       index >= 0
         ? await applyEdit(file, [file.key, index], wanted)
         : await applyEdit(file, [file.key, file.plugins.length], wanted)
-    return { ok: true, message: index >= 0 ? `已更新 ${wanted}` : `已添加 ${wanted}`, state }
+    return {
+      ok: true,
+      message: index >= 0 ? `已更新 ${wanted}` : `已添加 ${wanted}`,
+      // Updating this very package the window is running only rewrites the config: the
+      // running bundle (and the background service) still hold the old version until the
+      // app restarts. Flag it so the UI restarts immediately, never leaving a half-updated
+      // hub with a vanishing entry point.
+      selfUpdated: name === SELF_PACKAGE || undefined,
+      state,
+    }
   } catch (error) {
     return { ok: false, message: describe(error), state: await snapshot() }
   }
