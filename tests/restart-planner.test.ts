@@ -5,6 +5,7 @@ import { join } from "node:path"
 import {
   DEFAULT_APP_EXE,
   DEFAULT_SIDECAR_SUFFIX,
+  SIGNAL_RECHECK_REQUIREMENTS,
   identityFromProcessLike,
   planRestart,
   singletonLockPidFromTarget,
@@ -245,4 +246,97 @@ test("默认预期值与可覆盖项：规划器不硬编码绑定单一安装�
     { expectedAppExe: "/Users/meiyx/Applications/OpenCode.app/Contents/MacOS/OpenCode" },
   )
   assert.equal(plan.allowed, true)
+})
+
+test("self UID 非法值全部拒绝：缺失、NaN、Infinity、负数、小数", () => {
+  assertRefusal(planRestart(snapshotOk({ self: selfOk({ uid: undefined }) })), "identity-incomplete", "uid")
+  assertRefusal(planRestart(snapshotOk({ self: selfOk({ uid: NaN }) })), "identity-incomplete", "uid")
+  assertRefusal(planRestart(snapshotOk({ self: selfOk({ uid: Infinity }) })), "identity-incomplete", "uid")
+  assertRefusal(planRestart(snapshotOk({ self: selfOk({ uid: -1 }) })), "identity-incomplete", "uid")
+  assertRefusal(planRestart(snapshotOk({ self: selfOk({ uid: 1.5 }) })), "identity-incomplete", "uid")
+})
+
+test("sidecar UID 缺失或非法：拒绝且不得退化猜测", () => {
+  assertRefusal(planRestart(snapshotOk({ sidecar: sidecarOk({ uid: undefined }) })), "sidecar-unconfirmed", "uid")
+  assertRefusal(planRestart(snapshotOk({ sidecar: sidecarOk({ uid: NaN }) })), "sidecar-unconfirmed")
+  assertRefusal(planRestart(snapshotOk({ sidecar: sidecarOk({ uid: -5 }) })), "sidecar-unconfirmed")
+  assertRefusal(planRestart(snapshotOk({ sidecar: sidecarOk({ uid: 2.25 }) })), "sidecar-unconfirmed")
+})
+
+test("self 与 sidecar UID 不一致：拒绝生成重启计划", () => {
+  const plan = planRestart(snapshotOk({ sidecar: sidecarOk({ uid: 502 }) }))
+  assertRefusal(plan, "uid-mismatch")
+})
+
+test("UID 一致（正常值）时正常规划并在证据中记录一致性", () => {
+  const plan = planRestart(snapshotOk({ self: selfOk({ uid: 0 }), sidecar: sidecarOk({ uid: 0 }) }))
+  assert.equal(plan.allowed, true)
+  if (!plan.allowed) return
+  assert.equal(plan.target.uid, 0)
+  assert.ok(plan.evidence.some((item) => item.what === "uid" && item.value.includes("一致")))
+})
+
+test("信号动作必须携带执行前复核要求，不等于无条件按 PID 操作", () => {
+  const plan = planRestart(snapshotOk())
+  assert.equal(plan.allowed, true)
+  if (!plan.allowed) return
+  const signalActions = plan.actions.filter((action) => action.type === "terminate" || action.type === "terminate-if-still-running")
+  assert.equal(signalActions.length, 2)
+  for (const action of signalActions) {
+    if (action.type !== "terminate" && action.type !== "terminate-if-still-running") return
+    assert.deepEqual(action.recheck.requirements, SIGNAL_RECHECK_REQUIREMENTS)
+    assert.ok(action.recheck.requirements.length >= 5)
+    // 五项复核要求逐条在案：存在性、exe 一致、UID 一致、非 PID 复用、无矛盾。
+    assert.ok(action.recheck.requirements.some((r) => r.includes("仍然存在")))
+    assert.ok(action.recheck.requirements.some((r) => r.includes("可执行文件")))
+    assert.ok(action.recheck.requirements.some((r) => r.includes("UID")))
+    assert.ok(action.recheck.requirements.some((r) => r.includes("PID 复用")))
+    assert.ok(action.recheck.requirements.some((r) => r.includes("矛盾")))
+  }
+  // 每个信号动作的复核身份必须与原始目标一致，而不是空泛占位。
+  const appAction = plan.actions.find((action) => action.type === "terminate")
+  const sidecarAction = plan.actions.find((action) => action.type === "terminate-if-still-running")
+  if (!appAction || appAction.type !== "terminate") return assert.fail("缺少主进程终止动作")
+  assert.equal(appAction.recheck.exe, APP_EXE)
+  assert.equal(appAction.recheck.uid, 501)
+  if (!sidecarAction || sidecarAction.type !== "terminate-if-still-running") return assert.fail("缺少服务进程条件终止动作")
+  assert.equal(sidecarAction.recheck.exe, SIDECAR_EXE)
+  assert.equal(sidecarAction.recheck.uid, 501)
+})
+
+test("启动能力必须明确标记为未验证，且不虚构启动上下文", () => {
+  const plan = planRestart(snapshotOk())
+  assert.equal(plan.allowed, true)
+  if (!plan.allowed) return
+  assert.equal(plan.relaunchReadiness, "unverified")
+  const relaunch = plan.actions.find((action) => action.type === "relaunch")
+  if (!relaunch || relaunch.type !== "relaunch") return assert.fail("缺少 relaunch 动作")
+  assert.equal(relaunch.readiness, "unverified")
+  // 不虚构环境变量、工作目录或实例隔离参数：relaunch 只携带 exe 与 argv。
+  assert.deepEqual(Object.keys(relaunch).sort(), ["argv", "exe", "note", "readiness", "type"])
+  assert.deepEqual(relaunch.argv, [APP_EXE])
+  assert.ok(!("env" in plan.target))
+  assert.ok(!("cwd" in plan.target))
+  assert.ok(!("userDataDir" in plan.target))
+  assert.ok(plan.evidence.some((item) => item.what === "relaunchReadiness" && item.value.includes("unverified")))
+})
+
+test("复核约束与就绪状态是规划器输出的一部分（类型层面存在）", () => {
+  // 通过一次成功规划与一次拒绝规划，确认新字段在两个分支上的结构稳定。
+  const ok = planRestart(snapshotOk())
+  const bad = planRestart(snapshotOk({ self: selfOk({ uid: NaN }) }))
+  assert.equal(ok.allowed, true)
+  assert.equal(bad.allowed, false)
+  if (ok.allowed) {
+    assert.ok("relaunchReadiness" in ok)
+    assert.ok(ok.actions.every((action) => {
+      if (action.type === "terminate" || action.type === "terminate-if-still-running") return "recheck" in action
+      if (action.type === "relaunch") return "readiness" in action
+      return true
+    }))
+  }
+  if (!bad.allowed) {
+    assert.equal(bad.target, null)
+    assert.deepEqual(bad.actions, [])
+  }
 })

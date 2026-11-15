@@ -44,10 +44,53 @@ export interface RestartPlanOptions {
 }
 
 export type PlannedAction =
-  | { type: "terminate"; pid: number; signal: "TERM"; note: string }
-  | { type: "terminate-if-still-running"; pid: number; signal: "KILL"; note: string }
+  | {
+      type: "terminate"
+      pid: number
+      signal: "TERM"
+      note: string
+      /** 发送信号前必须逐项重新确认；任何一项不成立就放弃本次信号操作。 */
+      recheck: SignalRecheck
+    }
+  | {
+      type: "terminate-if-still-running"
+      pid: number
+      signal: "KILL"
+      note: string
+      /** 条件终止同样受复核约束：不是允许无条件按 PID 强制结束。 */
+      recheck: SignalRecheck
+    }
   | { type: "await-exit"; pid: number; note: string }
-  | { type: "relaunch"; exe: string; argv: readonly string[]; note: string }
+  | { type: "relaunch"; exe: string; argv: readonly string[]; note: string; readiness: RelaunchReadiness }
+
+/**
+ * 执行前复核要求：动作里出现的 terminate / terminate-if-still-running 只代表
+ * 「候选动作」，后续执行器在任何信号操作之前必须按 requirements 重新确认目标
+ * 进程身份。仅凭 PID 存活、PID 与原记录一致、命令行包含 opencode、或
+ * SingletonLock 记录的 PID，都不构成发送信号的理由；复核失败必须放弃信号
+ * 操作，也不得退化为模糊匹配。
+ */
+export interface SignalRecheck {
+  exe: string
+  uid: number
+  requirements: readonly string[]
+}
+
+export const SIGNAL_RECHECK_REQUIREMENTS: readonly string[] = [
+  "目标 PID 仍然存在",
+  "目标 PID 对应的可执行文件与规划时的原始身份一致",
+  "目标 PID 对应的 UID 与规划时的原始身份一致",
+  "目标进程仍是原始目标本身，而不是 PID 复用后产生的新进程",
+  "进程身份信息完整且没有矛盾",
+]
+
+/**
+ * 启动能力状态：规划器目前只能确认目标实例身份并生成候选动作。真实重启还
+ * 依赖环境变量、工作目录、用户数据目录、实例隔离参数以及启动方式
+ * （LaunchServices 与直接启动的可执行文件行为不同）能否完整恢复，这些都尚未
+ * 验证，因此 relaunch 恒为 "unverified"，不得解释为已具备完整恢复能力。
+ */
+export type RelaunchReadiness = "unverified"
 
 export interface RestartTarget {
   appPid: number
@@ -71,6 +114,7 @@ export type RestartRefusalCode =
   | "sidecar-relation-broken"
   | "pid-conflict"
   | "lock-mismatch"
+  | "uid-mismatch"
 
 export type RestartPlan =
   | {
@@ -79,6 +123,7 @@ export type RestartPlan =
       target: RestartTarget
       actions: readonly PlannedAction[]
       evidence: readonly RestartEvidence[]
+      relaunchReadiness: RelaunchReadiness
     }
   | {
       allowed: false
@@ -130,6 +175,11 @@ function validPid(value: unknown): value is number {
   return typeof value === "number" && Number.isInteger(value) && value > 0
 }
 
+/** UID 必须是安全的非负整数：拒绝 NaN、Infinity、负数与小数。 */
+function validUid(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0
+}
+
 export function planRestart(snapshot: RestartSnapshot, options: RestartPlanOptions = {}): RestartPlan {
   const evidence: RestartEvidence[] = []
   const appExe = options.expectedAppExe ?? DEFAULT_APP_EXE
@@ -166,8 +216,8 @@ export function planRestart(snapshot: RestartSnapshot, options: RestartPlanOptio
   if (!validPid(ppid)) {
     return refuse("identity-incomplete", "当前进程缺少父进程 PID（ppid），身份证据不足，拒绝自动重启。")
   }
-  if (typeof uid !== "number") {
-    return refuse("identity-incomplete", "当前进程缺少 UID（uid），身份证据不足，拒绝自动重启。")
+  if (!validUid(uid)) {
+    return refuse("identity-incomplete", "当前进程 UID（uid）缺失或非法（必须为非负安全整数），身份证据不足，拒绝自动重启。")
   }
   evidence.push({ what: "self.exe", value: exe })
   evidence.push({ what: "self.ppid", value: String(ppid) })
@@ -204,6 +254,14 @@ export function planRestart(snapshot: RestartSnapshot, options: RestartPlanOptio
       `无法确认服务进程可执行文件身份：${typeof sidecarExe === "string" ? sidecarExe : "（缺失）"}。`,
     )
   }
+  if (!validUid(sidecar.uid)) {
+    return refuse("sidecar-unconfirmed", "服务进程 UID（uid）缺失或非法（必须为非负安全整数），无法确认归属，拒绝自动重启。")
+  }
+  if (sidecar.uid !== uid) {
+    return refuse("uid-mismatch", `服务进程 UID（${sidecar.uid}）与当前主进程 UID（${uid}）不一致，拒绝自动重启。`)
+  }
+  evidence.push({ what: "sidecar.uid", value: String(sidecar.uid) })
+  evidence.push({ what: "uid", value: "self 与 sidecar 一致" })
   if (sidecar.ppid !== self.pid) {
     return refuse("sidecar-relation-broken", `服务进程（PID ${sidecarPid}）不是当前主进程的直接子进程，归属不明，拒绝终止。`)
   }
@@ -256,16 +314,40 @@ export function planRestart(snapshot: RestartSnapshot, options: RestartPlanOptio
     uid,
   }
   const actions: readonly PlannedAction[] = [
-    { type: "terminate", pid: self.pid, signal: "TERM", note: "请求当前 OpenCode 桌面主进程退出" },
+    {
+      type: "terminate",
+      pid: self.pid,
+      signal: "TERM",
+      note: "请求当前 OpenCode 桌面主进程退出",
+      recheck: { exe, uid, requirements: SIGNAL_RECHECK_REQUIREMENTS },
+    },
     { type: "await-exit", pid: self.pid, note: "等待主进程完全退出，期间不发送任何其他信号" },
     {
       type: "terminate-if-still-running",
       pid: sidecarPid,
       signal: "KILL",
-      note: "主进程退出后，服务进程若仍残留才强制结束",
+      note: "主进程退出后，服务进程若经复核确认仍是原始目标且仍残留，才允许强制结束",
+      recheck: { exe: sidecarExe, uid: sidecar.uid, requirements: SIGNAL_RECHECK_REQUIREMENTS },
     },
     { type: "await-exit", pid: sidecarPid, note: "等待服务进程退出并确认单实例锁释放" },
-    { type: "relaunch", exe, argv, note: "用原可执行文件与原启动参数重新打开当前实例" },
+    {
+      type: "relaunch",
+      exe,
+      argv,
+      note: "用原可执行文件与原启动参数重新打开当前实例（启动上下文尚未验证，见 relaunchReadiness）",
+      readiness: "unverified",
+    },
   ]
-  return { allowed: true, reason: "identity-confirmed", target, actions, evidence }
+  evidence.push({
+    what: "relaunchReadiness",
+    value: "unverified：环境变量、工作目录、用户数据目录、实例隔离参数与启动方式均尚未验证能否完整恢复",
+  })
+  return {
+    allowed: true,
+    reason: "identity-confirmed",
+    target,
+    actions,
+    evidence,
+    relaunchReadiness: "unverified",
+  }
 }
