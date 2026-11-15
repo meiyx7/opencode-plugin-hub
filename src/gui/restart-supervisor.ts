@@ -66,8 +66,9 @@ function parseProcLine(line) {
 var MIN_SIGNAL_AGE_SECONDS = 2
 
 // Parses ps etime ('[[dd-]hh:]mm:ss') into total seconds; null when malformed.
-// Fields are strictly digit-checked (hh/mm/ss two digits) so garbage can
-// never masquerade as a valid age credential.
+// Fields are strictly digit-checked so garbage can never masquerade as a
+// valid age credential. BSD ps does not zero-pad hours (1:05:23), so hours
+// accept one or two digits; minutes and seconds are always two digits.
 function etimeSeconds(etime) {
   var rest = String(etime || '').trim()
   var days = 0
@@ -80,12 +81,13 @@ function etimeSeconds(etime) {
   }
   var parts = rest.split(':')
   if (parts.length < 2 || parts.length > 3) return null
-  for (var i = 0; i < parts.length; i++) {
-    if (!/^\\d{2}$/.test(parts[i])) return null
-  }
-  var seconds = 0
-  for (var j = 0; j < parts.length; j++) seconds = seconds * 60 + parseInt(parts[j], 10)
-  return days * 86400 + seconds
+  var hours = parts.length === 3 ? parts[0] : null
+  var minutes = parts.length === 3 ? parts[1] : parts[0]
+  var secs = parts[parts.length - 1]
+  if (hours !== null && !/^\\d{1,2}$/.test(hours)) return null
+  if (!/^\\d{2}$/.test(minutes) || !/^\\d{2}$/.test(secs)) return null
+  var total = (hours !== null ? parseInt(hours, 10) * 3600 : 0) + parseInt(minutes, 10) * 60 + parseInt(secs, 10)
+  return days * 86400 + total
 }
 
 function makeRealOps(payload) {

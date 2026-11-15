@@ -131,9 +131,11 @@ export function parseProcLine(line: string): ParsedProc | null {
 
 /**
  * Parses `ps etime` (`[[dd-]hh:]mm:ss`) into total seconds; null when the
- * value is malformed. Fields are strictly digit-checked (hh/mm/ss two digits,
- * days one or more) so a garbage value can never masquerade as a valid age —
- * a malformed age is treated as "credential missing" and refuses the restart.
+ * value is malformed. Fields are strictly digit-checked so a garbage value
+ * can never masquerade as a valid age — a malformed age is treated as
+ * "credential missing" and refuses the restart. BSD `ps` does not zero-pad
+ * the hours field (a 1-hour process renders `1:05:23`), so hours accept one
+ * or two digits; minutes and seconds are always two digits.
  */
 export function etimeSeconds(etime: string): number | null {
   let rest = String(etime ?? "").trim()
@@ -147,10 +149,16 @@ export function etimeSeconds(etime: string): number | null {
   }
   const parts = rest.split(":")
   if (parts.length < 2 || parts.length > 3) return null
-  if (!parts.every((part) => /^\d{2}$/.test(part))) return null
-  let seconds = 0
-  for (const part of parts) seconds = seconds * 60 + Number.parseInt(part, 10)
-  return days * 86_400 + seconds
+  const hours = parts.length === 3 ? parts[0]! : null
+  const minutes = parts.length === 3 ? parts[1]! : parts[0]!
+  const seconds = parts[parts.length - 1]!
+  if (hours !== null && !/^\d{1,2}$/.test(hours)) return null
+  if (!/^\d{2}$/.test(minutes) || !/^\d{2}$/.test(seconds)) return null
+  const total =
+    (hours !== null ? Number.parseInt(hours, 10) * 3600 : 0) +
+    Number.parseInt(minutes, 10) * 60 +
+    Number.parseInt(seconds, 10)
+  return days * 86_400 + total
 }
 
 /**

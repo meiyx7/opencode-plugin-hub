@@ -223,12 +223,17 @@ test("ps 行解析：完整字段与脏数据", () => {
 test("etimeSeconds：[[dd-]hh:]mm:ss 解析与异常值", () => {
   assert.equal(etimeSeconds("12:33"), 753)
   assert.equal(etimeSeconds("01:02:03"), 3723)
+  // BSD ps 的小时字段不补零：运行 1 小时的进程渲染为 1:05:23
+  assert.equal(etimeSeconds("1:05:23"), 3923)
+  assert.equal(etimeSeconds("12:05:23"), 43523)
   assert.equal(etimeSeconds("2-03:04:05"), 2 * 86400 + 3 * 3600 + 4 * 60 + 5)
   assert.equal(etimeSeconds("00:00"), 0)
   assert.equal(etimeSeconds(""), null)
   assert.equal(etimeSeconds("bogus"), null)
   assert.equal(etimeSeconds("1:2"), null)
   assert.equal(etimeSeconds("x:zz"), null)
+  assert.equal(etimeSeconds("100:05"), null)
+  assert.equal(etimeSeconds("1:5:23"), null)
 })
 
 test("自身进程过新（etime 低于最小年龄门）：拒绝自动重启", () => {
