@@ -1238,9 +1238,9 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
           // The config now names the new version, but this window (and the background
           // service) still run the previous bundle. Say exactly that and leave loading to
           // OpenCode's own mechanism — the hub never restarts the host.
-          notify(`${result.message}。插件中心的新版本已写入配置，当前窗口仍运行旧构建，OpenCode 重新加载后生效。`, "warning")
+          notify(`${result.message}。新版本已写入配置，当前窗口仍运行旧构建；OpenCode 重新加载后生效（工具栏「重载配置」即执行 opencode reload）。`, "warning")
         } else {
-          notify(`${result.message}。配置已写入，OpenCode 加载后生效。`, "success")
+          notify(`${result.message}。配置已写入：受监控的配置由 OpenCode 自动重新加载，未自动生效时点工具栏「重载配置」。`, "success")
         }
         const latest = version || hits().find((hit) => hit.name === name)?.version || ""
         setCatalog((prev) => prev.map((entry) => (entry.pkg === name ? { ...entry, installed: true } : entry)))
@@ -1275,7 +1275,7 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
           notify(result.message, "error")
           return
         }
-        notify(`${result.message}。配置已写入，OpenCode 加载后生效。`, "success")
+        notify(`${result.message}。配置已写入：受监控的配置由 OpenCode 自动重新加载，未自动生效时点工具栏「重载配置」。`, "success")
         setCatalog((prev) =>
           prev.map((item) => (item.pkg === entry.name ? { ...item, installed: false } : item)),
         )
@@ -1770,7 +1770,7 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
       }
       if (status === "failed") return runtimeInfo()?.error || "宿主报告加载失败"
       if (status === "control") return "配置里的禁用/通配规则，不是已安装的插件包"
-      if (status === "pending") return "配置已写入，宿主尚未加载（OpenCode 启动或重载时读取）"
+      if (status === "pending") return "配置已写入，等待宿主重新加载（自动重载，或点「重载配置」）"
       return "没有取得宿主的加载证据，不当作已生效"
     }
     return (
@@ -1951,7 +1951,7 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
           <div class="ph-notice" data-tone="info">
             <ui.Icon name="outline-rotate-clockwise" size="small" />
             <span>
-              有 {pendingChangesCount()} 项配置变更尚未被宿主加载。插件在 OpenCode 启动/重载时读取，插件中心只写配置、不接管宿主进程。
+              有 {pendingChangesCount()} 项配置变更尚未被宿主加载。受监控的配置由 OpenCode 自动重新加载，需要立刻确认时点工具栏「重载配置」。插件中心只写配置，不接管宿主进程。
             </span>
           </div>
         </Show>
@@ -2282,7 +2282,7 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
 
       <footer class="ph-footer">
         <div class="ph-footer-note">
-          安装、更新和移除只改全局配置，不会立即生效：插件列表由 OpenCode 在启动或重载时读取。插件中心不重启宿主；需要立刻生效时，用 OpenCode 自己的重载/服务重启入口。
+          安装、更新和移除只写全局配置，生效由 OpenCode 负责：受监控的配置会自动重新加载，需要确认时点工具栏「重载配置」（opencode reload）；未被监听的本地依赖变化，可能仍需重启 OpenCode 服务。插件中心不重启宿主。
         </div>
       </footer>
     </div>

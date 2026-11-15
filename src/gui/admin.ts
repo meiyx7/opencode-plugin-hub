@@ -183,15 +183,56 @@ function isPackageName(name: string): boolean {
   return base.length > 0 && !base.startsWith(".")
 }
 
+/** One dot-separated part of a plugin id: `acme`, `reviewer`, `opencode-notify`. */
+const ID_PART = /^[a-z0-9_-]+$/i
+
 /**
- * A config control entry instead of a plugin: `-id` disables a plugin, `*` / `.*` are
- * wildcards (see OpenCode's plugin config docs). These are user rules, not installable
- * packages, so they are shown as rules and are never resolved, updated or sent to the
- * registry.
+ * Drops a leading `@scope/` from a plugin id. Returns `null` when the entry carries an
+ * npm version suffix (`foo@*`, `@scope/foo@1.2.3`): there the text after `@` is a version
+ * range, so the entry installs a package instead of being a rule.
+ */
+function stripScope(id: string): string | null {
+  if (!id.startsWith("@")) return id.includes("@") ? null : id
+  const slash = id.indexOf("/")
+  if (slash < 0) return null
+  const rest = id.slice(slash + 1)
+  return rest.includes("@") ? null : rest
+}
+
+/** A bare plugin id with no version: `acme`, `acme.reviewer`, `@scope/foo`. */
+function isBarePluginId(id: string): boolean {
+  const unscoped = stripScope(id)
+  if (unscoped === null || unscoped.length === 0) return false
+  return unscoped.split(".").every((part) => ID_PART.test(part))
+}
+
+/** A wildcard plugin id: `*`, `.*`, `acme.*`, `acme.reviewer.*`, `@scope/acme.*`. */
+function isWildcardPluginId(id: string): boolean {
+  const unscoped = stripScope(id)
+  if (unscoped === null) return false
+  if (unscoped === "*" || unscoped === ".*") return true
+  if (!unscoped.endsWith(".*")) return false
+  const prefix = unscoped.slice(0, -2)
+  return prefix.length > 0 && prefix.split(".").every((part) => ID_PART.test(part))
+}
+
+/**
+ * A config control entry instead of a plugin, using OpenCode's own syntax: `-id` disables a
+ * plugin, while `*`, `.*`, `acme.*` and `-acme.*` are wildcards. These are user rules, not
+ * installable packages, so they are shown as rules and are never resolved, updated or sent
+ * to the registry.
+ *
+ * `foo@*` and `@scope/foo@*` are deliberately *not* control entries: `@` starts a version
+ * range there, so they install (or pin) a package and their `*` has nothing to do with
+ * wildcards.
  */
 export function isControlSpec(spec: string): boolean {
   const trimmed = spec.trim()
-  return trimmed.startsWith("-") || trimmed.includes("*")
+  if (trimmed.length === 0) return false
+  const negated = trimmed.startsWith("-")
+  const body = negated ? trimmed.slice(1) : trimmed
+  if (body.length === 0) return false
+  return negated ? isBarePluginId(body) || isWildcardPluginId(body) : isWildcardPluginId(body)
 }
 
 export function splitSpec(spec: string): { name: string; range: string; kind: string } {
@@ -607,14 +648,25 @@ async function restoreTree(from: string, to: string): Promise<void> {
   await copyTree(from, to)
 }
 
-function run(command: string, args: string[], cwd: string): Promise<{ code: number; output: string }> {
+/**
+ * Runs a command to completion and reports its truth: `started` says whether the process
+ * was actually spawned (a missing binary reports `false`, not exit code 0), `code` is the
+ * real exit status, and `output` holds stdout + stderr for the caller to quote.
+ */
+function run(
+  command: string,
+  args: string[],
+  cwd: string,
+): Promise<{ code: number; output: string; started: boolean }> {
   return new Promise((resolve) => {
     const child = spawn(command, args, { cwd, stdio: ["ignore", "pipe", "pipe"] })
     let output = ""
+    let started = false
     child.stdout?.on("data", (chunk) => (output += String(chunk)))
     child.stderr?.on("data", (chunk) => (output += String(chunk)))
-    child.on("error", (error) => resolve({ code: -1, output: describe(error) }))
-    child.on("close", (code) => resolve({ code: code ?? -1, output }))
+    child.on("spawn", () => (started = true))
+    child.on("error", (error) => resolve({ code: -1, output: describe(error), started }))
+    child.on("close", (code) => resolve({ code: code ?? -1, output, started }))
   })
 }
 
@@ -1165,19 +1217,31 @@ export async function openConfig(): Promise<boolean> {
 }
 
 /**
- * Asks the CLI to reload its configuration. This reloads config only: changes to provider
- * snapshots still take effect when OpenCode itself restarts, which is the host's call, not
- * the hub's.
+ * Runs `opencode reload` and waits for it: the hub reports what the command actually did,
+ * never "success" just because a child process object exists. Reloading config is all this
+ * does — provider snapshots and unmonitored local dependencies still need the host's own
+ * restart, which is OpenCode's call, not the hub's.
  */
 export async function reload(argv: readonly string[]): Promise<MutationValue> {
+  if (argv.length === 0) return { ok: false, message: "找不到 opencode CLI", state: await snapshot() }
+  // Same working directory the old fire-and-forget spawn inherited, so the command targets
+  // the same project as before — only now its exit status is actually read.
+  const result = await run(argv[0]!, [...argv.slice(1), "reload"], process.cwd())
   const state = await snapshot()
-  try {
-    if (argv.length === 0) return { ok: false, message: "找不到 opencode CLI", state }
-    const child = spawn(argv[0]!, [...argv.slice(1), "reload"], { detached: true, stdio: "ignore" })
-    child.unref()
-    return { ok: true, message: "已请求重载配置；插件列表变化由 OpenCode 自行加载，必要时请重启服务", state }
-  } catch (error) {
-    return { ok: false, message: describe(error), state }
+  if (result.code !== 0) {
+    const detail = lastLines(result.output)
+    const reason = result.started ? `opencode reload 退出码 ${result.code}` : "无法启动 opencode CLI"
+    return {
+      ok: false,
+      message: detail ? `配置重载失败：${reason} — ${detail}` : `配置重载失败：${reason}`,
+      state,
+    }
+  }
+  return {
+    ok: true,
+    message:
+      "已执行 opencode reload：受监控的配置项会随之重新加载；未被监听的本地依赖变化，可能仍需重启 OpenCode 服务",
+    state,
   }
 }
 
@@ -1280,6 +1344,15 @@ function toUnknown(entry: InstalledEntryValue): RuntimeInfoValue {
 function describe(error: unknown): string {
   if (error instanceof Error) return error.message
   return String(error)
+}
+
+/** The last few non-empty lines of CLI output, so an error message stays one line. */
+function lastLines(output: string, count = 3): string {
+  const lines = output
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0)
+  return lines.slice(-count).join(" ")
 }
 
 /** Makes socket-level failures actionable: `fetch failed` alone says nothing about what to do. */

@@ -1,5 +1,5 @@
 /**
- * 自更新专项测试：admin.install() 的 selfUpdated 判定。
+ * 生命周期测试：admin.install() 的 selfUpdated 判定、配置控制项识别、`opencode reload` 的结果回传。
  * 只用 Node 内置 node:test、临时目录和 fetch 桩，不引入第三方依赖。
  *
  * selfUpdated 只表示「配置已指向新版本、当前窗口仍是旧构建」；加载交给 OpenCode，
@@ -236,4 +236,97 @@ test("10. 安装同名插件时追加启用条目，不改写已有禁用规则"
   const result = await admin.install("opencode-notify", "")
   assert.equal(result.ok, true)
   assert.deepEqual(await readConfigSpecs(), ["-acme.reviewer", "opencode-notify"])
+})
+
+// ---------------------------------------------------------------------------
+// 控制项识别：官方语法是 `-id` / `*` / `.*` / `prefix.*`，而 `pkg@*` 是 npm 版本范围
+// ---------------------------------------------------------------------------
+
+test("11. isControlSpec 只认官方语法的规则项", () => {
+  const controls = ["-acme.reviewer", "*", ".*", "acme.*", "acme.reviewer.*", "-acme.*", "-acme.reviewer.*"]
+  for (const spec of controls) {
+    assert.equal(admin.isControlSpec(spec), true, `${spec} 应识别为控制项`)
+  }
+  for (const spec of ["  *  ", " -acme.reviewer "]) {
+    assert.equal(admin.isControlSpec(spec), true, `${spec} 去掉空白后仍是控制项`)
+  }
+})
+
+test("12. 带版本范围的包名不会被误判成控制项", () => {
+  const packages = [
+    "foo@*",
+    "@scope/foo@*",
+    "foo@latest",
+    "foo@^1.2.0",
+    "foo@1.2.3",
+    "opencode-notify",
+    "@scope/foo",
+    "./local-plugin",
+    "",
+    "-",
+  ]
+  for (const spec of packages) {
+    assert.equal(admin.isControlSpec(spec), false, `${spec} 不是控制项`)
+  }
+})
+
+test("13. foo@* 按包展示，名字与版本范围分开", async () => {
+  await writeConfig(["foo@*", "@scope/foo@*", "-acme.reviewer"])
+  const state = await admin.snapshot()
+  const bySpec = new Map(state.plugins.map((entry) => [entry.spec, entry]))
+  assert.equal(bySpec.get("foo@*")!.kind, "package")
+  assert.equal(bySpec.get("foo@*")!.name, "foo")
+  assert.equal(bySpec.get("@scope/foo@*")!.kind, "package")
+  assert.equal(bySpec.get("@scope/foo@*")!.name, "@scope/foo")
+  assert.equal(bySpec.get("-acme.reviewer")!.kind, "control")
+})
+
+test("14. foo@* 会按包名去 registry 查版本", async () => {
+  await writeConfig(["foo@*", "-acme.reviewer"])
+  const asked: string[] = []
+  route = (url) => {
+    asked.push(url)
+    return json({ name: "foo", "dist-tags": { latest: "1.4.0" }, versions: { "1.4.0": { version: "1.4.0" } } })
+  }
+  const result = await admin.updates()
+  assert.equal(asked.length, 1, "只有包名去查，控制项不发请求")
+  assert.match(asked[0]!, /\/foo\/latest$/)
+  const bySpec = new Map(result.items.map((item) => [item.spec, item]))
+  assert.equal(bySpec.get("foo@*")!.name, "foo")
+  assert.equal(bySpec.get("-acme.reviewer")!.hasUpdate, false)
+})
+
+// ---------------------------------------------------------------------------
+// 配置重载：等子进程真正结束，按退出码报告，不以「进程对象存在」为成功
+// ---------------------------------------------------------------------------
+
+test("15. reload 成功只在 opencode reload 退出码为 0 时报告", async () => {
+  const result = await admin.reload([process.execPath, "-e", "process.exit(0)"])
+  assert.equal(result.ok, true)
+  assert.match(result.message, /opencode reload/)
+  assert.doesNotMatch(result.message, /Desktop|彻底重启/, "重载不是 Desktop 重启")
+  assert.equal(Array.isArray(result.state.plugins), true, "无论成败都回传最新配置状态")
+})
+
+test("16. reload 失败带退出码和命令输出，不返回成功", async () => {
+  const result = await admin.reload([
+    process.execPath,
+    "-e",
+    "console.error('no background service'); process.exit(3)",
+  ])
+  assert.equal(result.ok, false)
+  assert.match(result.message, /退出码 3/)
+  assert.match(result.message, /no background service/)
+})
+
+test("17. reload 在 CLI 无法启动时明确失败", async () => {
+  const result = await admin.reload([join(temp, "definitely-not-opencode")])
+  assert.equal(result.ok, false)
+  assert.match(result.message, /无法启动 opencode CLI/)
+})
+
+test("18. reload 没有 CLI 时不假装执行过命令", async () => {
+  const result = await admin.reload([])
+  assert.equal(result.ok, false)
+  assert.match(result.message, /找不到 opencode CLI/)
 })
