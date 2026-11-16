@@ -1,9 +1,19 @@
-import { createEffect, createMemo, createSignal, For, onMount, Show, Switch, Match } from "solid-js"
+import { createEffect, createMemo, createSignal, For, onCleanup, onMount, Show, Switch, Match } from "solid-js"
 import type { Context, IconName, IpcClient } from "@opencode/plugin/gui"
 import type { Admin } from "../contract"
 import { countTitle, countWithUnit, formatCount } from "./download-format"
 import { explainMutation, type Tone } from "./feedback"
 import { buildAttentionItems, type InstalledFilter } from "./attention"
+import { classifyState, severityOf, type RowState } from "./status-view"
+import { readableErrorText } from "./error-view"
+import {
+  buildProgressReport,
+  runningSteps,
+  type ProgressInput,
+  type ProgressMutation,
+  type ProgressReport,
+  type StepState,
+} from "./progress-view"
 import { CSS } from "./styles"
 
 type AdminClient = IpcClient<typeof Admin.spec>
@@ -21,10 +31,24 @@ type DiscoveredPlugin = NonNullable<Awaited<ReturnType<AdminClient["runtime"]>>[
 type Tab = "catalog" | "search" | "installed"
 type Note = { text: string; tone: Tone; scope?: Tab }
 
-const PAGE = 24
+/**
+ * 一次安装/更新的进度可视状态。阶段只由真实结果驱动：
+ * running 时只显示“正在执行官方命令”这一个进行中状态，不预支任何阶段为完成；
+ * done 时由 progress-view 把后端 result.stages 映射成时间线与结论。
+ *
+ * 生命周期与触发它的 PluginHubPage 组件一致（一个 signal），不引入全局状态管理。
+ */
+type ProgressKind = "install" | "update"
+interface ProgressOp {
+  kind: ProgressKind
+  name: string
+  from: string
+  to: string
+  selfUpdate: boolean
+}
+type ProgressState = { op: ProgressOp; phase: "running" } | { op: ProgressOp; phase: "done"; report: ProgressReport }
 
-/** 一行的运行状态：服务端事实 + 配置规则一起决定，界面按它出徽章和按钮。 */
-type RowState = "loaded" | "failed" | "paused" | "pending" | "unknown" | "control" | "rule"
+const PAGE = 24
 
 const CATALOG_SOURCE_FALLBACK = "https://github.com/awesome-opencode/awesome-opencode"
 const CATALOG_SOURCE_TITLE = "精选目录来自 awesome-opencode 社区维护的 registry.json，不是 OpenCode 官方推荐"
@@ -97,19 +121,186 @@ function noteIcon(tone: Tone): IconName {
 }
 
 /**
- * A schema error almost always means the window bundle and the `serve --service` process
- * are running different builds of this plugin. Say that in words instead of showing
- * `SchemaError(Missing key at ...)`, which gives the user nothing to act on.
+ * 把底层异常翻译成可读文案。分类逻辑见 error-view 纯函数（网络/权限/配置/版本/版本不一致），
+ * 保留底层原因，不把所有异常压成同一句。两点旧行为完全一致：版本不一致提示重载、未知异常保留原文。
  */
 function readableError(error: unknown): string {
-  const text = error instanceof Error ? error.message : String(error)
-  if (/SchemaError|Missing key at/i.test(text)) {
-    return "插件窗口与后台服务版本不一致，需要 OpenCode 重新加载（插件中心不重启宿主）。"
+  return readableErrorText(error)
+}
+
+/** 阶段圆点：用 data-state 驱动样式，颜色之外仍有 ✓/✕/—/? 形状区分（不依赖颜色表意）。 */
+function StepIcon(props: { state: StepState }) {
+  const glyph = () =>
+    props.state === "done"
+      ? "✓"
+      : props.state === "failed"
+        ? "✕"
+        : props.state === "skipped"
+          ? "—"
+          : props.state === "unknown"
+            ? "?"
+            : ""
+  return <span class="ph-step-ico" data-state={props.state} aria-hidden="true">{glyph()}</span>
+}
+
+/**
+ * 进度 Dialog 的共享内容体：详情页就地切换与独立进度 Dialog 复用同一套呈现，
+ * 保证所有入口的进度外观与状态语义完全一致。
+ */
+function ProgressBody(props: { state: ProgressState }) {
+  // 把联合类型收敛成一个对象，避免在 JSX 里对 props.state 反复取值导致 TS 无法收窄。
+  const view = createMemo(() => {
+    const s = props.state
+    if (s.phase === "running") {
+      return { phase: "running" as const, op: s.op, steps: runningSteps(s.op), report: undefined }
+    }
+    return { phase: "done" as const, op: s.op, steps: s.report.steps, report: s.report }
+  })
+  const op = () => view().op
+  const steps = () => view().steps
+  const report = () => view().report
+  const foot = () =>
+    view().phase === "running"
+      ? op().kind === "install"
+        ? "正在安装，请稍候。官方命令执行期间无法关闭本窗口。"
+        : "正在更新，请稍候。官方命令执行期间无法关闭本窗口。"
+      : report()!.summary
+
+  return (
+    <div class="ph-progress">
+      <div class="ph-progress-id">
+        <span class="ph-tile ph-progress-tile">{initial(op().name)}</span>
+        <div class="ph-progress-titles">
+          <div class="ph-progress-name">{op().name}</div>
+          <div class="ph-progress-flow">
+            {op().kind === "install" ? "安装" : "更新"}
+            <Show when={op().selfUpdate}> · 插件中心安全自升级</Show>
+          </div>
+        </div>
+      </div>
+      <div class="ph-progress-versions">
+        <span class="ph-badge">{op().from ? `当前 v${op().from}` : "当前版本未知"}</span>
+        <span class="ph-version-arrow">→</span>
+        <span class="ph-badge" data-tone="accent">{op().to ? `目标 v${op().to}` : "目标版本确认中"}</span>
+      </div>
+      <ol class="ph-steps">
+        <For each={steps()}>
+          {(step) => (
+            <li class="ph-step" data-state={step.state}>
+              <StepIcon state={step.state} />
+              <div class="ph-step-copy">
+                <div class="ph-step-title">{step.title}</div>
+                <div class="ph-step-desc">{step.desc}</div>
+              </div>
+            </li>
+          )}
+        </For>
+      </ol>
+      <Show when={report()}>
+        {(result) => (
+          <div class="ph-progress-result" data-tone={result().tone}>
+            <div class="ph-progress-result-head">{result().headline}</div>
+            <p class="ph-progress-summary">{result().summary}</p>
+            <div class="ph-progress-rows">
+              <For each={result().rows}>
+                {(row) => (
+                  <div class="ph-progress-row">
+                    <span class="ph-progress-key">{row.key}</span>
+                    <span class="ph-progress-val" data-tone={row.tone}>{row.value}</span>
+                  </div>
+                )}
+              </For>
+            </div>
+          </div>
+        )}
+      </Show>
+      <p class="ph-progress-foot" data-state={view().phase}>{foot()}</p>
+    </div>
+  )
+}
+
+/** 阶段圆点与结论色在两种主题下都要清晰：颜色定义在 styles.ts，这里只挂 data 属性。 */
+function progressPill(props: { phase: "running" | "done"; tone?: "success" | "failed" | "attention" }) {
+  if (props.phase === "running") return "执行中"
+  if (props.tone === "failed") return "失败"
+  if (props.tone === "attention") return "需关注"
+  return "完成"
+}
+
+/** 从进度状态取结论语气：running 无语气。供 JSX 里对联合类型安全取值。 */
+function progressTone(state: ProgressState): "success" | "failed" | "attention" | undefined {
+  return state.phase === "done" ? state.report.tone : undefined
+}
+
+/**
+ * 操作执行期间锁住 Dialog，禁用一切关闭路径。
+ *
+ * 宿主的 `ui.Dialog` 只提供 `closable`（仅隐藏标题栏的 X），Escape 与外部点击仍会关闭它；
+ * 这里用捕获阶段的 window 监听把 Escape 与外部指针事件拦下——只在 running 时生效，
+ * 任务结束（phase=done）或组件卸载即移除，不残留监听、不引入全局状态管理。
+ * 这是在不改宿主 Dialog 实现、不自研进程机制的前提下，能满足“执行期间不可关闭”的最小做法。
+ */
+function useLockDialogWhileRunning(running: () => boolean): void {
+  onMount(() => {
+    const onKey = (event: KeyboardEvent) => {
+      if (running() && event.key === "Escape") {
+        event.preventDefault()
+        event.stopImmediatePropagation()
+      }
+    }
+    const onPointer = (event: PointerEvent) => {
+      if (running()) {
+        event.preventDefault()
+        event.stopImmediatePropagation()
+      }
+    }
+    window.addEventListener("keydown", onKey, true)
+    window.addEventListener("pointerdown", onPointer, true)
+    onCleanup(() => {
+      window.removeEventListener("keydown", onKey, true)
+      window.removeEventListener("pointerdown", onPointer, true)
+    })
+  })
+}
+
+/** 独立进度 Dialog：详情以外的安装/更新入口（精选、搜索、已安装列表）统一使用。 */
+function ProgressDialog(props: {
+  ctx: Context
+  state: ProgressState
+  onClose: () => void
+}) {
+  const ui = props.ctx.ui
+  const running = () => props.state.phase === "running"
+  const done = () => props.state.phase === "done"
+  useLockDialogWhileRunning(running)
+  const title = () => {
+    const verb = props.state.op.kind === "install" ? "安装" : "更新"
+    if (props.state.phase === "running") return `正在${verb}插件`
+    const tone = props.state.report.tone
+    return tone === "failed" ? `${verb}失败` : tone === "attention" ? `${verb}需关注` : `${verb}完成`
   }
-  if (/unknown method|not implemented|no such method|method.*not.*found/i.test(text)) {
-    return "后台服务还在跑旧版本，没有这个接口。请让 OpenCode 重新加载插件后重试。"
-  }
-  return text
+  return (
+    <ui.Dialog
+      title={title()}
+      size="normal"
+      closable={!running()}
+      footer={
+        <div class="ph-dialog-footer">
+          <span class="ph-progress-pill" data-state={props.state.phase} data-tone={progressTone(props.state)}>
+            {progressPill({ phase: props.state.phase, tone: progressTone(props.state) })}
+          </span>
+          <span class="ph-spacer" />
+          <Show when={done()}>
+            <ui.Button size="small" onClick={props.onClose}>
+              关闭
+            </ui.Button>
+          </Show>
+        </div>
+      }
+    >
+      <ProgressBody state={props.state} />
+    </ui.Dialog>
+  )
 }
 
 const NPM_LIKE = /^(@[a-z0-9-_.]+\/)?[a-z0-9-_.]+$/i
@@ -129,6 +320,8 @@ interface DetailDialogProps {
   name: string
   fallback?: DetailFallback
   busy: boolean
+  /** 当前包的进度状态；有值时详情就地切换成进度展示，不关闭再重开。 */
+  progress?: ProgressState
   onInstall: (version: string) => void
   onClose: () => void
 }
@@ -170,47 +363,89 @@ function DetailDialog(props: DetailDialogProps) {
   const canInstall = () => !loading() && data() !== undefined && !failure() && (data()?.version ?? "") !== ""
   const update = () => data()?.hasUpdate === true
   const installed = () => data()?.installed === true
+  // 有本包的进度状态时，详情就地切换成进度视图；执行期间锁住所有关闭路径。
+  const progressRunning = () => props.progress?.phase === "running"
+  useLockDialogWhileRunning(progressRunning)
 
   return (
     <ui.Dialog
-      title="插件详情"
+      title={
+        props.progress
+          ? props.progress.phase === "running"
+            ? props.progress.op.kind === "install"
+              ? "正在安装插件"
+              : "正在更新插件"
+            : `${props.progress.op.kind === "install" ? "安装" : "更新"}${
+                props.progress.report.tone === "failed"
+                  ? "失败"
+                  : props.progress.report.tone === "attention"
+                    ? "需关注"
+                    : "完成"
+              }`
+          : "插件详情"
+      }
       size="x-large"
+      closable={!progressRunning()}
       footer={
-        <div class="ph-dialog-footer">
-          <div class="ph-dialog-links">
-            <Show when={homepage()}>
-              <ui.Button size="small" variant="ghost" icon="globe" onClick={() => open(homepage())}>
-                主页
+        <Show
+          when={props.progress}
+          fallback={
+            <div class="ph-dialog-footer">
+              <div class="ph-dialog-links">
+                <Show when={homepage()}>
+                  <ui.Button size="small" variant="ghost" icon="globe" onClick={() => open(homepage())}>
+                    主页
+                  </ui.Button>
+                </Show>
+                <Show when={repo()}>
+                  <ui.Button
+                    size="small"
+                    variant="ghost"
+                    icon="github"
+                    onClick={() => open(repoLink(repo(), data()?.repoDir ?? ""))}
+                  >
+                    源码
+                  </ui.Button>
+                </Show>
+                <Show when={npm()}>
+                  <ui.Button size="small" variant="ghost" icon="cube" onClick={() => open(npm())}>
+                    npm
+                  </ui.Button>
+                </Show>
+                <Show when={bugs()}>
+                  <ui.Button size="small" variant="ghost" icon="bubble-5" onClick={() => open(bugs())}>
+                    问题反馈
+                  </ui.Button>
+                </Show>
+              </div>
+              <span class="ph-spacer" />
+              <ui.Button size="small" onClick={props.onClose}>
+                关闭
               </ui.Button>
-            </Show>
-            <Show when={repo()}>
-              <ui.Button
-                size="small"
-                variant="ghost"
-                icon="github"
-                onClick={() => open(repoLink(repo(), data()?.repoDir ?? ""))}
+            </div>
+          }
+        >
+          {(state) => (
+            <div class="ph-dialog-footer">
+              <span
+                class="ph-progress-pill"
+                data-state={state().phase}
+                data-tone={progressTone(state())}
               >
-                源码
-              </ui.Button>
-            </Show>
-            <Show when={npm()}>
-              <ui.Button size="small" variant="ghost" icon="cube" onClick={() => open(npm())}>
-                npm
-              </ui.Button>
-            </Show>
-            <Show when={bugs()}>
-              <ui.Button size="small" variant="ghost" icon="bubble-5" onClick={() => open(bugs())}>
-                问题反馈
-              </ui.Button>
-            </Show>
-          </div>
-          <span class="ph-spacer" />
-          <ui.Button size="small" onClick={props.onClose}>
-            关闭
-          </ui.Button>
-        </div>
+                {progressPill({ phase: state().phase, tone: progressTone(state()) })}
+              </span>
+              <span class="ph-spacer" />
+              <Show when={state().phase === "done"}>
+                <ui.Button size="small" onClick={props.onClose}>
+                  关闭
+                </ui.Button>
+              </Show>
+            </div>
+          )}
+        </Show>
       }
     >
+      <Show when={props.progress} fallback={
       <div class="ph-detail">
         <Show when={loading()}>
           <div class="ph-detail-loading">
@@ -390,6 +625,9 @@ function DetailDialog(props: DetailDialogProps) {
           <div class="ph-readme-empty">{failure() || "未能读取这个包的详情。"}</div>
         </Show>
       </div>
+      }>
+        {(state) => <ProgressBody state={state()} />}
+      </Show>
     </ui.Dialog>
   )
 }
@@ -447,6 +685,8 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
 
   const [busyKeys, setBusyKeys] = createSignal<ReadonlySet<string>>(new Set())
   const [note, setNote] = createSignal<Note>()
+  /** 当前安装/更新进度；详情与独立 Dialog 共用这一份状态，详情按 name 匹配就地切换。 */
+  const [progress, setProgress] = createSignal<ProgressState>()
   const isBusy = (key: string) => busyKeys().has(key)
   const begin = (key: string) =>
     setBusyKeys((prev) => {
@@ -614,17 +854,66 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
   const reportMutation = (result: MutationResult, successTone: Tone = "success") => {
     const report = explainMutation(result, successTone)
     notify(report.text, report.tone)
+    return report
   }
 
   const specFor = (name: string) => state()?.plugins.find((entry) => entry.name === name)?.spec ?? name
 
-  const install = async (name: string, version = "") => {
+  /** 当前已安装版本，作为进度展示的“更新前版本”。 */
+  const installedVersionOf = (name: string) => state()?.plugins.find((entry) => entry.name === name)?.version ?? ""
+
+  /** 打开独立进度 Dialog（详情以外的入口用）。生命周期跟随 PluginHubPage。 */
+  const openStandaloneProgress = () => {
+    props.ctx.dialogs.open((dialog) => (
+      <ProgressDialog
+        ctx={props.ctx}
+        state={progress()!}
+        onClose={() => {
+          setProgress(undefined)
+          dialog.close()
+        }}
+      />
+    ))
+  }
+
+  /** 依据后端结果把 running 收敛为 done；阶段与结论全部来自 result.stages，不预测。 */
+  const finishProgress = (result: ProgressMutation, tone: Tone, text: string) => {
+    const current = progress()
+    if (!current) return
+    const op = current.op
+    const to = result.stages?.version || op.to
+    const input: ProgressInput = {
+      kind: op.kind,
+      name: op.name,
+      from: op.from,
+      to,
+      selfUpdate: op.selfUpdate,
+      mutationTone: tone,
+      mutationText: text,
+    }
+    setProgress({ op: { ...op, to }, phase: "done", report: buildProgressReport(input, result) })
+  }
+
+  /** 操作抛异常（拿不到后端结果）时也要收敛进度，避免 Dialog 永远锁在“执行中”。 */
+  const failProgress = (text: string) => {
+    finishProgress({ ok: false, message: text, stages: { command: "failed", config: "unchanged", runtime: "skipped" } }, "error", text)
+  }
+
+  const install = async (name: string, version = "", fromDetail = false) => {
     await track(`install:${name}`, async () => {
       try {
+        // 先置 running，再开 Dialog：确保 Dialog 渲染时 progress() 已有值。
+        // 详情入口就地切换（不另开 Dialog），其余入口开独立 Dialog。
+        setProgress({
+          op: { kind: "install", name, from: installedVersionOf(name), to: version, selfUpdate: name === "opencode-plugin-hub" },
+          phase: "running",
+        })
+        if (!fromDetail) openStandaloneProgress()
         const result = await props.admin.install({ spec: name, version })
         // 服务端回的就是权威状态：先用它，再重新读一遍运行事实。
         setState(result.state)
-        reportMutation(result)
+        const report = reportMutation(result)
+        finishProgress(result, report.tone, report.text)
         if (!result.ok && result.stages?.config !== "updated") return
         // 只有配置真的改了才动本地列表，失败时不能提前把目录/搜索结果改成“已安装”。
         if (result.stages?.config === "updated") {
@@ -640,6 +929,7 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
         // 配置变了：之前的运行事实与检查结果都已过期，全部重新读取。
         await Promise.all([loadRuntime(), checkUpdates(true)])
       } catch (error) {
+        failProgress(readableError(error))
         notify(readableError(error), "error")
       }
     })
@@ -649,12 +939,19 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
   const updatePlugin = async (spec: string, name: string) => {
     await track(`install:${name}`, async () => {
       try {
+        setProgress({
+          op: { kind: "update", name, from: installedVersionOf(name), to: "", selfUpdate: name === "opencode-plugin-hub" },
+          phase: "running",
+        })
+        openStandaloneProgress()
         const result = await props.admin.update({ spec, version: "" })
         setState(result.state)
-        reportMutation(result)
+        const report = reportMutation(result)
+        finishProgress(result, report.tone, report.text)
         if (!result.ok && result.stages?.config !== "updated") return
         await Promise.all([loadRuntime(), checkUpdates(true)])
       } catch (error) {
+        failProgress(readableError(error))
         notify(readableError(error), "error")
       }
     })
@@ -769,9 +1066,11 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
         name={name}
         fallback={fallback}
         busy={isBusy(`install:${name}`)}
+        // 详情就地切换到进度视图：先启动操作（会置 progress），不预先关闭 Dialog。
+        // progress 按 name 匹配，避免其它包的进度误切了当前详情。
+        progress={progress()?.op.name === name ? progress() : undefined}
         onInstall={(version) => {
-          dialog.close()
-          void install(name, version)
+          void install(name, version, true)
         }}
         onClose={() => dialog.close()}
       />
@@ -824,21 +1123,9 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
     () => [...updates().values()].filter((item) => item.official === "failed" || item.official === "unknown").length,
   )
 
-  /** 运行事实：已加载 / 加载失败 / 已暂停 / 待加载 / 未验证 / 配置规则。 */
-  const runtimeState = (entry: PluginEntry): RowState => {
-    // `-id` / `*` 是配置里的启用规则，不参与“是否已加载”的判断。
-    if (entry.kind === "control") return "control"
-    // 插件中心自己追加的启用规则（裸 ID）看上去像包名，但它是规则。
-    if (entry.kind === "enable-rule" || entry.rule) return "rule"
-    const info = runtime().get(entry.spec)
-    // 规则明确禁用时，运行时不报告它是正常现象 —— 先表达“已暂停”，不当作未验证。
-    if (info?.paused) return "paused"
-    if (!info) return runtimeError() ? "unknown" : "pending"
-    if (info.status === "failed") return "failed"
-    if (info.status === "loaded") return "loaded"
-    // 服务端已应答但列表里没有：配置已写入、尚未被加载；应答不可用才是真正的“未验证”。
-    return info.available ? "pending" : "unknown"
-  }
+  /** 运行事实：已加载 / 加载失败 / 已暂停 / 待加载 / 未验证 / 配置规则。判定逻辑见 status-view 纯函数。 */
+  const runtimeState = (entry: PluginEntry): RowState =>
+    classifyState(entry, { runtimeError: runtimeError(), runtime: runtime().get(entry.spec) })
   const failedCount = createMemo(
     () => (state()?.plugins ?? []).filter((entry) => runtimeState(entry) === "failed").length,
   )
@@ -870,17 +1157,8 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
     }),
   )
   /** 问题项排前面：加载失败 → 待加载 → 可更新 → 未验证 → 已暂停 → 正常 → 配置规则，同级保持配置顺序。 */
-  const severity = (entry: PluginEntry): number => {
-    const status = runtimeState(entry)
-    if (status === "control" || status === "rule") return 6
-    if (status === "failed") return 0
-    if (status === "pending") return 1
-    if (updates().get(entry.spec)?.hasUpdate) return 2
-    if (status === "unknown") return 3
-    // 暂停是用户主动造成的“不生效”，比正常项更值得先看到，但仍排在故障之后。
-    if (status === "paused") return 4
-    return 5
-  }
+  const severity = (entry: PluginEntry): number =>
+    severityOf(runtimeState(entry), updates().get(entry.spec)?.hasUpdate === true)
   const visiblePlugins = createMemo(() => {
     const needle = installedQuery().trim().toLowerCase()
     const filter = installedFilter()

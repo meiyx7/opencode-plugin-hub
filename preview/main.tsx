@@ -629,18 +629,25 @@ const ctx = {
     openUrl: async (input: { url: string }) => { window.open(input.url, "_blank"); return { ok: true } },
     openConfig: async () => ({ ok: true }),
     // 预览不执行真实操作，但把「分阶段结果」的形态演示出来：配置没动 = 错误语气。
-    install: async () => ({
-      ok: false,
-      message: "预览模式不执行安装",
-      state: fakeState,
-      stages: { command: "skipped", config: "unchanged", runtime: "skipped" },
-    }),
-    update: async () => ({
-      ok: false,
-      message: "预览模式不执行更新",
-      state: fakeState,
-      stages: { command: "skipped", config: "unchanged", runtime: "skipped" },
-    }),
+    // ?slow=2500 让 install/update 延迟返回，方便核对进度 Dialog 的执行中状态。
+    install: async () => {
+      if (slowMs) await new Promise((r) => setTimeout(r, slowMs))
+      return {
+        ok: false,
+        message: "预览模式不执行安装",
+        state: fakeState,
+        stages: { command: "skipped", config: "unchanged", runtime: "skipped" },
+      }
+    },
+    update: async () => {
+      if (slowMs) await new Promise((r) => setTimeout(r, slowMs))
+      return {
+        ok: false,
+        message: "预览模式不执行更新",
+        state: fakeState,
+        stages: { command: "skipped", config: "unchanged", runtime: "skipped" },
+      }
+    },
     remove: async () => ({
       ok: false,
       message: "预览模式不执行移除",
@@ -702,6 +709,7 @@ const ctx = {
 } as unknown as Context
 
 const params = new URLSearchParams(window.location.search)
+const slowMs = Number(params.get("slow") ?? 0) || 0
 const embedded = params.has("embedded")
 if (params.has("dark")) document.documentElement.dataset.theme = "dark"
 const narrow = Number(params.get("narrow") ?? "")
