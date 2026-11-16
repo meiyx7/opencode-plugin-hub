@@ -189,6 +189,32 @@ export const Opened = Schema.Struct({
   ok: Schema.Boolean,
 })
 
+/**
+ * Every mutation answers four separate questions instead of one `ok`. A run can succeed at the
+ * command, change the config, and still leave the runtime unconfirmed — collapsing that into a
+ * single boolean is how "配置写入成功" ends up being displayed as "插件已加载".
+ */
+export const MutationStages = Schema.Struct({
+  /** What the official CLI command itself did. */
+  command: Schema.Union([Schema.Literal("succeeded"), Schema.Literal("failed"), Schema.Literal("skipped")]),
+  /** Whether the configuration ended up the way the operation intended. */
+  config: Schema.Union([Schema.Literal("updated"), Schema.Literal("unchanged"), Schema.Literal("failed")]),
+  /** Whether the host confirmed it loaded the plugin. `unknown` is not a success. */
+  runtime: Schema.Union([
+    Schema.Literal("loaded"),
+    Schema.Literal("failed"),
+    Schema.Literal("unknown"),
+    Schema.Literal("unchanged"),
+    Schema.Literal("skipped"),
+  ]),
+  /** Only set when a failed operation tried to put the previous state back. */
+  rollback: Schema.optional(
+    Schema.Union([Schema.Literal("none"), Schema.Literal("succeeded"), Schema.Literal("failed")]),
+  ),
+  /** Version the config ended up naming; empty when it names none. */
+  version: Schema.optional(Schema.String),
+})
+
 export const Mutation = Schema.Struct({
   ok: Schema.Boolean,
   message: Schema.String,
@@ -202,6 +228,8 @@ export const Mutation = Schema.Struct({
   selfUpdated: Schema.optional(Schema.Boolean),
   /** What the config, the CLI and the runtime each reported after the operation. */
   verification: Schema.optional(Schema.String),
+  /** 分阶段结论；optional，旧窗口与新服务混跑时仍能互相解码。 */
+  stages: Schema.optional(MutationStages),
 })
 
 /** One configured plugin's runtime truth as the running server reports it. */
@@ -230,6 +258,10 @@ export const RuntimeInfo = Schema.Struct({
   paused: Schema.optional(Schema.Boolean),
   /** The rule that decides the enabled/disabled verdict, as written in the config. */
   rule: Schema.optional(Schema.String),
+  /** Whether an exact `-<id>` line or a wildcard decided it; empty when nothing disables it. */
+  pausedBy: Schema.optional(
+    Schema.Union([Schema.Literal("exact"), Schema.Literal("wildcard"), Schema.Literal("")]),
+  ),
   /** Every rule that mentions this plugin, in config order. */
   rules: Schema.optional(Schema.Array(Schema.String)),
 })

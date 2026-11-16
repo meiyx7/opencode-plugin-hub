@@ -24,6 +24,8 @@ const ENV_KEYS = [
   "XDG_CACHE_HOME",
   "OPENCODE_PLUGIN_HUB_REGISTRY",
   "FAKE_CLI_MODE",
+  "FAKE_CLI_FAIL",
+  "FAKE_CLI_HANG",
   "FAKE_CLI_LOG",
   "FAKE_CLI_LIST",
   "FAKE_CLI_CHECK",
@@ -86,6 +88,8 @@ beforeEach(async () => {
   process.env.OPENCODE_PLUGIN_HUB_REGISTRY = "http://plugin-hub.test"
   process.env.FAKE_CLI_LOG = join(temp, "cli.log")
   delete process.env.FAKE_CLI_MODE
+  delete process.env.FAKE_CLI_FAIL
+  delete process.env.FAKE_CLI_HANG
   delete process.env.FAKE_CLI_UPDATE_TO
   delete process.env.OPENCODE_PLUGIN_HUB_CLI_TIMEOUT_MS
   process.env.FAKE_CLI_LIST = listOutput([])
@@ -142,22 +146,26 @@ test("4. 已配置的插件不会重复写入，也不会再跑一次安装", as
   assert.deepEqual(await readPlugins(), ["opencode-notify"])
 })
 
-test("5. 换版本先移除旧条目再安装新版本，不留两条同名条目", async () => {
+test("5. 换版本不删除旧条目：先在隔离配置里准备好新版本，再一次性改写配置", async () => {
   await writeConfig(["opencode-notify@1.0.0", "other-plugin"])
   const result = await admin.install("opencode-notify", "1.2.0")
   assert.equal(result.ok, true, result.message)
-  assert.deepEqual(packageCalls(), ["plugin remove opencode-notify@1.0.0", "plugin add opencode-notify@1.2.0"])
-  assert.deepEqual(await readPlugins(), ["other-plugin", "opencode-notify@1.2.0"])
+  // 只有一次 add，而且没有 remove：旧条目在切换前从未被删掉。
+  assert.deepEqual(packageCalls(), ["plugin add opencode-notify@1.2.0"])
+  assert.deepEqual(await readPlugins(), ["opencode-notify@1.2.0", "other-plugin"])
+  assert.equal(result.stages?.command, "succeeded")
+  assert.equal(result.stages?.config, "updated")
 })
 
-test("6. 换版本失败时把旧条目装回去，并说明恢复结果", async () => {
+test("6. 换版本失败时旧条目原样保留，不出现“先删后补”", async () => {
   await writeConfig(["opencode-notify@1.0.0"])
-  process.env.FAKE_CLI_MODE = "fail"
+  process.env.FAKE_CLI_FAIL = "add"
   const result = await admin.install("opencode-notify", "9.9.9")
   assert.equal(result.ok, false)
-  // fail 模式对 add/remove 都报错：移除失败即中止，不允许继续把配置改坏。
-  assert.deepEqual(await readPlugins(), ["opencode-notify@1.0.0"])
-  assert.match(result.message, /失败/)
+  assert.deepEqual(packageCalls(), ["plugin add opencode-notify@9.9.9"], "没有 remove，也没有第二次 add")
+  assert.deepEqual(await readPlugins(), ["opencode-notify@1.0.0"], "旧条目没有被碰过")
+  assert.equal(result.stages?.config, "unchanged")
+  assert.match(result.message, /仍在配置里/)
 })
 
 test("7. 本地目录条目拒绝被 npm 安装覆盖，也不调用 CLI", async () => {

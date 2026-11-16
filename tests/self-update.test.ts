@@ -24,7 +24,10 @@ const ENV_KEYS = [
   "OPENCODE_PLUGIN_HUB_REGISTRY",
   "FAKE_CLI_LOG",
   "FAKE_CLI_LIST",
+  "FAKE_CLI_CHECK",
   "FAKE_CLI_UPDATE_TO",
+  "FAKE_CLI_FAIL",
+  "OPENCODE_PLUGIN_HUB_SELF_TIMEOUT_MS",
 ] as const
 const ORIGINAL_ENV: Record<string, string | undefined> = Object.fromEntries(
   ENV_KEYS.map((key) => [key, process.env[key]]),
@@ -67,6 +70,9 @@ beforeEach(async () => {
   process.env.FAKE_CLI_LOG = join(temp, "cli.log")
   process.env.FAKE_CLI_LIST = listOutput([])
   delete process.env.FAKE_CLI_UPDATE_TO
+  delete process.env.FAKE_CLI_CHECK
+  delete process.env.FAKE_CLI_FAIL
+  delete process.env.OPENCODE_PLUGIN_HUB_SELF_TIMEOUT_MS
   globalThis.fetch = (async () => new Response("", { status: 404 })) as typeof fetch
   await writeConfig([])
   admin.useCli([process.execPath, FIXTURE])
@@ -111,14 +117,17 @@ test("3. 安装插件中心自身触发 selfUpdated", async () => {
   assert.deepEqual(await readPlugins(), [`opencode-plugin-hub@${LATER_VERSION}`])
 })
 
-test("4. 更新插件中心自身也触发 selfUpdated", async () => {
+test("4. 更新插件中心自身走自升级流程：目标版本取自官方检查，且不改用 plugin update", async () => {
   await writeConfig([`opencode-plugin-hub@${SELF_VERSION}`])
-  process.env.FAKE_CLI_UPDATE_TO = LATER_VERSION
-  process.env.FAKE_CLI_LIST = listOutput([`plugin-hub  ${SELF_VERSION}  opencode-plugin-hub@${SELF_VERSION}`])
+  process.env.FAKE_CLI_CHECK = `Server\n  plugin-hub ${SELF_VERSION} \u2192 ${LATER_VERSION}\n`
+  process.env.FAKE_CLI_LIST = listOutput([`plugin-hub  ${LATER_VERSION}  opencode-plugin-hub@${LATER_VERSION}`])
   const result = await admin.update(`opencode-plugin-hub@${SELF_VERSION}`)
   assert.equal(result.ok, true, result.message)
   assert.equal(result.selfUpdated, true)
-  assert.deepEqual(await readPlugins(), [`opencode-plugin-hub@${LATER_VERSION}`])
+  assert.deepEqual(await readPlugins(), [`opencode-plugin-hub@${LATER_VERSION}`], "配置指向目标版本")
+  // 自升级不走 plugin update：那条路径会直接重写配置，跳过准备与校验。
+  assert.deepEqual(calls().filter((line) => line.startsWith("plugin update")), [], "不该调用 plugin update")
+  assert.equal(result.stages?.runtime, "loaded", "宿主报告新版本加载后才算成功")
 })
 
 test("5. 插件中心自身不能被移除", async () => {

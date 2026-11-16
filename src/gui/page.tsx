@@ -11,6 +11,9 @@ type CatalogEntry = Awaited<ReturnType<AdminClient["browse"]>>["entries"][number
 type CatalogResult = Awaited<ReturnType<AdminClient["browse"]>>
 type UpdateInfo = Awaited<ReturnType<AdminClient["updates"]>>["items"][number]
 type PackageDetail = Awaited<ReturnType<AdminClient["detail"]>>
+type MutationResult = Awaited<ReturnType<AdminClient["install"]>>
+/** 每个阶段各说一句话：命令、配置、运行时、回滚。少一段就可能把「命令成功」说成「已生效」。 */
+type MutationStages = NonNullable<MutationResult["stages"]>
 type RuntimeInfo = Awaited<ReturnType<AdminClient["runtime"]>>["items"][number]
 type DiscoveredPlugin = NonNullable<Awaited<ReturnType<AdminClient["runtime"]>>["discovered"]>[number]
 
@@ -1129,7 +1132,15 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
       next.delete(key)
       return next
     })
-  const track = async <T,>(key: string, task: () => Promise<T>): Promise<T> => {
+  /**
+   * 同一个键只允许一个操作在跑：生命周期操作已经由后端加了锁，这里再加一道，
+   * 是为了不让「连点两下」把两个请求都发出去、让第二个白等一次失败。
+   */
+  const track = async <T,>(key: string, task: () => Promise<T>): Promise<T | undefined> => {
+    if (isBusy(key)) {
+      notify(`${key.replace(/^install:/, "")} 上一个操作还没结束，请稍等`, "warning")
+      return undefined
+    }
     begin(key)
     try {
       return await task()
@@ -1253,9 +1264,42 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
     }, 450)
   }
 
-  /** 操作结果 = CLI 说的话 + 配置/运行时的复核结论，两件事分开写清楚。 */
-  const describeMutation = (result: { message: string; verification?: string }) =>
-    result.verification ? `${result.message}（${result.verification}）` : result.message
+  /**
+   * 操作结果分两段写：服务端那句话（它已经按阶段措辞），加一句界面自己的判定。
+   * 语气由阶段决定，而不是只看 ok：配置改了但运行时没确认，是警告不是成功。
+   */
+  const stageTail = (stages: MutationStages) => {
+    const parts: string[] = []
+    if (stages.config === "updated" && stages.runtime === "unknown") parts.push("配置已切换，运行时未确认")
+    else if (stages.config === "updated" && stages.runtime === "loaded") parts.push("配置与运行时均已确认")
+    else if (stages.config === "updated") parts.push("配置已切换")
+    else if (stages.config === "unchanged") parts.push("配置未改动")
+    else if (stages.config === "failed") parts.push("配置写入未完成")
+    if (stages.rollback === "succeeded") parts.push("已回滚到原版本")
+    else if (stages.rollback === "failed") parts.push("回滚未成功")
+    return parts.join("；")
+  }
+
+  const describeMutation = (result: MutationResult) => {
+    const stages = result.stages
+    if (!stages) return result.verification ? `${result.message}（${result.verification}）` : result.message
+    const tail = stageTail(stages)
+    return tail ? `${result.message}（${tail}）` : result.message
+  }
+
+  /** 语气：失败且配置已变 = 警告（还有救），失败且配置没变 = 错误。自升级永远是警告。 */
+  const toneFor = (result: MutationResult, successTone: Tone = "success"): Tone => {
+    if (result.selfUpdated) return "warning"
+    if (result.ok) {
+      const runtime = result.stages?.runtime
+      return runtime === "unknown" || runtime === "unchanged" ? "warning" : successTone
+    }
+    return result.stages?.config === "updated" ? "warning" : "error"
+  }
+
+  const reportMutation = (result: MutationResult, successTone: Tone = "success") => {
+    notify(describeMutation(result), toneFor(result, successTone))
+  }
 
   const specFor = (name: string) => state()?.plugins.find((entry) => entry.name === name)?.spec ?? name
 
@@ -1263,25 +1307,21 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
     await track(`install:${name}`, async () => {
       try {
         const result = await props.admin.install({ spec: name, version })
+        // 服务端回的就是权威状态：先用它，再重新读一遍运行事实。
         setState(result.state)
-        if (!result.ok) {
-          notify(describeMutation(result), "error")
-          return
+        reportMutation(result)
+        if (!result.ok && result.stages?.config !== "updated") return
+        // 只有配置真的改了才动本地列表，失败时不能提前把目录/搜索结果改成“已安装”。
+        if (result.stages?.config === "updated") {
+          setCatalog((prev) => prev.map((entry) => (entry.pkg === name ? { ...entry, installed: true } : entry)))
+          setHits((prev) =>
+            prev.map((hit) =>
+              hit.name === name
+                ? { ...hit, installed: true, current: version || result.stages?.version || hit.current, hasUpdate: false }
+                : hit,
+            ),
+          )
         }
-        if (result.selfUpdated) {
-          // The config now names the new version, but this window (and the background
-          // service) still run the previous bundle. Say exactly that and leave loading to
-          // OpenCode's own mechanism — the hub never restarts the host.
-          notify(`${describeMutation(result)}。新版本已写入配置，当前窗口仍运行旧构建；OpenCode 重新加载后生效。`, "warning")
-        } else {
-          notify(describeMutation(result), "success")
-        }
-        setCatalog((prev) => prev.map((entry) => (entry.pkg === name ? { ...entry, installed: true } : entry)))
-        setHits((prev) =>
-          prev.map((hit) =>
-            hit.name === name ? { ...hit, installed: true, current: version || hit.current, hasUpdate: false } : hit,
-          ),
-        )
         // 配置变了：之前的运行事实与检查结果都已过期，全部重新读取。
         await Promise.all([loadRuntime(), checkUpdates(true)])
       } catch (error) {
@@ -1296,8 +1336,8 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
       try {
         const result = await props.admin.update({ spec, version: "" })
         setState(result.state)
-        notify(describeMutation(result), result.ok ? "success" : "error")
-        if (!result.ok) return
+        reportMutation(result)
+        if (!result.ok && result.stages?.config !== "updated") return
         await Promise.all([loadRuntime(), checkUpdates(true)])
       } catch (error) {
         notify(readableError(error), "error")
@@ -1310,7 +1350,8 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
       try {
         const result = await props.admin.pause({ spec: entry.spec, version: "" })
         setState(result.state)
-        notify(describeMutation(result), result.ok ? "info" : "error")
+        // 暂停是“中性”成功：规则写进去了，但宿主仍可能在跑它，所以用 info 而不是 success。
+        reportMutation(result, "info")
         if (!result.ok) return
         await loadRuntime()
       } catch (error) {
@@ -1324,7 +1365,7 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
       try {
         const result = await props.admin.resume({ spec: entry.spec, version: "" })
         setState(result.state)
-        notify(describeMutation(result), result.ok ? "success" : "error")
+        reportMutation(result)
         if (!result.ok) return
         await loadRuntime()
       } catch (error) {
@@ -1348,11 +1389,8 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
       try {
         const result = await props.admin.remove({ spec: entry.spec, version: "" })
         setState(result.state)
-        if (!result.ok) {
-          notify(result.message, "error")
-          return
-        }
-        notify(result.message, "success")
+        reportMutation(result)
+        if (!result.ok) return
         setCatalog((prev) =>
           prev.map((item) => (item.pkg === entry.name ? { ...item, installed: false } : item)),
         )
@@ -1870,7 +1908,11 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
       if (status === "failed") return runtimeInfo()?.error || "宿主报告加载失败"
       if (status === "paused") {
         const rule = runtimeInfo()?.rule
-        return rule ? `配置规则 ${rule} 禁用了它；插件未被卸载，移除该规则即可恢复` : "配置规则禁用了它"
+        if (!rule) return "配置规则禁用了它"
+        // 精确规则只针对这一个插件；通配规则是用户写来覆盖一批插件的，恢复方式不一样。
+        return runtimeInfo()?.pausedBy === "wildcard"
+          ? `通配规则 ${rule} 覆盖了它（可能同时禁用其他插件）；插件未被卸载，恢复会在末尾追加一条启用规则，通配规则本身不动`
+          : `精确规则 ${rule} 禁用了它；插件未被卸载，移除这条规则即可恢复`
       }
       if (status === "control") return "配置里的禁用/通配规则，不是已安装的插件包"
       if (status === "rule") return "插件中心追加的启用规则（裸 ID），不是插件包"

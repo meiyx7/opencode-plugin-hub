@@ -87,6 +87,13 @@ export function summarize(stdout: string, stderr: string): string {
 export interface RunOptions {
   /** Hard deadline; on expiry the child is terminated and the result says so. */
   timeoutMs?: number
+  /**
+   * Extra environment on top of the current one. Used to point one command at a throwaway
+   * `XDG_CONFIG_HOME` so it can install a package without touching the real configuration.
+   */
+  env?: Record<string, string>
+  /** Working directory; the CLI also reads a project config, so a scratch cwd keeps it out. */
+  cwd?: string
 }
 
 const OUTPUT_LIMIT = 64 * 1024
@@ -140,7 +147,11 @@ export function runCli(args: readonly string[], options: RunOptions = {}): Promi
 
     let child: ReturnType<typeof spawn>
     try {
-      child = spawn(bin!, argv, { stdio: ["ignore", "pipe", "pipe"] })
+      child = spawn(bin!, argv, {
+        stdio: ["ignore", "pipe", "pipe"],
+        env: options.env ? { ...process.env, ...options.env } : process.env,
+        cwd: options.cwd,
+      })
     } catch (error) {
       resolve({
         ok: false,
@@ -255,6 +266,24 @@ function deadline(defaultMs: number): number {
 
 export async function pluginAdd(target: string): Promise<CliOutcome> {
   return classify(await runCli(["plugin", "add", target], { timeoutMs: deadline(ADD_TIMEOUT) }))
+}
+
+/**
+ * `plugin add` pointed at a throwaway config directory.
+ *
+ * Verified against opencode 2.0.27: the package is unpacked into the shared `XDG_CACHE_HOME`
+ * cache while the `plugins` entry is written to whatever `XDG_CONFIG_HOME` names. That makes it
+ * a pure "prepare the package" step — the real configuration is not touched, so a failure here
+ * cannot cost the user their working version.
+ */
+export async function pluginAddIsolated(target: string, configHome: string, cwd: string): Promise<CliOutcome> {
+  return classify(
+    await runCli(["plugin", "add", target], {
+      timeoutMs: deadline(ADD_TIMEOUT),
+      env: { XDG_CONFIG_HOME: configHome },
+      cwd,
+    }),
+  )
 }
 
 export async function pluginRemove(target: string): Promise<CliOutcome> {

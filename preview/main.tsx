@@ -338,11 +338,37 @@ const ctx = {
     },
     openUrl: async (input: { url: string }) => { window.open(input.url, "_blank"); return { ok: true } },
     openConfig: async () => ({ ok: true }),
-    install: async () => ({ ok: false, message: "预览模式不执行安装", state: fakeState }),
-    update: async () => ({ ok: false, message: "预览模式不执行更新", state: fakeState }),
-    remove: async () => ({ ok: false, message: "预览模式不执行移除", state: fakeState }),
-    pause: async () => ({ ok: false, message: "预览模式不写配置规则", state: fakeState }),
-    resume: async () => ({ ok: false, message: "预览模式不写配置规则", state: fakeState }),
+    // 预览不执行真实操作，但把「分阶段结果」的形态演示出来：配置没动 = 错误语气。
+    install: async () => ({
+      ok: false,
+      message: "预览模式不执行安装",
+      state: fakeState,
+      stages: { command: "skipped", config: "unchanged", runtime: "skipped" },
+    }),
+    update: async () => ({
+      ok: false,
+      message: "预览模式不执行更新",
+      state: fakeState,
+      stages: { command: "skipped", config: "unchanged", runtime: "skipped" },
+    }),
+    remove: async () => ({
+      ok: false,
+      message: "预览模式不执行移除",
+      state: fakeState,
+      stages: { command: "skipped", config: "unchanged", runtime: "skipped" },
+    }),
+    pause: async () => ({
+      ok: false,
+      message: "预览模式不写配置规则",
+      state: fakeState,
+      stages: { command: "skipped", config: "unchanged", runtime: "skipped" },
+    }),
+    resume: async () => ({
+      ok: false,
+      message: "预览模式不写配置规则",
+      state: fakeState,
+      stages: { command: "skipped", config: "unchanged", runtime: "skipped" },
+    }),
     reload: async () => ({ ok: true, message: "预览模式", state: fakeState }),
     // 预览里展示运行状态徽章：一条已加载、一条未知，用于核对 UI 呈现。
     runtime: async () => ({
@@ -360,6 +386,7 @@ const ctx = {
           available: true,
           paused,
           rule: paused ? "-opencode-timeline-gui" : "",
+          pausedBy: paused ? "exact" : "",
           rules: paused ? ["-opencode-timeline-gui"] : [],
         }
       }),

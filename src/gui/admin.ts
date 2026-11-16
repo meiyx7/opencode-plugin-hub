@@ -1,8 +1,7 @@
 import { spawn } from "node:child_process"
-import { homedir } from "node:os"
+import { access, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises"
+import { homedir, tmpdir } from "node:os"
 import { isAbsolute, join, resolve } from "node:path"
-import { mkdir, readFile, readdir, rename, rm, writeFile } from "node:fs/promises"
-import { applyEdits, modify, parse, type ParseError } from "jsonc-parser"
 import { downloadsFor, registryFetch, type Downloads } from "./registry"
 import {
   classify,
@@ -10,6 +9,7 @@ import {
   configureCli,
   hasCli,
   pluginAdd,
+  pluginAddIsolated,
   pluginCheck,
   pluginList,
   pluginReload,
@@ -19,11 +19,23 @@ import {
   type CliOutcome,
   type CliResult,
 } from "./cli"
+import {
+  atomicWrite,
+  configDir,
+  describe,
+  editConfig,
+  entryBySpec,
+  readConfig,
+  type ConfigEntry,
+  type ConfigFile,
+  type Edit,
+} from "./config"
 import { isPathSource, packageNameOf, parsePluginCheck, parsePluginList, type CheckRow, type PluginListRow } from "./official-parse"
 import { disableRule, enableRule, evaluateRules, exactRulesFor, isControlSpec, parseControl } from "./rules"
 import { forgetRule, lookupId, readStore, rememberId, rememberRule } from "./store"
 
 export { isControlSpec } from "./rules"
+export { configDir } from "./config"
 
 export interface InstalledEntryValue {
   spec: string
@@ -174,6 +186,8 @@ export interface MutationValue {
   selfUpdated?: boolean
   /** What the config, the CLI and the runtime each said after the operation. */
   verification?: string
+  /** 每个阶段各自的结论，前端据此判断"命令成功但还没加载"这类情况。 */
+  stages?: MutationStages
 }
 
 const SELF_PACKAGE = "opencode-plugin-hub"
@@ -186,84 +200,9 @@ export function useCli(argv: readonly string[] | undefined): void {
   configureCli(argv)
 }
 
-function configDir() {
-  const xdg = process.env.XDG_CONFIG_HOME
-  return xdg ? join(xdg, "opencode") : join(homedir(), ".config", "opencode")
-}
-
 function cacheDir() {
   const xdg = process.env.XDG_CACHE_HOME
   return xdg ? join(xdg, "opencode", "npm") : join(homedir(), ".cache", "opencode", "npm")
-}
-
-/** One entry of the `plugins` array, keeping its position so edits hit the right element. */
-interface ConfigEntry {
-  /** Position in the raw array; edits and removals are addressed by this. */
-  index: number
-  /** The configured spec: the string itself, or an object's `package`. */
-  spec: string
-  /** True when the entry is `{package, options}` — replacing it must keep the options. */
-  options: boolean
-  raw: unknown
-}
-
-interface ConfigFile {
-  path: string
-  text: string
-  key: string
-  /** The array exactly as written, including entries this build does not manage. */
-  raw: unknown[]
-  entries: ConfigEntry[]
-}
-
-/**
- * Reads the entries the hub understands while keeping everything else on disk untouched.
- * Unknown shapes (an object without `package`, a number) are preserved but not managed.
- */
-function normalize(raw: unknown[]): ConfigEntry[] {
-  const entries: ConfigEntry[] = []
-  for (const [index, value] of raw.entries()) {
-    if (typeof value === "string") {
-      entries.push({ index, spec: value, options: false, raw: value })
-      continue
-    }
-    if (value && typeof value === "object") {
-      const pkg = (value as { package?: unknown }).package
-      if (typeof pkg === "string" && pkg.trim().length > 0) {
-        entries.push({ index, spec: pkg, options: true, raw: value })
-      }
-    }
-  }
-  return entries
-}
-
-async function readConfig(): Promise<ConfigFile> {
-  const dir = configDir()
-  // Same order the official CLI uses: opencode.json first, then opencode.jsonc. Reading a
-  // different file than the CLI writes would make every "re-read after the command" a lie.
-  const candidates = [join(dir, "opencode.json"), join(dir, "opencode.jsonc")]
-  let fallback: ConfigFile | undefined
-  for (const path of candidates) {
-    let text: string
-    try {
-      text = await readFile(path, "utf8")
-    } catch {
-      continue
-    }
-    const errors: ParseError[] = []
-    const doc = parse(text, errors, { allowTrailingComma: true, disallowComments: false }) as
-      | Record<string, unknown>
-      | undefined
-    const record = doc && typeof doc === "object" ? doc : {}
-    const key = Array.isArray(record.plugins) ? "plugins" : Array.isArray(record.plugin) ? "plugin" : "plugins"
-    const list = Array.isArray(record[key]) ? (record[key] as unknown[]) : []
-    const file: ConfigFile = { path, text, key, raw: list, entries: normalize(list) }
-    if (file.entries.length > 0) return file
-    if (!fallback) fallback = file
-  }
-  if (fallback) return fallback
-  // Nothing on disk yet: create the JSON config next to whatever exists.
-  return { path: join(dir, "opencode.json"), text: "{}\n", key: "plugins", raw: [], entries: [] }
 }
 
 /** A registry package name: optional `@scope/`, then letters, digits, `-`, `_`, `.` — but no path traversal. */
@@ -303,6 +242,11 @@ interface Manifest {
   homepage?: string
   repository?: string | { url?: string; directory?: string }
   license?: string | { type?: string }
+  /** Entry declarations, used to check that the prepared package can actually be loaded. */
+  main?: string
+  module?: string
+  exports?: unknown
+  type?: string
 }
 
 /** The package.json of a directory plugin: the only place its real name and version live. */
@@ -322,29 +266,38 @@ async function readManifest(dir: string): Promise<Manifest | undefined> {
  * This is the only place an installed plugin's own summary lives. Going to the registry instead
  * makes the installed cards depend on the network: when the registry is unreachable the manifest
  * lookup fails and every card loses its description, even though the package is sitting on disk.
+ *
+ * The same lookup doubles as the "did the package actually materialise?" check after an install:
+ * `plugin add` exiting 0 is not proof that the tarball landed, but a readable manifest is.
  */
-async function readInstalledManifest(name: string, range: string): Promise<Manifest | undefined> {
+async function locatePackage(name: string, range: string): Promise<{ dir: string; manifest: Manifest } | undefined> {
   const wanted = range && range !== "latest" ? range : "latest"
   const roots = Array.from(new Set([`${name}@${wanted}`, `${name}@latest`]))
   for (const root of roots) {
-    const dir = join(cacheDir(), root)
+    const rootDir = join(cacheDir(), root)
     let stamps: string[]
     try {
-      stamps = await readdir(dir)
+      stamps = await readdir(rootDir)
     } catch {
       continue
     }
+    // Newest unpack first: a reinstalled version leaves the previous stamp behind.
     for (const stamp of stamps.reverse()) {
+      const dir = join(rootDir, stamp, "node_modules", name)
       try {
-        const raw = await readFile(join(dir, stamp, "node_modules", name, "package.json"), "utf8")
+        const raw = await readFile(join(dir, "package.json"), "utf8")
         const json = JSON.parse(raw) as Manifest
-        if (typeof json === "object" && json !== null && json.version) return json
+        if (typeof json === "object" && json !== null && json.version) return { dir, manifest: json }
       } catch {
         // try the next cached install
       }
     }
   }
   return undefined
+}
+
+async function readInstalledManifest(name: string, range: string): Promise<Manifest | undefined> {
+  return (await locatePackage(name, range))?.manifest
 }
 
 /** A version range is not a version: only a bare `x.y.z` can be compared. */
@@ -518,6 +471,11 @@ async function resolveAll(file: ConfigFile): Promise<ResolvedEntry[]> {
 export async function snapshot(): Promise<HubStateValue> {
   try {
     const file = await readConfig()
+    // A file that does not parse is reported as an error, never as "no plugins installed":
+    // the UI has to be able to tell "empty" from "broken", and so does the user.
+    if (file.parseError) {
+      return { configPath: file.path, configKey: file.key, plugins: [], error: file.parseError }
+    }
     const resolved = await resolveAll(file)
     const plugins: InstalledEntryValue[] = resolved.map((entry) => ({
       spec: entry.spec,
@@ -567,6 +525,12 @@ export interface RuntimeInfoValue {
   paused: boolean
   /** The rule that decides the disabled/enabled verdict, as written in the config. */
   rule: string
+  /**
+   * Which kind of rule decided it: `exact` is a `-<id>` line naming this plugin, `wildcard` is a
+   * `-*` / `-prefix.*` rule that happens to cover it. The UI has to say which, because removing a
+   * wildcard is a different (and much bigger) promise than removing one exact line.
+   */
+  pausedBy: "exact" | "wildcard" | ""
   /** Every rule that mentions this plugin, in config order. */
   rules: string[]
 }
@@ -644,6 +608,9 @@ export async function runtime(
   endpoint: { url: string; headers: Readonly<Record<string, string>> } | undefined,
 ): Promise<RuntimeResultValue> {
   const file = await readConfig()
+  if (file.parseError) {
+    return { items: [], discovered: [], error: `配置文件无法解析：${file.parseError}` }
+  }
   const resolved = await resolveAll(file)
 
   const list = await readRuntimeRows(resolved.length > 0)
@@ -672,7 +639,18 @@ export async function runtime(
   for (const entry of resolved) {
     const base = { spec: entry.spec, name: entry.name }
     if (entry.kind === "control" || entry.kind === "enable-rule") {
-      items.push({ ...base, id: "", status: "control", runtimeVersion: "", error: "", available: true, paused: false, rule: entry.spec, rules: [] })
+      items.push({
+        ...base,
+        id: "",
+        status: "control",
+        runtimeVersion: "",
+        error: "",
+        available: true,
+        paused: false,
+        rule: entry.spec,
+        pausedBy: "",
+        rules: [],
+      })
       continue
     }
     const key = rowKeyFor(entry)
@@ -682,13 +660,18 @@ export async function runtime(
     if (id) rememberId(key, id)
 
     // Rules are evaluated against the real ID when it is known, and against the configured name
-    // otherwise. The verdict says which rule decided it, so the UI can name it.
-    const targets = Array.from(new Set([id, entry.name].filter((value) => value.length > 0)))
-    const verdict = targets.length > 0 ? evaluateRules(file.raw, targets[0]!) : undefined
-    const paused = verdict?.disabled === true
+    // otherwise — and against every candidate, because a plugin can be disabled by a rule written
+    // with its ID while a `*` rule covers the name. Whichever decides it is reported.
+    const state = ruleState(file.raw, entry, id)
+    const paused = state.verdict.disabled
     // Only syntax-level control rules are listed as rules: a package entry that names the plugin
     // is the plugin itself, not a rule the user wrote about it.
-    const rules = (verdict?.matches ?? []).filter((rule) => isControlSpec(rule.raw)).map((rule) => rule.raw)
+    const rules = state.verdict.matches.filter((rule) => isControlSpec(rule.raw)).map((rule) => rule.raw)
+    const pausedBy: RuntimeInfoValue["pausedBy"] = !paused
+      ? ""
+      : state.verdict.rule?.scope === "exact"
+        ? "exact"
+        : "wildcard"
 
     const failure = failures.get(key)
     const loaded = sidecarLoaded.has(key) || (row !== undefined && row.id.length > 0)
@@ -705,7 +688,8 @@ export async function runtime(
       error: failure ?? "",
       available: sidecar.error === "" || list.ok,
       paused,
-      rule: paused ? verdict?.rule?.raw ?? "" : "",
+      rule: paused ? state.verdict.rule?.raw ?? "" : "",
+      pausedBy,
       rules,
     })
   }
@@ -753,6 +737,10 @@ export async function updates(): Promise<UpdatesResultValue> {
   let resolved: ResolvedEntry[]
   try {
     file = await readConfig()
+    if (file.parseError) {
+      // A broken file is an error to report, not an empty plugin list to check.
+      return { items: [], error: `配置文件无法解析：${file.parseError}`, checked: false }
+    }
     resolved = await resolveAll(file)
   } catch (error) {
     return { items: [], error: describe(error), checked: false }
@@ -863,62 +851,20 @@ export async function updates(): Promise<UpdatesResultValue> {
 }
 
 // ---------------------------------------------------------------------------
-// Config edits: one atomic, queued writer
+// Config edits: everything goes through config.ts's queued, planned writer
 // ---------------------------------------------------------------------------
 
 /**
- * Edits values in place, so the user's comments, ordering and indentation survive on every other line.
- * Paths are jsonc paths such as `["plugins", 2]`.
+ * Applies one plan and reports it as a `HubStateValue` for the UI.
  *
- * All config mutations funnel through this function while holding a module-level
- * queue: two overlapping edits (two cards, or the settings page and the dialog)
- * each re-read the file inside their turn, so neither clobbers the other.
- * Writes land via tmp-file + rename so a crash cannot leave a half-written config.
+ * The plan is evaluated inside the queue against the freshest file (see config.ts), so an
+ * external edit between the caller's read and this write cannot make us touch the wrong entry.
  */
-let configQueue: Promise<unknown> = Promise.resolve()
-function enqueue<T>(task: () => Promise<T>): Promise<T> {
-  const next = configQueue.then(task, task)
-  configQueue = next.catch(() => undefined)
-  return next
-}
-
-interface Edit {
-  path: (string | number)[]
-  value: unknown
-}
-
-/**
- * Applies one or more edits under the queue. Removals must be ordered by descending index by the
- * caller; the edits are applied to the same text, so a lower index would otherwise shift.
- */
-async function applyEditsTo(file: ConfigFile, edits: readonly Edit[]): Promise<void> {
-  const fresh = await readConfig()
-  let text = fresh.text.trim().length > 0 ? fresh.text : "{}\n"
-  const options = { formattingOptions: { insertSpaces: true, tabSize: 2, eol: "\n" } }
-  for (const edit of edits) {
-    text = applyEdits(text, modify(text, edit.path, edit.value, options))
-  }
-  await atomicWrite(fresh.path, text)
-}
-
-async function editConfig(edits: readonly Edit[]): Promise<HubStateValue> {
-  return enqueue(async () => {
-    // Re-read inside the queue: the file may have changed since the caller read it.
-    const fresh = await readConfig()
-    await applyEditsTo(fresh, edits)
-    return snapshot()
-  })
-}
-
-/** Write via a temp file in the same directory, then rename over the target (atomic on the same volume). */
-async function atomicWrite(path: string, text: string): Promise<void> {
-  const tmp = `${path}.plugin-hub-${process.pid}-${Date.now()}.tmp`
-  try {
-    await writeFile(tmp, text, "utf8")
-    await rename(tmp, path)
-  } finally {
-    await rm(tmp, { force: true }).catch(() => undefined)
-  }
+async function commit(
+  plan: (file: ConfigFile) => Edit[] | { refuse: string },
+): Promise<{ ok: boolean; error: string; state: HubStateValue }> {
+  const outcome = await editConfig(plan)
+  return { ok: outcome.ok, error: outcome.error, state: await snapshot() }
 }
 
 /** The config entry that owns `name`, matching either the raw name or a directory's package.json name. */
@@ -935,22 +881,56 @@ async function findEntry(file: ConfigFile, name: string): Promise<ResolvedEntry 
 }
 
 async function findBySpec(file: ConfigFile, spec: string): Promise<ResolvedEntry | undefined> {
-  const wanted = spec.trim()
-  const entry = file.entries.find((item) => item.spec.trim() === wanted)
+  const entry = entryBySpec(file, spec)
   return entry ? resolveEntry(entry) : undefined
 }
 
 // ---------------------------------------------------------------------------
-// Mutations that go through the official CLI
+// Mutations: one stage at a time, each stage reported separately
 // ---------------------------------------------------------------------------
+
+/**
+ * Every mutation reports four independent answers instead of one `ok`:
+ *
+ * | 阶段 | 取值 | 含义 |
+ * |---|---|---|
+ * | `command` | succeeded / failed / skipped | 官方 CLI 那条命令本身 |
+ * | `config`  | updated / unchanged / failed   | 配置有没有被改成预期样子 |
+ * | `runtime` | loaded / failed / unknown / unchanged / skipped | 宿主是否确认加载 |
+ * | `rollback`| none / succeeded / failed      | 失败后有没有回到旧状态 |
+ *
+ * 「命令成功」和「插件已经在跑」是两件事，压缩成一个布尔值会让界面只能猜。
+ */
+export type CommandStage = "succeeded" | "failed" | "skipped"
+export type ConfigStage = "updated" | "unchanged" | "failed"
+export type RuntimeStage = "loaded" | "failed" | "unknown" | "unchanged" | "skipped"
+export type RollbackStage = "none" | "succeeded" | "failed"
+
+export interface MutationStages {
+  command: CommandStage
+  config: ConfigStage
+  runtime: RuntimeStage
+  rollback?: RollbackStage
+  /** The version the config ended up naming, empty when it does not name one. */
+  version?: string
+}
 
 function outputDetail(outcome: CliOutcome): string {
   const text = outcome.result.message
   return text ? `（CLI：${text}）` : ""
 }
 
+type Endpoint = { url: string; headers: Readonly<Record<string, string>> } | undefined
+
+interface Verification {
+  state: HubStateValue
+  note: string
+  /** Runtime rows, so a caller can check one plugin instead of re-asking. */
+  live: RuntimeResultValue
+}
+
 /** Re-reads config and runtime after a command, and says what each of them now reports. */
-async function verify(endpoint?: { url: string; headers: Readonly<Record<string, string>> }): Promise<{ state: HubStateValue; note: string }> {
+async function verify(endpoint?: Endpoint): Promise<Verification> {
   const state = await snapshot()
   const live = await runtime(endpoint)
   const loaded = live.items.filter((item) => item.status === "loaded").length
@@ -960,100 +940,629 @@ async function verify(endpoint?: { url: string; headers: Readonly<Record<string,
   if (paused > 0) parts.push(`已暂停 ${paused} 个`)
   if (failed > 0) parts.push(`加载失败 ${failed} 个`)
   if (live.error) parts.push(live.error)
-  return { state, note: parts.join(" · ") }
+  return { state, note: parts.join(" · "), live }
+}
+
+/** The runtime row for one config entry, if the host reports it. */
+function runtimeRow(verified: Verification, spec: string): RuntimeInfoValue | undefined {
+  return verified.live.items.find((item) => item.spec === spec)
 }
 
 export interface MutationOptions {
-  endpoint?: { url: string; headers: Readonly<Record<string, string>> }
+  endpoint?: Endpoint
+}
+
+// ---------------------------------------------------------------------------
+// One lifecycle operation per plugin at a time
+// ---------------------------------------------------------------------------
+
+/**
+ * Lifecycle operations for the same plugin must not interleave: two clicks on 暂停 would append
+ * two identical rules, and a 更新 racing a 移除 could re-add what the user just removed.
+ *
+ * The queue in config.ts already serialises the *writes*; this serialises the whole operation,
+ * which also spans CLI calls and runtime polling.
+ */
+const inflight = new Set<string>()
+
+class BusyError extends Error {
+  constructor(readonly key: string) {
+    super(`${key} 上还有一个操作没有结束`)
+  }
+}
+
+async function withLock<T>(key: string, task: () => Promise<T>): Promise<T> {
+  if (inflight.has(key)) throw new BusyError(key)
+  inflight.add(key)
+  try {
+    return await task()
+  } finally {
+    inflight.delete(key)
+  }
+}
+
+function busyResult(state: HubStateValue, key: string): MutationValue {
+  return {
+    ok: false,
+    message: `${key} 上还有一个操作没有结束，本次请求已忽略（等它结束后再点一次）`,
+    state,
+    stages: { command: "skipped", config: "unchanged", runtime: "skipped" },
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Prepare a package without touching the real configuration
+// ---------------------------------------------------------------------------
+
+/**
+ * What `plugin add` did in the throwaway config directory.
+ *
+ * Verified against opencode 2.0.27: the tarball is unpacked into the shared cache while the
+ * `plugins` entry lands in whatever `XDG_CONFIG_HOME` points at. Running the command that way
+ * therefore answers "can this version be installed and does its entry file exist?" without
+ * being able to break the user's current configuration — which is the whole point of the
+ * prepare step.
+ */
+interface Prepared {
+  ok: boolean
+  /** The spec that is now materialised in the shared cache, e.g. `pkg@1.2.0`. */
+  target: string
+  version: string
+  command: CommandStage
+  /** Why it failed, or extra detail worth telling the user. */
+  message: string
+}
+
+function entryFiles(manifest: Manifest): string[] {
+  const out: string[] = []
+  const push = (value: unknown): void => {
+    if (typeof value === "string" && value.trim().length > 0) out.push(value.trim())
+  }
+  push(manifest.main)
+  push(manifest.module)
+  const exported = manifest.exports
+  if (typeof exported === "string") push(exported)
+  else if (exported && typeof exported === "object") {
+    const record = exported as Record<string, unknown>
+    const entry = record["."] ?? record
+    if (typeof entry === "string") push(entry)
+    else if (entry && typeof entry === "object") {
+      const conditions = entry as Record<string, unknown>
+      for (const key of ["import", "node", "require", "default", "browser"]) push(conditions[key])
+    }
+  }
+  return Array.from(new Set(out))
 }
 
 /**
- * Installs or re-versions an npm plugin through `opencode plugin add`.
+ * Does the prepared package point at a file that actually exists?
  *
- * The command is the only thing that may touch the package; the hub never copies files or writes
- * an install cache of its own. A directory entry is refused here on purpose: rewriting files in a
- * user's working tree is not something an install button should do (see README).
+ * `plugin add` does **not** validate this (verified: adding `left-pad` succeeds and writes the
+ * config), so a missing entry file is only ever found at load time — too late for a self-update.
+ * `undeclared` is not treated as a failure: plenty of plugins resolve through `exports` shapes
+ * this check does not model, and refusing those would be worse than letting the runtime decide.
  */
-export async function install(spec: string, version: string, options: MutationOptions = {}): Promise<MutationValue> {
+async function checkEntrypoint(
+  dir: string,
+  manifest: Manifest,
+): Promise<{ status: "ok" | "missing" | "undeclared"; file: string }> {
+  const candidates = entryFiles(manifest)
+  if (candidates.length === 0) return { status: "undeclared", file: "" }
+  for (const candidate of candidates) {
+    const base = join(dir, candidate)
+    for (const attempt of [base, `${base}.js`, `${base}.mjs`, `${base}.cjs`, join(base, "index.js")]) {
+      try {
+        await access(attempt)
+        return { status: "ok", file: attempt }
+      } catch {
+        // keep trying the declared shapes
+      }
+    }
+  }
+  return { status: "missing", file: candidates[0] ?? "" }
+}
+
+/** Environment a throwaway install runs in: its own config dir, its own cwd, shared package cache. */
+async function scratchEnv(): Promise<{ root: string; configHome: string; cwd: string }> {
+  const root = await mkdtemp(join(tmpdir(), "opencode-plugin-hub-prepare-"))
+  const configHome = join(root, "config")
+  const cwd = join(root, "work")
+  await mkdir(join(configHome, "opencode"), { recursive: true })
+  await mkdir(cwd, { recursive: true })
+  await writeFile(join(configHome, "opencode", "opencode.json"), '{"plugins":[]}\n', "utf8")
+  return { root, configHome, cwd }
+}
+
+async function scratchListed(configHome: string): Promise<string[]> {
   try {
-    const file = await readConfig()
-    const parsed = splitSpec(spec)
-    if (parsed.kind !== "package" || !isPackageName(parsed.name)) {
-      return { ok: false, message: "只能按 npm 包名安装", state: await snapshot() }
+    const raw = JSON.parse(await readFile(join(configHome, "opencode", "opencode.json"), "utf8")) as {
+      plugins?: unknown
     }
-    if (!hasCli()) {
-      return { ok: false, message: "找不到 opencode CLI，无法执行 opencode plugin add", state: await snapshot() }
-    }
-    const name = parsed.name
-    const target = version.trim() ? `${name}@${version.trim()}` : name
-    const existing = await findEntry(file, name)
-
-    if (existing?.kind === "path") {
-      return {
-        ok: false,
-        message: `${existing.spec} 是本地目录插件，由外部维护：插件中心不会下载 npm 包覆盖它。请在配置里改为 npm 包，或自行更新目录内容。`,
-        state: await snapshot(),
-      }
-    }
-    if (existing && existing.spec.trim() === target) {
-      const verified = await verify(options.endpoint)
-      return {
-        ok: true,
-        message: `${name} 已在配置中（${existing.spec}），没有再次安装`,
-        state: verified.state,
-        verification: verified.note,
-      }
-    }
-
-    // A different version of an already configured package: the CLI appends instead of replacing,
-    // which would leave two entries for one package. Remove the old entry first, and put it back
-    // if the new one cannot be installed.
-    if (existing) {
-      const removed = await pluginRemove(existing.spec)
-      if (!removed.result.ok && removed.status !== "not-configured") {
-        return { ok: false, message: `换版本前移除旧条目失败${outputDetail(removed)}`, state: await snapshot() }
-      }
-      const added = await pluginAdd(target)
-      if (!added.result.ok) {
-        const restored = await pluginAdd(existing.spec)
-        const tail = restored.result.ok ? "已恢复原条目。" : `恢复原条目也失败了${outputDetail(restored)}`
-        return {
-          ok: false,
-          message: `安装 ${target} 失败${outputDetail(added)}。${tail}`,
-          state: await snapshot(),
-        }
-      }
-      const verified = await verify(options.endpoint)
-      return {
-        ok: true,
-        message: `已通过 opencode plugin add 把 ${name} 换成 ${target}（旧条目 ${existing.spec} 已移除）。配置与运行状态已重新读取。`,
-        selfUpdated: name === SELF_PACKAGE || undefined,
-        state: verified.state,
-        verification: verified.note,
-      }
-    }
-
-    const added = await pluginAdd(target)
-    if (!added.result.ok) {
-      return { ok: false, message: `安装 ${target} 失败${outputDetail(added)}`, state: await snapshot() }
-    }
-    const verified = await verify(options.endpoint)
-    const where = added.path ? `写入 ${added.path}` : "已写入配置"
-    const message =
-      added.status === "already"
-        ? `${target} 已配置，命令没有改动配置`
-        : `已通过 opencode plugin add 安装 ${target}，${where}`
-    return {
-      ok: true,
-      message,
-      selfUpdated: name === SELF_PACKAGE || undefined,
-      state: verified.state,
-      verification: verified.note,
-    }
-  } catch (error) {
-    return { ok: false, message: describe(error), state: await snapshot() }
+    return Array.isArray(raw.plugins) ? raw.plugins.filter((item): item is string => typeof item === "string") : []
+  } catch {
+    return []
   }
 }
+
+/**
+ * Installs one package@version into the shared cache, with the config write going to a temp dir.
+ *
+ * The seven things checked before the real config is allowed to change:
+ * 1. a CLI exists; 2. the command exited 0 without a failure signature; 3. it did not time out;
+ * 4. the throwaway config really lists the target; 5. the package is readable in the shared cache;
+ * 6. its manifest version is the one we asked for; 7. its declared entry file exists.
+ */
+async function preparePackage(name: string, version: string): Promise<Prepared> {
+  const target = version.trim() ? `${name}@${version.trim()}` : name
+  if (!hasCli()) {
+    return { ok: false, target, version, command: "failed", message: "找不到 opencode CLI，无法准备包" }
+  }
+  let scratch: { root: string; configHome: string; cwd: string } | undefined
+  try {
+    scratch = await scratchEnv()
+    const outcome = await pluginAddIsolated(target, scratch.configHome, scratch.cwd)
+    if (outcome.result.timedOut) {
+      return {
+        ok: false,
+        target,
+        version,
+        command: "failed",
+        message: `准备 ${target} 超时后被终止，配置没有任何改动`,
+      }
+    }
+    if (!outcome.result.ok) {
+      return {
+        ok: false,
+        target,
+        version,
+        command: "failed",
+        message: `准备 ${target} 失败${outputDetail(outcome)}`,
+      }
+    }
+    const listed = await scratchListed(scratch.configHome)
+    const wroteConfig = listed.some((item) => item === target || item === name)
+    if (!wroteConfig) {
+      return {
+        ok: false,
+        target,
+        version,
+        command: "failed",
+        message: `命令报告成功，但临时配置里没有出现 ${target}，不认为包已准备好`,
+      }
+    }
+    const located = await locatePackage(name, version.trim())
+    if (!located) {
+      return {
+        ok: false,
+        target,
+        version,
+        command: "succeeded",
+        message: `命令报告成功，但缓存里找不到 ${target} 的包文件，不认为安装完成`,
+      }
+    }
+    const wanted = literalVersion(version.trim())
+    if (wanted && located.manifest.version !== wanted) {
+      return {
+        ok: false,
+        target,
+        version,
+        command: "succeeded",
+        message: `缓存里的版本是 ${located.manifest.version ?? "未知"}，不是要安装的 ${wanted}`,
+      }
+    }
+    const entry = await checkEntrypoint(located.dir, located.manifest)
+    if (entry.status === "missing") {
+      return {
+        ok: false,
+        target,
+        version,
+        command: "succeeded",
+        message: `包已下载，但 package.json 声明的入口 ${entry.file} 不存在，切换后很可能加载失败`,
+      }
+    }
+    return {
+      ok: true,
+      target,
+      version: located.manifest.version ?? wanted,
+      command: "succeeded",
+      message: entry.status === "undeclared" ? "包已就绪（package.json 没有声明入口，加载由宿主决定）" : "包已就绪",
+    }
+  } finally {
+    if (scratch) await rm(scratch.root, { recursive: true, force: true }).catch(() => undefined)
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Config switch helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Switches one configured entry to a new spec, keeping everything about the entry that is not
+ * the spec (`options`, unknown fields) intact, and refusing when the entry moved or vanished.
+ *
+ * The plan runs against a freshly read file, so the index it edits is always the current one.
+ */
+async function switchEntry(
+  spec: string,
+  target: string,
+): Promise<{ ok: boolean; error: string; state: HubStateValue }> {
+  return commit((file) => {
+    const entry = entryBySpec(file, spec)
+    if (!entry) {
+      return {
+        refuse: `配置里的 ${spec} 在操作期间被改动了（可能被其他窗口或编辑器修改），未做任何替换`,
+      }
+    }
+    const value = entry.options
+      ? { ...(entry.raw as Record<string, unknown>), package: target }
+      : target
+    return [{ path: [file.key, entry.index], value }]
+  })
+}
+
+/** Registers a config switch as a reload request, without claiming the host acted on it. */
+async function reloadAfterEdit(): Promise<string> {
+  if (!hasCli()) return "未执行重载：找不到 opencode CLI"
+  const result = await pluginReload()
+  if (result.ok) return "已执行 opencode reload"
+  return `opencode reload 未成功（${result.message || `退出码 ${result.code}`}）`
+}
+
+// ---------------------------------------------------------------------------
+// Install / re-version
+// ---------------------------------------------------------------------------
+
+/**
+ * Installs a new plugin, or switches an already configured one to a different version.
+ *
+ * A new plugin: `opencode plugin add` is the whole job — nothing old can be lost.
+ *
+ * A version switch: **prepare first, switch second.** `plugin add pkg@new` only ever appends
+ * (verified), so the old flow of "remove the old entry, then add, then put it back on failure"
+ * could lose the entry *and* the entry's `options`. Instead the new version is installed and
+ * validated in a throwaway config directory, and only then does the real config change — by one
+ * atomic jsonc edit that rewrites the spec and leaves everything else alone.
+ */
+export async function install(spec: string, version: string, options: MutationOptions = {}): Promise<MutationValue> {
+  const parsed = splitSpec(spec)
+  if (parsed.kind !== "package" || !isPackageName(parsed.name)) {
+    return {
+      ok: false,
+      message: "只能按 npm 包名安装",
+      state: await snapshot(),
+      stages: { command: "skipped", config: "unchanged", runtime: "skipped" },
+    }
+  }
+  const name = parsed.name
+  try {
+    return await withLock(`pkg:${name}`, () => installLocked(name, version, options))
+  } catch (error) {
+    if (error instanceof BusyError) return busyResult(await snapshot(), name)
+    return {
+      ok: false,
+      message: describe(error),
+      state: await snapshot(),
+      stages: { command: "failed", config: "unchanged", runtime: "skipped" },
+    }
+  }
+}
+
+async function installLocked(name: string, version: string, options: MutationOptions): Promise<MutationValue> {
+  const file = await readConfig()
+  if (file.parseError) {
+    return {
+      ok: false,
+      message: `配置文件无法解析（${file.parseError}），为避免覆盖你的配置，没有做任何修改`,
+      state: await snapshot(),
+      stages: { command: "skipped", config: "unchanged", runtime: "skipped" },
+    }
+  }
+  if (!hasCli()) {
+    return {
+      ok: false,
+      message: "找不到 opencode CLI，无法执行 opencode plugin add",
+      state: await snapshot(),
+      stages: { command: "failed", config: "unchanged", runtime: "skipped" },
+    }
+  }
+  const target = version.trim() ? `${name}@${version.trim()}` : name
+  const existing = await findEntry(file, name)
+
+  if (existing?.kind === "path") {
+    return {
+      ok: false,
+      message: `${existing.spec} 是本地目录插件，由外部维护：插件中心不会下载 npm 包覆盖它。请在配置里改为 npm 包，或自行更新目录内容。`,
+      state: await snapshot(),
+      stages: { command: "skipped", config: "unchanged", runtime: "skipped" },
+    }
+  }
+
+  if (existing && existing.spec.trim() === target) {
+    const verified = await verify(options.endpoint)
+    const row = runtimeRow(verified, existing.spec)
+    return {
+      ok: true,
+      message: `${name} 已在配置中（${existing.spec}），没有再次安装`,
+      state: verified.state,
+      verification: verified.note,
+      stages: {
+        command: "skipped",
+        config: "unchanged",
+        runtime: row?.status === "loaded" ? "loaded" : row?.status === "failed" ? "failed" : "unknown",
+        version: existing.version,
+      },
+    }
+  }
+
+  if (existing) {
+    if (name === SELF_PACKAGE) {
+      // The hub replacing itself has its own flow: it must survive a bad switch.
+      return selfUpdate(existing, version.trim(), options)
+    }
+    const prepared = await preparePackage(name, version.trim())
+    if (!prepared.ok) {
+      return {
+        ok: false,
+        message: `${prepared.message}。旧条目 ${existing.spec} 仍在配置里，可以照常使用。`,
+        state: await snapshot(),
+        stages: { command: prepared.command, config: "unchanged", runtime: "skipped" },
+      }
+    }
+    const switched = await switchEntry(existing.spec, prepared.target)
+    if (!switched.ok) {
+      return {
+        ok: false,
+        message: `${prepared.message}，但切换配置失败：${switched.error}。旧条目 ${existing.spec} 没有被改动。`,
+        state: switched.state,
+        stages: { command: "succeeded", config: "failed", runtime: "skipped" },
+      }
+    }
+    const reloaded = await reloadAfterEdit()
+    const verified = await verify(options.endpoint)
+    const row = runtimeRow(verified, prepared.target)
+    const runtimeStage: RuntimeStage =
+      row?.status === "loaded" ? "loaded" : row?.status === "failed" ? "failed" : "unknown"
+    return {
+      ok: true,
+      message: `已把 ${name} 换到 ${prepared.target}：新版本先在隔离目录里装好并校验，然后一次性改写配置（旧条目 ${existing.spec} 从未被提前删除）。${reloaded}。`,
+      state: verified.state,
+      verification: verified.note,
+      stages: {
+        command: "succeeded",
+        config: "updated",
+        runtime: runtimeStage,
+        version: prepared.version,
+      },
+    }
+  }
+
+  const added = await pluginAdd(target)
+  if (!added.result.ok) {
+    return {
+      ok: false,
+      message: `安装 ${target} 失败${outputDetail(added)}`,
+      state: await snapshot(),
+      stages: { command: "failed", config: "unchanged", runtime: "skipped" },
+    }
+  }
+  const verified = await verify(options.endpoint)
+  const listed = verified.state.plugins.some((item) => item.spec.trim() === target || item.name === name)
+  const row = runtimeRow(verified, target)
+  const where = added.path ? `写入 ${added.path}` : "已写入配置"
+  const base =
+    added.status === "already"
+      ? `${target} 已配置，命令没有改动配置`
+      : `已通过 opencode plugin add 安装 ${target}，${where}`
+  // A first-time install of the hub itself is still a self-update from this window's point of
+  // view: the config now names a version, and the build serving this page is whatever was loaded
+  // before. Nothing old could have been lost (there was no entry), so the plain path is enough,
+  // but the warning must still be shown.
+  const self = name === SELF_PACKAGE
+  return {
+    ok: listed,
+    message: listed
+      ? self
+        ? `${base}。当前窗口仍运行旧构建，OpenCode 重新加载后才会用上新版本。`
+        : base
+      : `命令报告成功，但配置里没有出现 ${target}`,
+    state: verified.state,
+    verification: verified.note,
+    selfUpdated: self || undefined,
+    stages: {
+      command: "succeeded",
+      config: listed ? "updated" : "failed",
+      runtime: row?.status === "loaded" ? "loaded" : row?.status === "failed" ? "failed" : "unknown",
+      version: literalVersion(version.trim()),
+    },
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Self-update: the hub replacing the package that is serving this window
+// ---------------------------------------------------------------------------
+
+/**
+ * How long a self-update waits for the host to report the new build before calling it unknown.
+ * Read per call so a test (or a user) can shorten it without reloading the plugin.
+ */
+function selfLoadTimeout(): number {
+  const raw = Number(process.env.OPENCODE_PLUGIN_HUB_SELF_TIMEOUT_MS)
+  return Number.isFinite(raw) && raw > 0 ? raw : 12_000
+}
+
+const SELF_POLL_INTERVAL = 1_500
+
+interface SelfLoad {
+  status: RuntimeStage
+  /** The version the host says it has loaded, when it says anything. */
+  loaded: string
+  note: string
+}
+
+/** Polls the runtime until it names the target version, reports a failure, or the deadline passes. */
+async function waitForSelf(targetVersion: string, spec: string, endpoint?: Endpoint): Promise<SelfLoad> {
+  const deadline = Date.now() + selfLoadTimeout()
+  let last: SelfLoad = { status: "unknown", loaded: "", note: "宿主还没有报告任何版本" }
+  while (Date.now() <= deadline) {
+    const live = await runtime(endpoint)
+    const row = live.items.find((item) => item.name === SELF_PACKAGE) ?? live.items.find((item) => item.spec === spec)
+    if (row?.status === "failed") {
+      return { status: "failed", loaded: row.runtimeVersion, note: row.error || "宿主报告插件中心加载失败" }
+    }
+    if (row?.status === "loaded" && row.runtimeVersion === targetVersion) {
+      return { status: "loaded", loaded: row.runtimeVersion, note: `宿主报告已加载 ${targetVersion}` }
+    }
+    // `runtimeVersion` falls back to the config when the host says nothing, so it is only used as
+    // "what the host runs" when the status is actually loaded. Anything else is an honest unknown.
+    last = {
+      status: "unknown",
+      loaded: row?.status === "loaded" ? row.runtimeVersion : "",
+      note: live.error
+        ? `读取运行状态失败：${live.error}`
+        : row?.status === "loaded"
+          ? `宿主报告加载的是 ${row.runtimeVersion}，不是 ${targetVersion}`
+          : "宿主没有报告插件中心处于加载状态",
+    }
+    if (Date.now() + SELF_POLL_INTERVAL > deadline) break
+    await delay(SELF_POLL_INTERVAL)
+  }
+  return { status: "unknown", loaded: last.loaded, note: last.note }
+}
+
+/**
+ * Upgrades the hub itself.
+ *
+ * The failure mode this is built around: the window that shows the button is the old build, and
+ * if the new version does not load, the user loses the *manager* — not just one plugin. So:
+ *
+ * 1. prepare + validate the target version in a throwaway config (the old one keeps working);
+ * 2. switch the config with one atomic edit (a failed write leaves the old entry in place);
+ * 3. reload and poll the runtime for the new version;
+ * 4. only claim success when the host actually says it loaded the new version;
+ * 5. roll back only when the old package is still verifiably on disk.
+ *
+ * The window never restarts the host and never touches the npm cache: if the host does not
+ * pick the new build up on its own, the honest answer is "配置已切换，运行状态未确认".
+ */
+async function selfUpdate(existing: ResolvedEntry, version: string, options: MutationOptions): Promise<MutationValue> {
+  const wanted = literalVersion(version)
+  if (!wanted) {
+    return {
+      ok: false,
+      message:
+        "插件中心自升级必须给出具体版本号（例如 0.5.1）。不做「装最新」的猜测：目标版本不明确时，切换配置等于拿管理器冒险。",
+      state: await snapshot(),
+      stages: { command: "skipped", config: "unchanged", runtime: "skipped" },
+    }
+  }
+  if (existing.version === wanted) {
+    const verified = await verify(options.endpoint)
+    return {
+      ok: true,
+      message: `插件中心已经是 ${wanted}，不需要升级`,
+      state: verified.state,
+      verification: verified.note,
+      stages: { command: "skipped", config: "unchanged", runtime: "unknown", version: wanted },
+    }
+  }
+
+  const target = `${SELF_PACKAGE}@${wanted}`
+  const prepared = await preparePackage(SELF_PACKAGE, wanted)
+  if (!prepared.ok) {
+    return {
+      ok: false,
+      message: `${prepared.message}。插件中心仍以 ${existing.spec} 运行，配置没有被改动。`,
+      state: await snapshot(),
+      stages: { command: prepared.command, config: "unchanged", runtime: "skipped" },
+    }
+  }
+
+  const switched = await switchEntry(existing.spec, prepared.target)
+  if (!switched.ok) {
+    return {
+      ok: false,
+      message: `${prepared.message}，但切换配置失败：${switched.error}。插件中心仍是 ${existing.spec}。`,
+      state: switched.state,
+      stages: { command: "succeeded", config: "failed", runtime: "skipped" },
+    }
+  }
+
+  const reloaded = await reloadAfterEdit()
+  const load = await waitForSelf(wanted, target, options.endpoint)
+
+  if (load.status === "loaded") {
+    return {
+      ok: true,
+      message: `插件中心已升级到 ${wanted}：新版本先在隔离目录校验，再一次性改写配置，宿主已报告加载 ${wanted}。${reloaded}。当前窗口仍是旧构建，重新打开插件中心（或重开窗口）即可用新界面。`,
+      state: await snapshot(),
+      selfUpdated: true,
+      verification: load.note,
+      stages: { command: "succeeded", config: "updated", runtime: "loaded", version: wanted },
+    }
+  }
+
+  if (load.status === "unknown") {
+    // Config is on the new version but the host never confirmed it. Not a success, not a rollback:
+    // the old build may still be serving this window, and the next reload decides.
+    return {
+      ok: false,
+      message: `插件中心配置已切到 ${wanted}，但宿主没有确认加载（${load.note}）。这不等于升级成功：${reloaded}，宿主重新加载后才会生效；若一直不生效，把配置改回 ${existing.spec} 即可退回。`,
+      state: await snapshot(),
+      selfUpdated: true,
+      verification: load.note,
+      stages: { command: "succeeded", config: "updated", runtime: "unknown", rollback: "none", version: wanted },
+    }
+  }
+
+  // The host says the hub itself failed to load. Try to put the old version back, but only when
+  // that old version is still verifiably present — a blind switch to a package that is not on
+  // disk would leave the user with no manager at all.
+  const oldRange = splitSpec(existing.spec).range
+  const oldPkg = await locatePackage(SELF_PACKAGE, oldRange)
+  if (!oldPkg) {
+    return {
+      ok: false,
+      message: `插件中心加载失败（${load.note}）。旧版本 ${existing.spec} 的包文件已不在缓存里，自动回滚不安全，因此配置保持为 ${wanted}；请手动把配置改回 ${existing.spec} 并重新安装。`,
+      state: await snapshot(),
+      selfUpdated: true,
+      stages: { command: "succeeded", config: "updated", runtime: "failed", rollback: "failed", version: wanted },
+    }
+  }
+
+  const back = await switchEntry(prepared.target, existing.spec)
+  if (!back.ok) {
+    return {
+      ok: false,
+      message: `插件中心加载失败（${load.note}），回滚也没写成功：${back.error}。配置现在是 ${wanted}，旧包仍在缓存（${oldPkg.manifest.version ?? "版本未知"}）。`,
+      state: back.state,
+      selfUpdated: true,
+      stages: { command: "succeeded", config: "failed", runtime: "failed", rollback: "failed", version: wanted },
+    }
+  }
+  const reloadedBack = await reloadAfterEdit()
+  const restored = await waitForSelf(oldPkg.manifest.version ?? "", existing.spec, options.endpoint)
+  const rollbackOk = restored.status === "loaded"
+  return {
+    ok: false,
+    message: rollbackOk
+      ? `插件中心加载 ${wanted} 失败（${load.note}），已回滚到 ${existing.spec}，宿主确认 ${oldPkg.manifest.version} 已加载。${reloadedBack}。`
+      : `插件中心加载 ${wanted} 失败（${load.note}），配置已回滚到 ${existing.spec}，但宿主还没确认旧版本加载（${restored.note}）。${reloadedBack}。`,
+    state: await snapshot(),
+    selfUpdated: !rollbackOk,
+    verification: restored.note,
+    stages: {
+      command: "succeeded",
+      config: "updated",
+      runtime: "failed",
+      rollback: rollbackOk ? "succeeded" : "failed",
+      version: existing.version,
+    },
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Update: the official command, for plugins that are not this one
+// ---------------------------------------------------------------------------
 
 /**
  * Updates one plugin through `opencode plugin update <target>`.
@@ -1062,56 +1571,146 @@ export async function install(spec: string, version: string, options: MutationOp
  * reported instead of being replaced with a made-up "up to date".
  */
 export async function update(spec: string, options: MutationOptions = {}): Promise<MutationValue> {
+  const parsed = splitSpec(spec)
+  const key = parsed.name || spec
   try {
-    const file = await readConfig()
-    const entry = await findBySpec(file, spec)
-    if (!entry) return { ok: false, message: "配置中没有这一项", state: await snapshot() }
-    if (entry.kind === "path") {
-      return {
-        ok: false,
-        message: `${entry.spec} 是本地目录插件，官方更新流程会跳过它：目录里可能有你的改动。需要时请自行更新目录内容（插件中心不覆盖本地目录）。`,
-        state: await snapshot(),
-      }
-    }
-    if (entry.kind === "control" || entry.kind === "enable-rule") {
-      return { ok: false, message: "配置规则不是插件包，没有可更新的版本", state: await snapshot() }
-    }
-    if (!hasCli()) {
-      return { ok: false, message: "找不到 opencode CLI，无法执行 opencode plugin update", state: await snapshot() }
-    }
-    const before = entry.version
-    const outcome = await pluginUpdate(entry.spec)
-    const verified = await verify(options.endpoint)
-    // The command may rewrite the spec (`pkg` -> `pkg@1.2.0`), so match by name, not by spec.
-    const after = verified.state.plugins.find((item) => item.name === entry.name)?.version ?? before
-    if (!outcome.result.ok) {
-      return {
-        ok: false,
-        message: `更新 ${entry.name} 失败${outputDetail(outcome)}`,
-        state: verified.state,
-        verification: verified.note,
-      }
-    }
-    if (outcome.status === "no-updates") {
-      return {
-        ok: true,
-        message: `官方命令报告没有可更新的插件：本地插件与精确锁定版本会被跳过，${entry.name} 未发生变化`,
-        state: verified.state,
-        verification: verified.note,
-      }
-    }
-    const moved = after && after !== before ? (before ? `v${before} → v${after}` : `v${after}`) : "版本号未变化"
-    return {
-      ok: true,
-      message: `已执行 opencode plugin update ${entry.spec}：${moved}。配置与运行状态已重新读取${after ? "" : "，但读不到新版本号"}`,
-      selfUpdated: entry.name === SELF_PACKAGE || undefined,
-      state: verified.state,
-      verification: verified.note,
-    }
+    return await withLock(`pkg:${key}`, () => updateLocked(spec, options))
   } catch (error) {
-    return { ok: false, message: describe(error), state: await snapshot() }
+    if (error instanceof BusyError) return busyResult(await snapshot(), key)
+    return {
+      ok: false,
+      message: describe(error),
+      state: await snapshot(),
+      stages: { command: "failed", config: "unchanged", runtime: "skipped" },
+    }
   }
 }
+
+async function updateLocked(spec: string, options: MutationOptions): Promise<MutationValue> {
+  const file = await readConfig()
+  if (file.parseError) {
+    return {
+      ok: false,
+      message: `配置文件无法解析（${file.parseError}），为避免覆盖你的配置，没有执行更新`,
+      state: await snapshot(),
+      stages: { command: "skipped", config: "unchanged", runtime: "skipped" },
+    }
+  }
+  const entry = await findBySpec(file, spec)
+  if (!entry) {
+    return {
+      ok: false,
+      message: "配置中没有这一项",
+      state: await snapshot(),
+      stages: { command: "skipped", config: "unchanged", runtime: "skipped" },
+    }
+  }
+  if (entry.kind === "path") {
+    return {
+      ok: false,
+      message: `${entry.spec} 是本地目录插件，官方更新流程会跳过它：目录里可能有你的改动。需要时请自行更新目录内容（插件中心不覆盖本地目录）。`,
+      state: await snapshot(),
+      stages: { command: "skipped", config: "unchanged", runtime: "skipped" },
+    }
+  }
+  if (entry.kind === "control" || entry.kind === "enable-rule") {
+    return {
+      ok: false,
+      message: "配置规则不是插件包，没有可更新的版本",
+      state: await snapshot(),
+      stages: { command: "skipped", config: "unchanged", runtime: "skipped" },
+    }
+  }
+  if (!hasCli()) {
+    return {
+      ok: false,
+      message: "找不到 opencode CLI，无法执行 opencode plugin update",
+      state: await snapshot(),
+      stages: { command: "failed", config: "unchanged", runtime: "skipped" },
+    }
+  }
+
+  if (entry.name === SELF_PACKAGE) {
+    // The hub does not let `plugin update` touch its own config: that path rewrites the entry
+    // without the prepare/validate/verify steps a self-update needs.
+    const target = await latestForSelf(entry)
+    if (!target.version) {
+      return {
+        ok: false,
+        message: `无法从官方检查里确定插件中心的目标版本${target.note ? `（${target.note}）` : ""}。自升级需要明确版本，未做任何改动。`,
+        state: await snapshot(),
+        stages: { command: "skipped", config: "unchanged", runtime: "skipped" },
+      }
+    }
+    return selfUpdate(entry, target.version, options)
+  }
+
+  const before = entry.version
+  const outcome = await pluginUpdate(entry.spec)
+  const verified = await verify(options.endpoint)
+  if (!outcome.result.ok) {
+    // The command failed; confirm the config was not left in a worse state.
+    const stillThere = verified.state.plugins.some((item) => item.name === entry.name)
+    return {
+      ok: false,
+      message: stillThere
+        ? `更新 ${entry.name} 失败${outputDetail(outcome)}；配置里的 ${entry.spec} 仍在`
+        : `更新 ${entry.name} 失败${outputDetail(outcome)}，并且配置里的条目已经不见了，请检查 ${verified.state.configPath}`,
+      state: verified.state,
+      verification: verified.note,
+      stages: { command: "failed", config: stillThere ? "unchanged" : "failed", runtime: "unknown" },
+    }
+  }
+  // The command may rewrite the spec (`pkg` -> `pkg@1.2.0`), so match by name, not by spec.
+  const after = verified.state.plugins.find((item) => item.name === entry.name)
+  const moved = after && after.version && after.version !== before
+  if (outcome.status === "no-updates") {
+    return {
+      ok: true,
+      message: `官方命令报告没有可更新的插件：本地插件与精确锁定版本会被跳过，${entry.name} 未发生变化`,
+      state: verified.state,
+      verification: verified.note,
+      stages: {
+        command: "succeeded",
+        config: "unchanged",
+        runtime: runtimeRow(verified, entry.spec)?.status === "loaded" ? "loaded" : "unknown",
+        version: before,
+      },
+    }
+  }
+  const target = verified.state.plugins.find((item) => item.name === entry.name)?.spec ?? entry.spec
+  return {
+    ok: Boolean(after),
+    message: after
+      ? `已执行 opencode plugin update ${entry.spec}：${moved ? `v${before} → v${after.version}` : "版本号未变化"}。配置与运行状态已重新读取。`
+      : `官方命令报告成功，但配置里已经没有 ${entry.name}`,
+    state: verified.state,
+    verification: verified.note,
+    stages: {
+      command: "succeeded",
+      config: after ? "updated" : "failed",
+      runtime: runtimeRow(verified, target)?.status === "loaded" ? "loaded" : "unknown",
+      version: after?.version ?? before,
+    },
+  }
+}
+
+/** The version `opencode plugin check` wants for this plugin, or an empty version plus the reason. */
+async function latestForSelf(entry: ResolvedEntry): Promise<{ version: string; note: string }> {
+  if (!hasCli()) return { version: "", note: "找不到 opencode CLI" }
+  const check = await pluginCheck(entry.spec)
+  const rows = parsePluginCheck(`${check.stdout}\n${check.stderr}`)
+  const row = rows.find((item) => item.status === "outdated" && item.latest)
+  if (!row) {
+    const failed = rows.find((item) => item.status === "failed")
+    return { version: "", note: failed?.note || "官方检查没有报告可更新的版本" }
+  }
+  return { version: literalVersion(row.latest), note: "" }
+}
+
+// ---------------------------------------------------------------------------
+// Remove
+// ---------------------------------------------------------------------------
 
 /**
  * Removes a plugin.
@@ -1120,53 +1719,118 @@ export async function update(spec: string, options: MutationOptions = {}): Promi
  * only — the files stay on disk, and the message says so explicitly.
  */
 export async function remove(spec: string): Promise<MutationValue> {
+  const parsed = splitSpec(spec)
+  const key = parsed.name || spec
   try {
-    const file = await readConfig()
-    const entry = await findBySpec(file, spec)
-    if (!entry) return { ok: false, message: "配置中没有这一项", state: await snapshot() }
-    if (entry.name === SELF_PACKAGE) {
-      return { ok: false, message: "不能移除正在运行的插件中心自身", state: await snapshot() }
+    return await withLock(`pkg:${key}`, () => removeLocked(spec))
+  } catch (error) {
+    if (error instanceof BusyError) return busyResult(await snapshot(), key)
+    return {
+      ok: false,
+      message: describe(error),
+      state: await snapshot(),
+      stages: { command: "failed", config: "unchanged", runtime: "skipped" },
     }
+  }
+}
 
-    if (entry.kind === "path" || entry.kind === "enable-rule" || entry.kind === "control") {
-      const state = await editConfig([{ path: [file.key, entry.entry.index], value: undefined }])
-      if (entry.kind === "enable-rule") forgetRule(entry.spec)
-      if (entry.kind === "control" && entry.name) forgetRule(entry.name)
-      const gone = state.plugins.every((item) => item.spec !== entry.spec)
+async function removeLocked(spec: string): Promise<MutationValue> {
+  const file = await readConfig()
+  if (file.parseError) {
+    return {
+      ok: false,
+      message: `配置文件无法解析（${file.parseError}），为避免覆盖你的配置，没有做任何修改`,
+      state: await snapshot(),
+      stages: { command: "skipped", config: "unchanged", runtime: "skipped" },
+    }
+  }
+  const entry = await findBySpec(file, spec)
+  if (!entry) {
+    return {
+      ok: false,
+      message: "配置中没有这一项",
+      state: await snapshot(),
+      stages: { command: "skipped", config: "unchanged", runtime: "skipped" },
+    }
+  }
+  if (entry.name === SELF_PACKAGE) {
+    return {
+      ok: false,
+      message: "不能移除正在运行的插件中心自身",
+      state: await snapshot(),
+      stages: { command: "skipped", config: "unchanged", runtime: "skipped" },
+    }
+  }
+
+  if (entry.kind === "path" || entry.kind === "enable-rule" || entry.kind === "control") {
+    const written = await commit((fresh) => {
+      const target = entryBySpec(fresh, entry.spec)
+      if (!target) return { refuse: `配置里已经没有 ${entry.spec}，无需移除` }
+      return [{ path: [fresh.key, target.index], value: undefined }]
+    })
+    if (!written.ok) {
       return {
-        ok: gone,
-        message: gone
-          ? entry.kind === "enable-rule"
-            ? `已移除插件中心追加的启用规则 ${entry.spec}（配置里其他规则没有改动）`
-            : entry.kind === "control"
-              ? `已从配置移除规则 ${entry.spec}；其他规则与插件条目没有改动`
-              : `已从配置移除目录条目 ${entry.spec}；磁盘上的目录 ${expandPath(entry.spec)} 没有被删除`
-          : `移除失败：配置里仍然有 ${entry.spec}`,
-        state,
+        ok: false,
+        message: written.error,
+        state: written.state,
+        stages: { command: "skipped", config: "failed", runtime: "skipped" },
       }
     }
-
-    if (!hasCli()) {
-      return { ok: false, message: "找不到 opencode CLI，无法执行 opencode plugin remove", state: await snapshot() }
-    }
-    const outcome = await pluginRemove(entry.spec)
-    const state = await snapshot()
-    const gone = state.plugins.every((item) => item.spec !== entry.spec)
-    if (outcome.status === "not-configured" && !gone) {
-      return { ok: false, message: `官方命令没有找到 ${entry.spec}${outputDetail(outcome)}`, state }
-    }
-    if (!outcome.result.ok && !gone) {
-      return { ok: false, message: `移除 ${entry.spec} 失败${outputDetail(outcome)}`, state }
-    }
+    if (entry.kind === "enable-rule") forgetRule(entry.spec)
+    if (entry.kind === "control" && entry.name) forgetRule(entry.name)
+    const gone = written.state.plugins.every((item) => item.spec !== entry.spec)
     return {
       ok: gone,
       message: gone
-        ? `已通过 opencode plugin remove 移除 ${entry.spec}（只改配置，不删除 npm 缓存里的包文件）`
-        : `命令已执行，但配置里仍有 ${entry.spec}`,
-      state,
+        ? entry.kind === "enable-rule"
+          ? `已移除插件中心追加的启用规则 ${entry.spec}（配置里其他规则没有改动）`
+          : entry.kind === "control"
+            ? `已从配置移除规则 ${entry.spec}；其他规则与插件条目没有改动`
+            : `已从配置移除目录条目 ${entry.spec}；磁盘上的目录 ${expandPath(entry.spec)} 没有被删除`
+        : `移除失败：配置里仍然有 ${entry.spec}`,
+      state: written.state,
+      stages: { command: "skipped", config: gone ? "updated" : "failed", runtime: "skipped" },
     }
-  } catch (error) {
-    return { ok: false, message: describe(error), state: await snapshot() }
+  }
+
+  if (!hasCli()) {
+    return {
+      ok: false,
+      message: "找不到 opencode CLI，无法执行 opencode plugin remove",
+      state: await snapshot(),
+      stages: { command: "failed", config: "unchanged", runtime: "skipped" },
+    }
+  }
+  const outcome = await pluginRemove(entry.spec)
+  const state = await snapshot()
+  const gone = state.plugins.every((item) => item.spec !== entry.spec)
+  if (outcome.status === "not-configured" && !gone) {
+    return {
+      ok: false,
+      message: `官方命令没有找到 ${entry.spec}${outputDetail(outcome)}`,
+      state,
+      stages: { command: "failed", config: "unchanged", runtime: "skipped" },
+    }
+  }
+  if (!outcome.result.ok && !gone) {
+    return {
+      ok: false,
+      message: `移除 ${entry.spec} 失败${outputDetail(outcome)}`,
+      state,
+      stages: { command: "failed", config: "unchanged", runtime: "skipped" },
+    }
+  }
+  return {
+    ok: gone,
+    message: gone
+      ? `已通过 opencode plugin remove 移除 ${entry.spec}（只改配置，不删除 npm 缓存里的包文件和本地目录）`
+      : `命令已执行，但配置里仍有 ${entry.spec}`,
+    state,
+    stages: {
+      command: outcome.result.ok ? "succeeded" : "failed",
+      config: gone ? "updated" : "failed",
+      runtime: "skipped",
+    },
   }
 }
 
@@ -1208,12 +1872,24 @@ function ruleText(matches: readonly { raw: string }[]): string {
   return matches.map((rule) => rule.raw).join(" → ")
 }
 
-/** Asks the host to reload, and reports what the command said without claiming more than that. */
-async function reloadAfterEdit(): Promise<string> {
-  if (!hasCli()) return "未执行重载：找不到 opencode CLI"
-  const result = await pluginReload()
-  if (result.ok) return "已执行 opencode reload"
-  return `opencode reload 未成功（${result.message || `退出码 ${result.code}`}）`
+/** Every ID this entry could be known under, runtime ID first. */
+function idCandidates(entry: ResolvedEntry, id: string): string[] {
+  return Array.from(new Set([id, entry.name, splitSpec(entry.spec).name].filter((value) => value.length > 0)))
+}
+
+/** The rule chain that has the most to say about this plugin, so the verdict is not read off a name. */
+function ruleState(
+  raw: readonly unknown[],
+  entry: ResolvedEntry,
+  id: string,
+): { target: string; verdict: ReturnType<typeof evaluateRules> } {
+  let best: { target: string; verdict: ReturnType<typeof evaluateRules> } | undefined
+  for (const target of idCandidates(entry, id)) {
+    const verdict = evaluateRules(raw, target)
+    if (!best || verdict.matches.length > best.verdict.matches.length) best = { target, verdict }
+    if (verdict.disabled) return { target, verdict }
+  }
+  return best ?? { target: id || entry.name, verdict: evaluateRules(raw, id || entry.name) }
 }
 
 /**
@@ -1224,142 +1900,284 @@ async function reloadAfterEdit(): Promise<string> {
  * new rule is appended last so it wins over everything the user already wrote.
  */
 export async function pause(spec: string, options: MutationOptions = {}): Promise<MutationValue> {
+  const parsed = splitSpec(spec)
+  const key = parsed.name || spec
   try {
-    const file = await readConfig()
-    const entry = await findBySpec(file, spec)
-    if (!entry) return { ok: false, message: "配置中没有这一项", state: await snapshot() }
-    if (entry.kind === "control" || entry.kind === "enable-rule") {
-      return { ok: false, message: "配置规则不是插件包，无法暂停", state: await snapshot() }
+    return await withLock(`pkg:${key}`, () => pauseLocked(spec, options))
+  } catch (error) {
+    if (error instanceof BusyError) return busyResult(await snapshot(), key)
+    return {
+      ok: false,
+      message: describe(error),
+      state: await snapshot(),
+      stages: { command: "failed", config: "unchanged", runtime: "skipped" },
     }
-    const lookup = await resolveId(entry)
-    if (!lookup.id) {
-      return {
-        ok: false,
-        message: `无法确认 ${entry.name} 的插件 ID：宿主没有报告它加载时使用的 ID。为避免写入无效规则，未修改配置（请先让它成功加载一次，再暂停）。`,
-        state: await snapshot(),
-      }
+  }
+}
+
+async function pauseLocked(spec: string, options: MutationOptions): Promise<MutationValue> {
+  const file = await readConfig()
+  if (file.parseError) {
+    return {
+      ok: false,
+      message: `配置文件无法解析（${file.parseError}），为避免覆盖你的配置，没有做任何修改`,
+      state: await snapshot(),
+      stages: { command: "skipped", config: "unchanged", runtime: "skipped" },
     }
-    const strings = file.raw.filter((value): value is string => typeof value === "string")
-    const verdict = evaluateRules(strings, lookup.id)
-    if (verdict.disabled) {
-      return {
-        ok: true,
-        message: `${entry.name} 已经被规则 ${ruleText(verdict.matches)} 禁用，没有再次写入`,
-        state: await snapshot(),
-      }
+  }
+  const entry = await findBySpec(file, spec)
+  if (!entry) {
+    return {
+      ok: false,
+      message: "配置中没有这一项",
+      state: await snapshot(),
+      stages: { command: "skipped", config: "unchanged", runtime: "skipped" },
     }
-    const rule = disableRule(lookup.id)
-    const index = file.raw.length
-    const state = await editConfig([{ path: [file.key, index], value: rule }])
-    const written = state.plugins.some((item) => item.spec === rule)
-    if (!written) {
-      return { ok: false, message: `写入禁用规则 ${rule} 失败`, state }
+  }
+  if (entry.kind === "control" || entry.kind === "enable-rule") {
+    return {
+      ok: false,
+      message: "配置规则不是插件包，无法暂停",
+      state: await snapshot(),
+      stages: { command: "skipped", config: "unchanged", runtime: "skipped" },
     }
-    const reloaded = await reloadAfterEdit()
-    const live = await runtime(options.endpoint)
-    const info = live.items.find((item) => item.spec === entry.spec)
-    const stillLoaded = info?.status === "loaded" && info.id === lookup.id
-    const verification = stillLoaded
-      ? `运行时仍报告 ${lookup.id} 已加载：规则已写入，但宿主尚未重新加载`
-      : `运行时不再报告 ${lookup.id}，配置中新增规则 ${rule}`
+  }
+  const lookup = await resolveId(entry)
+  if (!lookup.id) {
+    return {
+      ok: false,
+      message: `无法确认 ${entry.name} 的插件 ID：宿主没有报告它加载时使用的 ID。为避免写入无效规则，未修改配置（请先让它成功加载一次，再暂停）。`,
+      state: await snapshot(),
+      stages: { command: "skipped", config: "unchanged", runtime: "unknown" },
+    }
+  }
+  const state0 = ruleState(file.raw, entry, lookup.id)
+  if (state0.verdict.disabled) {
     return {
       ok: true,
-      message: `已暂停 ${entry.name}：在配置末尾追加禁用规则 ${rule}（ID 来自${lookup.from === "runtime" ? "宿主运行状态" : "本机记录的运行历史"}），插件条目与包文件都没有改动。${reloaded}。`,
-      state,
-      verification,
+      message: `${entry.name} 已经被规则 ${ruleText(state0.verdict.matches)} 禁用，没有再次写入`,
+      state: await snapshot(),
+      stages: { command: "skipped", config: "unchanged", runtime: "unknown" },
     }
-  } catch (error) {
-    return { ok: false, message: describe(error), state: await snapshot() }
+  }
+  const rule = disableRule(lookup.id)
+  const written = await commit((fresh) => {
+    if (!entryBySpec(fresh, entry.spec)) return { refuse: `配置里的 ${entry.spec} 在操作期间被改动了，未写入规则` }
+    // Re-check inside the queue: another window may have just paused it.
+    if (ruleState(fresh.raw, entry, lookup.id).verdict.disabled) return []
+    return [{ path: [fresh.key, fresh.raw.length], value: rule }]
+  })
+  if (!written.ok) {
+    return {
+      ok: false,
+      message: written.error,
+      state: written.state,
+      stages: { command: "skipped", config: "failed", runtime: "skipped" },
+    }
+  }
+  const applied = written.state.plugins.some((item) => item.spec === rule)
+  if (!applied) {
+    return {
+      ok: false,
+      message: `写入禁用规则 ${rule} 失败：配置里没有出现这条规则`,
+      state: written.state,
+      stages: { command: "skipped", config: "failed", runtime: "skipped" },
+    }
+  }
+  const reloaded = await reloadAfterEdit()
+  const live = await runtime(options.endpoint)
+  const info = live.items.find((item) => item.spec === entry.spec)
+  const stillLoaded = info?.status === "loaded" && info.id === lookup.id
+  const verification = stillLoaded
+    ? `运行时仍报告 ${lookup.id} 已加载：规则已写入，但宿主尚未重新加载`
+    : `配置已写入 ${rule}；宿主尚未报告新的加载结果（暂停成功不等于包已卸载，磁盘文件都还在）`
+  return {
+    ok: true,
+    message: `已暂停 ${entry.name}：在配置末尾追加禁用规则 ${rule}（ID 来自${lookup.from === "runtime" ? "宿主运行状态" : "本机记录的运行历史"}），插件条目与包文件都没有改动。${reloaded}。`,
+    state: written.state,
+    verification,
+    stages: {
+      command: "skipped",
+      config: "updated",
+      runtime: stillLoaded ? "unchanged" : "unknown",
+    },
   }
 }
 
 /**
  * Resumes a paused plugin.
  *
- * Not a reinstall: it deletes the exact `-<id>` rules the config holds for this plugin, and only
- * when a wildcard rule still disables it does it append the positive ID rule that re-enables it.
- * Wildcards themselves are never removed — they belong to the user and cover other plugins too.
+ * Not a reinstall, and not two writes: every rule is evaluated **before** anything changes, then
+ * the deletions and the optional positive rule are applied as one edit. The old two-step version
+ * could delete the exact rule and then discover it could not name the plugin, leaving the config
+ * changed while the operation reported failure.
+ *
+ * Wildcards are never removed — they belong to the user and cover other plugins too.
  */
 export async function resume(spec: string, options: MutationOptions = {}): Promise<MutationValue> {
+  const parsed = splitSpec(spec)
+  const key = parsed.name || spec
   try {
-    const file = await readConfig()
-    const entry = await findBySpec(file, spec)
-    if (!entry) return { ok: false, message: "配置中没有这一项", state: await snapshot() }
-    if (entry.kind === "control" || entry.kind === "enable-rule") {
-      return { ok: false, message: "配置规则不是插件包，无法恢复", state: await snapshot() }
+    return await withLock(`pkg:${key}`, () => resumeLocked(spec, options))
+  } catch (error) {
+    if (error instanceof BusyError) return busyResult(await snapshot(), key)
+    return {
+      ok: false,
+      message: describe(error),
+      state: await snapshot(),
+      stages: { command: "failed", config: "unchanged", runtime: "skipped" },
     }
-    const lookup = await resolveId(entry)
-    const ids = Array.from(new Set([lookup.id, entry.name, splitSpec(entry.spec).name].filter((value) => value.length > 0)))
-    const strings = file.raw.filter((value): value is string => typeof value === "string")
-    const exact = exactRulesFor(strings, ids)
-    const evalTarget = lookup.id || entry.name
-    const verdictBefore = evaluateRules(strings, evalTarget)
-    const wildcardBlocked = verdictBefore?.matches.some((rule) => rule.scope !== "exact" && rule.negate) === true
+  }
+}
 
-    if (exact.length === 0 && !verdictBefore?.disabled) {
-      return {
-        ok: true,
-        message: `${entry.name} 没有被禁用规则挡住，不需要恢复${lookup.id ? `（运行时 ID ${lookup.id}）` : ""}`,
-        state: await snapshot(),
-      }
+async function resumeLocked(spec: string, options: MutationOptions): Promise<MutationValue> {
+  const file = await readConfig()
+  if (file.parseError) {
+    return {
+      ok: false,
+      message: `配置文件无法解析（${file.parseError}），为避免覆盖你的配置，没有做任何修改`,
+      state: await snapshot(),
+      stages: { command: "skipped", config: "unchanged", runtime: "skipped" },
     }
-    if (exact.length === 0 && !lookup.id) {
-      return {
-        ok: false,
-        message: `无法确认 ${entry.name} 的插件 ID：规则 ${verdictBefore ? ruleText(verdictBefore.matches) : ""} 覆盖了它，而宿主没有报告过它的 ID。为避免写入无效规则，未修改配置。`,
-        state: await snapshot(),
-      }
+  }
+  const entry = await findBySpec(file, spec)
+  if (!entry) {
+    return {
+      ok: false,
+      message: "配置中没有这一项",
+      state: await snapshot(),
+      stages: { command: "skipped", config: "unchanged", runtime: "skipped" },
     }
-
-    // Removals are applied from the highest index down so earlier positions stay valid.
-    const removals: Edit[] = exact
-      .slice()
-      .sort((a, b) => b.index - a.index)
-      .map((rule) => ({ path: [file.key, rule.index], value: undefined }))
-    if (removals.length > 0) await editConfig(removals)
-
-    const after = await readConfig()
-    const remainingStrings = after.raw.filter((value): value is string => typeof value === "string")
-    const verdictAfter = evaluateRules(remainingStrings, evalTarget)
-
-    if (verdictAfter?.disabled) {
-      if (!lookup.id) {
-        return {
-          ok: false,
-          message: `已删除精确禁用规则，但仍有通配规则 ${ruleText(verdictAfter.matches)} 覆盖它，且无法确认插件 ID，未写入启用规则。`,
-          state: await snapshot(),
-        }
-      }
-      const rule = enableRule(lookup.id)
-      rememberRule(rule)
-      const state = await editConfig([{ path: [after.key, after.raw.length], value: rule }])
-      const reloaded = await reloadAfterEdit()
-      const live = await runtime(options.endpoint)
-      const info = live.items.find((item) => item.spec === entry.spec)
-      return {
-        ok: true,
-        message: `已恢复 ${entry.name}：删除精确禁用规则后仍被 ${ruleText(verdictAfter.matches)} 挡住，因此在配置末尾追加启用规则 ${rule}。通配规则保持原样。${reloaded}。`,
-        state,
-        verification: info?.status === "loaded" ? `运行时已报告 ${lookup.id} 加载成功` : "运行时尚未报告加载：等待宿主重新加载",
-      }
+  }
+  if (entry.kind === "control" || entry.kind === "enable-rule") {
+    return {
+      ok: false,
+      message: "配置规则不是插件包，无法恢复",
+      state: await snapshot(),
+      stages: { command: "skipped", config: "unchanged", runtime: "skipped" },
     }
+  }
 
-    const reloaded = removals.length > 0 ? await reloadAfterEdit() : "配置没有禁用规则，未改动"
-    const live = await runtime(options.endpoint)
-    const info = live.items.find((item) => item.spec === entry.spec)
-    const removedText = exact.map((rule) => rule.raw).join("、")
+  const lookup = await resolveId(entry)
+  const ids = idCandidates(entry, lookup.id)
+  const exact = exactRulesFor(file.raw, ids)
+  const before = ruleState(file.raw, entry, lookup.id)
+
+  if (exact.length === 0 && !before.verdict.disabled) {
     return {
       ok: true,
-      message:
-        removals.length > 0
-          ? `已恢复 ${entry.name}：删除禁用规则 ${removedText}，插件的版本与配置参数没有改动。${reloaded}。`
-          : `已恢复 ${entry.name}：没有需要删除的禁用规则。${reloaded}。`,
+      message: `${entry.name} 没有被禁用规则挡住，不需要恢复${lookup.id ? `（运行时 ID ${lookup.id}）` : ""}`,
       state: await snapshot(),
-      verification: info?.status === "loaded" ? `运行时已报告 ${lookup.id || entry.name} 加载成功` : "运行时尚未报告加载：等待宿主重新加载",
+      stages: { command: "skipped", config: "unchanged", runtime: "unknown" },
     }
-  } catch (error) {
-    return { ok: false, message: describe(error), state: await snapshot() }
   }
+
+  // Every rule is settled here, before anything is written:
+  //   - exact `-id` rules to delete;
+  //   - whether a wildcard still disables it once those are gone (then a positive rule is needed).
+  // The old code deleted first and discovered the second part afterwards, which is how an
+  // operation could report failure *and* leave the config changed.
+  const stillBlocked = countWildcardBlocks(file.raw, entry, ids, exact)
+  if (stillBlocked && !lookup.id) {
+    return {
+      ok: false,
+      message: `无法确认 ${entry.name} 的插件 ID：规则 ${ruleText(before.verdict.matches)} 覆盖了它，而宿主没有报告过它的 ID。为避免写入无效规则，未修改配置。`,
+      state: await snapshot(),
+      stages: { command: "skipped", config: "unchanged", runtime: "unknown" },
+    }
+  }
+
+  const enable = stillBlocked ? enableRule(lookup.id) : ""
+  const expectsNoExact = exact.length === 0
+  const written = await commit((fresh) => {
+    if (!entryBySpec(fresh, entry.spec)) return { refuse: `配置里的 ${entry.spec} 在操作期间被改动了，未做任何修改` }
+    const current = exactRulesFor(fresh.raw, ids)
+    // The deletion and the re-enable are one write: either both land, or neither does.
+    if (expectsNoExact && current.length > 0) {
+      return { refuse: `配置在操作期间出现了新的禁用规则（${ruleText(current)}），请重新执行恢复` }
+    }
+    if (current.length === 0 && !enable) return []
+    // No dedupe on `enable`: a package entry may carry the same text as the ID (the plugin
+    // `acme.alpha` and the rule `acme.alpha` look identical), but only a rule *after* the last
+    // disabler re-enables anything. Appending is what makes the order work.
+    // Removals from the highest index down, then the append at the end: applied to the same text,
+    // so the descending order keeps every earlier index valid.
+    const planned: Edit[] = current
+      .slice()
+      .sort((a, b) => b.index - a.index)
+      .map((rule) => ({ path: [fresh.key, rule.index], value: undefined }))
+    if (enable) planned.push({ path: [fresh.key, fresh.raw.length], value: enable })
+    return planned
+  })
+  if (!written.ok) {
+    return {
+      ok: false,
+      message: written.error,
+      state: written.state,
+      stages: { command: "skipped", config: "failed", runtime: "skipped" },
+    }
+  }
+
+  // Verify the end state from the file, not from what we intended to write.
+  const after = await readConfig()
+  if (after.parseError) {
+    return {
+      ok: false,
+      message: `写入后配置无法解析：${after.parseError}`,
+      state: written.state,
+      stages: { command: "skipped", config: "failed", runtime: "skipped" },
+    }
+  }
+  const remaining = exactRulesFor(after.raw, ids)
+  const verdictAfter = ruleState(after.raw, entry, lookup.id)
+  if (remaining.length > 0 || verdictAfter.verdict.disabled) {
+    return {
+      ok: false,
+      message: `恢复 ${entry.name} 没有完成：配置里仍有规则 ${ruleText(verdictAfter.verdict.matches)} 在禁用它`,
+      state: written.state,
+      stages: { command: "skipped", config: "failed", runtime: "unknown" },
+    }
+  }
+
+  const reloaded = await reloadAfterEdit()
+  const live = await runtime(options.endpoint)
+  const info = live.items.find((item) => item.spec === entry.spec)
+  const loaded = info?.status === "loaded"
+  const removedText = exact.map((rule) => rule.raw).join("、")
+  const verification = loaded
+    ? `运行时已报告 ${lookup.id || entry.name} 加载成功`
+    : "运行时尚未报告加载：等待宿主重新加载（恢复成功不等于插件已加载）"
+  if (enable) {
+    return {
+      ok: true,
+      message: `已恢复 ${entry.name}：${removedText ? `删除禁用规则 ${removedText}，` : ""}这些规则去掉后仍被通配规则挡住，因此在同一次写入里追加启用规则 ${enable}。通配规则保持原样。${reloaded}。`,
+      state: written.state,
+      verification,
+      stages: { command: "skipped", config: "updated", runtime: loaded ? "loaded" : "unknown" },
+    }
+  }
+  return {
+    ok: true,
+    message:
+      exact.length > 0
+        ? `已恢复 ${entry.name}：删除禁用规则 ${removedText}，插件的版本与配置参数没有改动。${reloaded}。`
+        : `已恢复 ${entry.name}：没有需要删除的禁用规则。${reloaded}。`,
+    state: written.state,
+    verification,
+    stages: { command: "skipped", config: "updated", runtime: loaded ? "loaded" : "unknown" },
+  }
+}
+
+/** Would a rule still disable this plugin once the exact rules are gone? */
+function countWildcardBlocks(
+  raw: readonly unknown[],
+  entry: ResolvedEntry,
+  ids: readonly string[],
+  exact: readonly { index: number }[],
+): boolean {
+  const drop = new Set(exact.map((rule) => rule.index))
+  const kept = raw.filter((_, index) => !drop.has(index))
+  return idCandidates(entry, ids[0] ?? "").some((target) => evaluateRules(kept, target).disabled)
 }
 
 // ---------------------------------------------------------------------------
@@ -1816,6 +2634,7 @@ export async function reload(): Promise<MutationValue> {
       ok: false,
       message: detail ? `配置重载失败：${reason} — ${detail}` : `配置重载失败：${reason}`,
       state,
+      stages: { command: "failed", config: "unchanged", runtime: "skipped" },
     }
   }
   return {
@@ -1823,6 +2642,8 @@ export async function reload(): Promise<MutationValue> {
     message:
       "已执行 opencode reload：受监控的配置项会随之重新加载；未被监听的本地依赖变化，可能仍需重启 OpenCode 服务",
     state,
+    // The command ran; whether the host picked anything up is a separate question this never claims.
+    stages: { command: "succeeded", config: "unchanged", runtime: "unknown" },
   }
 }
 
@@ -1834,11 +2655,6 @@ export function cliInfo(): { available: boolean; command: string } {
 
 /** Exposed for the UI: the same classifier the mutations use, so a test can assert on it. */
 export { classify as classifyCliResult }
-
-function describe(error: unknown): string {
-  if (error instanceof Error) return error.message
-  return String(error)
-}
 
 /** Makes socket-level failures actionable: `fetch failed` alone says nothing about what to do. */
 function describeNetwork(error: unknown): string {
