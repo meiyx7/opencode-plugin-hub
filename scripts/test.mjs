@@ -24,6 +24,7 @@ const entries = [
   "self-update-detection.test.ts",
   "progress-view.test.ts",
   "install-progress.test.ts",
+  "detail-close.test.ts",
   "status-view.test.ts",
   "error-view.test.ts",
   "release-guard.test.ts",

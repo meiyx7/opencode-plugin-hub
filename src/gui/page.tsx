@@ -9,6 +9,7 @@ import { readableErrorText } from "./error-view"
 import {
   buildProgressReport,
   runningSteps,
+  shouldClearProgress,
   type ProgressInput,
   type ProgressMutation,
   type ProgressReport,
@@ -1072,7 +1073,13 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
         onInstall={(version) => {
           void install(name, version, true)
         }}
-        onClose={() => dialog.close()}
+        onClose={() => {
+          // 正常关闭时清理本包进度，避免下次打开详情残留上一次的安装/更新结果。
+          // shouldClearProgress 保证：只清属于本包、且操作已结束的进度；执行期关闭被锁住，
+          // 清理只改界面状态、不触碰已完成的 Promise，也不影响其它插件或在途操作。
+          if (shouldClearProgress(progress(), name)) setProgress(undefined)
+          dialog.close()
+        }}
       />
     ))
   }

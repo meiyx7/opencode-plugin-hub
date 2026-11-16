@@ -62,6 +62,23 @@ export interface ProgressInput {
   mutationText: string
 }
 
+/**
+ * Dialog 关闭时是否应清理当前的进度状态。
+ *
+ * 用于修复「详情 Dialog 关闭后进度残留」：关闭详情时要清掉它对应的 progress，
+ * 但必须满足——该进度确实属于这个包（不误清其它插件）、且操作已结束（phase=done）。
+ * 执行中（running）不允许关闭，更不允许提前清理阶段信息；清理只作用于界面状态，
+ * 不触碰正在执行的 Promise。
+ */
+export function shouldClearProgress(
+  current: { op: { name: string }; phase: "running" | "done" } | undefined,
+  dialogName: string,
+): boolean {
+  if (!current) return false
+  if (current.op.name !== dialogName) return false
+  return current.phase === "done"
+}
+
 function commandStep(command: string | undefined, install: boolean): ProgressStep {
   const title = install ? "执行安装命令" : "执行更新命令"
   switch (command) {
