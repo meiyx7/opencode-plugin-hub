@@ -20,6 +20,7 @@ const entries = [
   "lifecycle-safety.test.ts",
   "config-safety.test.ts",
   "feedback.test.ts",
+  "attention.test.ts",
   "release-guard.test.ts",
 ]
 

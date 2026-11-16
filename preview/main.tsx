@@ -1,6 +1,7 @@
 import { render } from "solid-js/web"
 import type { Context } from "@opencode/plugin/gui"
 import { PluginHubDialog, PluginHubPage } from "../src/gui/page"
+import snapshot from "../src/gui/registry-snapshot.json"
 // admin 模块引用 node:child_process / fs；浏览器里用简化 mock 替代
 // （预览重点验收 UI 与交互，网络请求用真 fetch 走 npm/awesome-opencode）。
 
@@ -88,16 +89,46 @@ const fakeUpdates = fakeState.plugins.map((entry) => {
 function Button(props: { children?: unknown; onClick?: (event: MouseEvent) => void; busy?: boolean; disabled?: boolean; variant?: string; size?: string; icon?: string }) {
   return (
     <button class="mock-btn" data-variant={props.variant} onClick={props.onClick} disabled={props.busy || props.disabled}>
-      {props.icon ? <span class="mock-icon" title={props.icon} /> : null}
+      {props.icon ? <MockGlyph name={props.icon} /> : null}
       {props.busy ? "…" : props.children}
     </button>
   )
 }
+/** 预览不引入图标包，用字形近似真实图标，方便核对按钮和信息层级。 */
+const glyphs: Record<string, string> = {
+  extensions: "🧩",
+  "magnifying-glass": "⌕",
+  "outline-rotate-clockwise": "↻",
+  refresh: "↻",
+  download: "↓",
+  eye: "◉",
+  github: "GH",
+  globe: "◎",
+  trash: "⌫",
+  check: "✓",
+  close: "×",
+  "circle-ban-sign": "⊘",
+  "circle-exclamation": "!",
+  warning: "▲",
+  info: "i",
+  "bubble-5": "◌",
+  cube: "▣",
+  "square-arrow-top-right": "↗",
+  "outline-dots": "⋯",
+  "settings-gear": "⚙",
+}
+function MockGlyph(props: { name?: string }) {
+  return (
+    <span class="mock-icon" data-icon={props.name} title={props.name}>
+      {glyphs[props.name ?? ""] ?? "•"}
+    </span>
+  )
+}
 function Icon(props: { name?: string; size?: string }) {
-  return <span class="mock-icon" title={props.name} />
+  return <MockGlyph name={props.name} />
 }
 function IconButton(props: { icon?: string; label?: string; onClick?: (event: MouseEvent) => void }) {
-  return <button class="mock-btn" title={props.label} aria-label={props.label} onClick={props.onClick}><span class="mock-icon" title={props.icon} /></button>
+  return <button class="mock-btn" title={props.label} aria-label={props.label} onClick={props.onClick}><MockGlyph name={props.icon} /></button>
 }
 function Tooltip(props: { value?: unknown; children?: unknown }) {
   return <span title={String(props.value ?? "")}>{props.children}</span>
@@ -143,8 +174,146 @@ function TextInput(props: { label?: string; placeholder?: string; type?: string;
     </label>
   )
 }
+/** 预览用的极简 Markdown 渲染：只覆盖 README 常见结构，真实宿主用 ui.Markdown。 */
+function escapeHtml(value: string) {
+  return value
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+}
+function inlineMarkdown(value: string) {
+  return escapeHtml(value)
+    .replace(/!\[([^\]]*)\]\(([^)\s]+)(?:\s+"[^"]*")?\)/g, '<img alt="$1" src="$2" />')
+    .replace(/\[([^\]]+)\]\(([^)\s]+)(?:\s+"[^"]*")?\)/g, '<a href="$2" target="_blank" rel="noreferrer">$1</a>')
+    .replace(/`([^`]+)`/g, "<code>$1</code>")
+    .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
+    .replace(/(^|[\s(])\*([^*]+)\*/g, "$1<em>$2</em>")
+}
+function tableCells(line: string) {
+  return line
+    .replace(/^\s*\|/, "")
+    .replace(/\|\s*$/, "")
+    .split("|")
+    .map((cell) => cell.trim())
+}
+function markdownToHtml(source: string) {
+  const lines = source.replace(/\r\n?/g, "\n").split("\n")
+  const out: string[] = []
+  let paragraph: string[] = []
+  let list: "ul" | "ol" | undefined
+  const flushParagraph = () => {
+    if (!paragraph.length) return
+    out.push(`<p>${inlineMarkdown(paragraph.join(" "))}</p>`)
+    paragraph = []
+  }
+  const closeList = () => {
+    if (!list) return
+    out.push(`</${list}>`)
+    list = undefined
+  }
+  let i = 0
+  while (i < lines.length) {
+    const line = lines[i] ?? ""
+    const trimmed = line.trim()
+    if (trimmed.startsWith("```")) {
+      flushParagraph()
+      closeList()
+      const language = trimmed.slice(3).trim()
+      const code: string[] = []
+      i += 1
+      while (i < lines.length && !(lines[i] ?? "").trim().startsWith("```")) {
+        code.push(lines[i] ?? "")
+        i += 1
+      }
+      i += 1
+      out.push(
+        `<pre><code${language ? ` class="language-${escapeHtml(language)}"` : ""}>${escapeHtml(code.join("\n"))}</code></pre>`,
+      )
+      continue
+    }
+    if (!trimmed) {
+      flushParagraph()
+      closeList()
+      i += 1
+      continue
+    }
+    const heading = /^(#{1,6})\s+(.*)$/.exec(trimmed)
+    if (heading) {
+      flushParagraph()
+      closeList()
+      const level = heading[1]!.length
+      out.push(`<h${level}>${inlineMarkdown(heading[2]!)}</h${level}>`)
+      i += 1
+      continue
+    }
+    if (/^(-{3,}|\*{3,}|_{3,})$/.test(trimmed)) {
+      flushParagraph()
+      closeList()
+      out.push("<hr />")
+      i += 1
+      continue
+    }
+    if (trimmed.startsWith(">")) {
+      flushParagraph()
+      closeList()
+      const quote: string[] = []
+      while (i < lines.length && (lines[i] ?? "").trim().startsWith(">")) {
+        quote.push((lines[i] ?? "").trim().replace(/^>\s?/, ""))
+        i += 1
+      }
+      out.push(`<blockquote>${quote.map((text) => `<p>${inlineMarkdown(text)}</p>`).join("")}</blockquote>`)
+      continue
+    }
+    if (/^[-*+]\s+/.test(trimmed)) {
+      flushParagraph()
+      if (list !== "ul") {
+        closeList()
+        out.push("<ul>")
+        list = "ul"
+      }
+      out.push(`<li>${inlineMarkdown(trimmed.replace(/^[-*+]\s+/, ""))}</li>`)
+      i += 1
+      continue
+    }
+    if (/^\d+[.)]\s+/.test(trimmed)) {
+      flushParagraph()
+      if (list !== "ol") {
+        closeList()
+        out.push("<ol>")
+        list = "ol"
+      }
+      out.push(`<li>${inlineMarkdown(trimmed.replace(/^\d+[.)]\s+/, ""))}</li>`)
+      i += 1
+      continue
+    }
+    const next = lines[i + 1] ?? ""
+    if (trimmed.includes("|") && /^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?\s*$/.test(next)) {
+      flushParagraph()
+      closeList()
+      const head = tableCells(trimmed)
+      const rows: string[][] = []
+      i += 2
+      while (i < lines.length && (lines[i] ?? "").trim().includes("|")) {
+        rows.push(tableCells((lines[i] ?? "").trim()))
+        i += 1
+      }
+      out.push(
+        `<table><thead><tr>${head.map((cell) => `<th>${inlineMarkdown(cell)}</th>`).join("")}</tr></thead><tbody>${rows
+          .map((row) => `<tr>${row.map((cell) => `<td>${inlineMarkdown(cell)}</td>`).join("")}</tr>`)
+          .join("")}</tbody></table>`,
+      )
+      continue
+    }
+    paragraph.push(trimmed)
+    i += 1
+  }
+  flushParagraph()
+  closeList()
+  return out.join("\n")
+}
 function Markdown(props: { text?: string; class?: string }) {
-  return <div class={props.class} innerHTML={props.text ?? ""} />
+  return <div class={props.class} innerHTML={markdownToHtml(props.text ?? "")} />
 }
 function Dialog(props: { title?: string; children?: unknown; footer?: unknown; size?: string }) {
   return (
@@ -182,6 +351,111 @@ async function previewExtra(name: string): Promise<{ weekly: number; monthly: nu
   }
 }
 
+/** 预览的离线兜底：网络不可达时仍然能核对目录、搜索和详情布局。 */
+const snapshotEntries = (snapshot as any[]).slice(0, 72).map((entry) => ({
+  name: entry.name,
+  pkg: entry.pkg,
+  version: entry.ver,
+  type: entry.type,
+  desc: entry.desc,
+  long: entry.long,
+  repo: entry.repo,
+  tags: entry.tags ?? [],
+  installed: fakeState.plugins.some((p) => p.name === entry.pkg),
+}))
+
+const previewReadme = `# 示例插件
+
+这个 README 由预览环境提供，用来核对详情弹窗的排版。真实数据来自 npm。
+
+## 它能做什么
+
+- 在会话里监听事件，并把通知发到手机
+- 支持自定义回调地址和重试
+- 不修改宿主的插件加载流程
+
+## 安装
+
+\`\`\`json
+{
+  "plugins": ["example-plugin"]
+}
+\`\`\`
+
+| 配置项 | 说明 |
+| --- | --- |
+| \`url\` | 回调地址 |
+| \`retries\` | 失败重试次数 |
+
+> 预览环境不执行安装，按钮只用于检查交互和状态呈现。
+
+## 更多
+
+更多说明见项目主页。这里是较长的正文，用来检查 README 在宽屏双栏下是否保持足够阅读宽度，以及独立滚动是否正常。
+`
+
+const offlineHits = snapshotEntries
+  .filter((entry) => entry.pkg)
+  .map((entry, index) => ({
+    name: entry.pkg,
+    version: entry.version || "0.1.0",
+    description: entry.desc || entry.long,
+    published: new Date(Date.now() - (index + 1) * 86_400_000 * 7).toISOString(),
+    updated: "",
+    installed: entry.installed,
+    current: fakeState.plugins.find((p) => p.name === entry.pkg)?.version ?? "",
+    hasUpdate: false,
+    weekly: 18000 - index * 320,
+    monthly: 70000 - index * 1200,
+    publisher: "community",
+    license: "MIT",
+    keywords: entry.tags,
+    homepage: "",
+    repo: entry.repo,
+    npm: `https://www.npmjs.com/package/${entry.pkg}`,
+  }))
+
+function offlineSearch(text: string) {
+  const needle = text.toLowerCase()
+  const matched = offlineHits.filter((hit) =>
+    [hit.name, hit.description, ...hit.keywords].join(" ").toLowerCase().includes(needle),
+  )
+  return (matched.length > 0 ? matched : offlineHits).slice(0, 32)
+}
+
+function offlineDetail(name: string) {
+  const entry = snapshotEntries.find((item) => item.pkg === name) ?? snapshotEntries.find((item) => item.name === name)
+  const installed = fakeState.plugins.find((p) => p.name === name)
+  return {
+    name,
+    version: entry?.version || "0.1.0",
+    description: entry?.desc || entry?.long || "预览环境生成的示例包。",
+    homepage: "",
+    repo: entry?.repo ?? "",
+    repoDir: "",
+    npm: `https://www.npmjs.com/package/${name}`,
+    bugs: "",
+    license: "MIT",
+    keywords: entry?.tags?.slice(0, 6) ?? ["opencode", "plugin"],
+    maintainers: ["community", "meiyx7"],
+    weekly: 12480,
+    monthly: 51200,
+    published: new Date(Date.now() - 12 * 86_400_000).toISOString(),
+    created: new Date(Date.now() - 420 * 86_400_000).toISOString(),
+    versions: 18,
+    unpacked: 284_000,
+    files: 42,
+    dependencies: ["zod@^3.22.0", "undici@^6.0.0", "yaml@^2.4.0"],
+    deprecated: "",
+    readme: previewReadme,
+    readmeTruncated: false,
+    installed: Boolean(installed),
+    current: installed?.version ?? "",
+    hasUpdate: false,
+    error: "",
+  }
+}
+
 const ctx = {
   client: {},
   main: () => ({
@@ -203,7 +477,7 @@ const ctx = {
           // 下一个源
         }
       }
-      if (!response) return { hits: [], error: "无法连接 npm registry" }
+      if (!response) return { hits: offlineSearch(input.query.trim()), error: "当前网络无法连接 npm registry，预览使用本地示例结果。" }
       const body = await response.json()
       const wanted = new Set(["opencode", "opencode-plugin", "opencode-plugins", "opencode-ai"])
       const picked = (body.objects ?? []).filter((item: any) => {
@@ -267,7 +541,15 @@ const ctx = {
           // 下一个源
         }
       }
-      if (!raw) return { entries: [], source: "builtin", registry: sources[0]!, fetchedAt: 0, error: "无法连接插件目录" }
+      if (!raw) {
+        return {
+          entries: snapshotEntries,
+          source: "builtin",
+          registry: sources[0]!,
+          fetchedAt: 0,
+          error: "当前网络无法连接插件目录，预览使用本地内置快照。",
+        }
+      }
       const entries = raw
         .filter((entry) => ["plugins", "mcp", "themes"].includes(entry.type ?? "plugins"))
         .slice(0, 60)
@@ -302,8 +584,8 @@ const ctx = {
           // 下一个源
         }
       }
-      if (!response) return { name: input.name, version: "", description: "", homepage: "", repo: "", repoDir: "", npm: `https://www.npmjs.com/package/${input.name}`, bugs: "", license: "", keywords: [], maintainers: [], weekly: -1, monthly: -1, published: "", created: "", versions: 0, unpacked: 0, files: 0, dependencies: [], deprecated: "", readme: "", readmeTruncated: false, installed: false, current: "", hasUpdate: false, error: "无法连接 npm registry" }
-      if (!response.ok) return { name: input.name, version: "", description: "", homepage: "", repo: "", repoDir: "", npm: `https://www.npmjs.com/package/${input.name}`, bugs: "", license: "", keywords: [], maintainers: [], weekly: -1, monthly: -1, published: "", created: "", versions: 0, unpacked: 0, files: 0, dependencies: [], deprecated: "", readme: "", readmeTruncated: false, installed: false, current: "", hasUpdate: false, error: `npm registry 返回 ${response.status}` }
+      if (!response) return offlineDetail(input.name)
+      if (!response.ok) return offlineDetail(input.name)
       const body = await response.json()
       const latest = body["dist-tags"]?.latest ?? ""
       const manifest = latest ? body.versions?.[latest] : undefined
@@ -374,8 +656,9 @@ const ctx = {
     runtime: async () => ({
       items: fakeState.plugins.map((entry) => {
         const control = entry.kind === "control"
-        const failed = entry.name === "magpie-workbuddy-growth"
-        const paused = entry.name === "opencode-timeline-gui"
+        // ?clean 预览分支：让运行状态全部正常，用来核对「无事不显示摘要」。
+        const failed = !params.has("clean") && entry.name === "magpie-workbuddy-growth"
+        const paused = !params.has("clean") && entry.name === "opencode-timeline-gui"
         return {
           spec: entry.spec,
           name: entry.name,
@@ -412,6 +695,9 @@ const ctx = {
 
 const params = new URLSearchParams(window.location.search)
 const embedded = params.has("embedded")
+if (params.has("dark")) document.documentElement.dataset.theme = "dark"
+const narrow = Number(params.get("narrow") ?? "")
+if (Number.isFinite(narrow) && narrow > 0) document.getElementById("root")!.style.width = `${narrow}px`
 render(
   () => (
     <>
@@ -422,6 +708,9 @@ render(
   document.getElementById("root")!,
 )
 // 截图/回归时可直接落到指定页签：?tab=installed
-if (params.get("tab") === "installed") {
+const initialTab = params.get("tab")
+if (initialTab === "installed") {
   setTimeout(() => document.querySelectorAll<HTMLButtonElement>(".ph-tab")[2]?.click(), 0)
+} else if (initialTab === "search") {
+  setTimeout(() => document.querySelectorAll<HTMLButtonElement>(".ph-tab")[1]?.click(), 0)
 }
