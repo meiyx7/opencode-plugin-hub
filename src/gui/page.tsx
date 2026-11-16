@@ -3,6 +3,7 @@ import type { Context, IconName, IpcClient } from "@opencode/plugin/gui"
 import type { Admin } from "../contract"
 import { countTitle, countWithUnit, formatCount } from "./download-format"
 import { explainMutation, type Tone } from "./feedback"
+import { CSS } from "./styles"
 
 type AdminClient = IpcClient<typeof Admin.spec>
 type HubState = Awaited<ReturnType<AdminClient["snapshot"]>>
@@ -19,7 +20,7 @@ type DiscoveredPlugin = NonNullable<Awaited<ReturnType<AdminClient["runtime"]>>[
 type Tab = "catalog" | "search" | "installed"
 /** 已安装页的状态筛选；管理页先看问题项，而不是按配置顺序翻。 */
 type InstalledFilter = "all" | "update" | "paused" | "failed" | "pending" | "unknown"
-type Note = { text: string; tone: Tone }
+type Note = { text: string; tone: Tone; scope?: Tab }
 
 const PAGE = 24
 
@@ -122,707 +123,6 @@ interface DetailFallback {
   npm?: string
 }
 
-const CSS = `
-:root {
-  --ph-strong: var(--color-v2-text-text-contrast, var(--color-text-strong, currentColor));
-  --ph-muted: var(--color-v2-text-text-muted, var(--color-text-weak, color-mix(in srgb, currentColor 58%, transparent)));
-  --ph-faint: var(--color-v2-text-text-faint, color-mix(in srgb, currentColor 42%, transparent));
-  --ph-border: var(--color-v2-border-border-base, var(--color-border-weak-base, color-mix(in srgb, currentColor 12%, transparent)));
-  --ph-border-strong: var(--color-v2-border-border-strong, color-mix(in srgb, currentColor 24%, transparent));
-  --ph-layer: var(--color-v2-background-bg-layer-01, var(--color-surface-base, color-mix(in srgb, currentColor 3%, transparent)));
-  --ph-layer-2: var(--color-v2-background-bg-layer-02, var(--color-surface-raised-base, color-mix(in srgb, currentColor 6%, transparent)));
-  --ph-layer-3: var(--color-v2-background-bg-layer-03, color-mix(in srgb, currentColor 10%, transparent));
-  --ph-accent: var(--color-v2-text-text-accent, var(--color-text-interactive-base, var(--color-blue-primary, #4f8cff)));
-  --ph-success: var(--color-v2-state-fg-success, var(--color-green, #2f9e5f));
-  --ph-danger: var(--color-v2-state-fg-danger, var(--color-red, #d9534f));
-  --ph-warning: var(--color-v2-state-fg-warning, var(--color-orange, #c98a16));
-  --ph-hover: var(--color-v2-overlay-simple-overlay-hover, color-mix(in srgb, currentColor 6%, transparent));
-}
-.ph-root {
-  display: flex;
-  flex-direction: column;
-  gap: 14px;
-  max-width: 920px;
-  padding: 4px 0 40px;
-  color: var(--color-v2-text-text-base, var(--color-text-base, inherit));
-}
-.ph-root *, .ph-detail * { box-sizing: border-box; }
-.ph-spacer { flex: 1; }
-
-/* hero */
-.ph-hero {
-  display: flex;
-  gap: 22px;
-  justify-content: space-between;
-  align-items: stretch;
-  padding: 20px 22px;
-  border: 1px solid var(--ph-border);
-  border-radius: 14px;
-  background:
-    radial-gradient(120% 160% at 0% 0%, color-mix(in srgb, var(--ph-accent) 13%, transparent) 0%, transparent 52%),
-    var(--ph-layer);
-}
-.ph-hero-copy { display: flex; flex: 1; flex-direction: column; gap: 6px; min-width: 0; }
-.ph-kicker {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  font-size: 10.5px;
-  font-weight: 700;
-  letter-spacing: 0.12em;
-  color: var(--ph-accent);
-}
-.ph-title {
-  margin: 0;
-  font-size: 20px;
-  font-weight: 650;
-  letter-spacing: -0.015em;
-  color: var(--ph-strong);
-}
-.ph-sub {
-  margin: 0;
-  font-size: 12px;
-  line-height: 1.6;
-  color: var(--ph-muted);
-  max-width: 72ch;
-}
-.ph-inline-source {
-  padding: 0;
-  border: 0;
-  background: none;
-  color: var(--ph-accent);
-  font: inherit;
-  line-height: inherit;
-  cursor: pointer;
-}
-.ph-inline-source:hover { text-decoration: underline; }
-.ph-inline-source:focus-visible {
-  outline: 2px solid color-mix(in srgb, var(--ph-accent) 55%, transparent);
-  outline-offset: 2px;
-  border-radius: 2px;
-}
-.ph-path {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  font-size: 11px;
-}
-.ph-path code {
-  font-size: 10.5px;
-  padding: 1px 5px;
-  border-radius: 5px;
-  background: var(--ph-layer-2);
-}
-
-/* notice */
-.ph-notice {
-  display: flex;
-  align-items: flex-start;
-  gap: 8px;
-  padding: 10px 12px;
-  border: 1px solid var(--ph-border);
-  border-radius: 10px;
-  background: var(--ph-layer);
-  color: var(--ph-muted);
-  font-size: 12px;
-  line-height: 1.55;
-}
-.ph-notice[data-tone="error"] {
-  color: var(--ph-danger);
-  border-color: color-mix(in srgb, var(--ph-danger) 28%, transparent);
-  background: color-mix(in srgb, var(--ph-danger) 7%, transparent);
-}
-.ph-notice[data-tone="success"] {
-  color: var(--ph-success);
-  border-color: color-mix(in srgb, var(--ph-success) 28%, transparent);
-  background: color-mix(in srgb, var(--ph-success) 7%, transparent);
-}
-.ph-notice[data-tone="warning"] {
-  color: var(--ph-warning);
-  border-color: color-mix(in srgb, var(--ph-warning) 28%, transparent);
-  background: color-mix(in srgb, var(--ph-warning) 7%, transparent);
-}
-.ph-notice span { flex: 1; min-width: 0; }
-.ph-notice-close {
-  flex: 0 0 auto;
-  display: grid;
-  place-items: center;
-  width: 22px;
-  height: 22px;
-  padding: 0;
-  border: 0;
-  border-radius: 6px;
-  background: transparent;
-  color: inherit;
-  opacity: 0.55;
-  cursor: pointer;
-}
-.ph-notice-close:hover { opacity: 1; background: color-mix(in srgb, currentColor 10%, transparent); }
-
-/* toolbar and tabs */
-.ph-toolbar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
-.ph-tabs {
-  display: flex;
-  gap: 2px;
-  padding: 3px;
-  border: 1px solid var(--ph-border);
-  border-radius: 10px;
-  background: var(--ph-layer);
-}
-.ph-tab {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  padding: 6px 12px;
-  border: 0;
-  border-radius: 8px;
-  background: transparent;
-  color: var(--ph-muted);
-  font-family: inherit;
-  font-size: 12px;
-  font-weight: 500;
-  cursor: pointer;
-  transition: background 0.15s, color 0.15s;
-}
-.ph-tab:hover { color: var(--ph-strong); background: var(--ph-hover); }
-.ph-tab[data-active="true"] {
-  color: var(--ph-strong);
-  background: var(--ph-layer-3);
-  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.08);
-}
-.ph-count {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  min-width: 16px;
-  padding: 1px 5px;
-  border-radius: 99px;
-  background: color-mix(in srgb, currentColor 10%, transparent);
-  color: var(--ph-muted);
-  font-size: 9.5px;
-  font-weight: 600;
-}
-.ph-count-alert {
-  background: color-mix(in srgb, var(--ph-accent) 14%, transparent);
-  color: var(--ph-accent);
-  white-space: nowrap;
-}
-.ph-tab[data-active="true"] .ph-count {
-  background: color-mix(in srgb, var(--ph-accent) 16%, transparent);
-  color: var(--ph-accent);
-}
-
-/* panels, filters */
-.ph-panel { display: flex; flex-direction: column; gap: 12px; }
-.ph-filters { display: flex; flex-direction: column; gap: 10px; }
-.ph-filter-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
-.ph-grow { flex: 1; min-width: 220px; }
-.ph-searchbar { display: flex; align-items: flex-end; gap: 8px; }
-.ph-searchbar .ph-grow { min-width: 200px; }
-.ph-meta {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  flex-wrap: wrap;
-  font-size: 11px;
-  color: var(--ph-muted);
-  line-height: 1.5;
-}
-.ph-meta > span { display: inline-flex; align-items: center; gap: 4px; min-width: 0; }
-.ph-dot { flex: 0 0 auto; width: 3px; height: 3px; border-radius: 50%; background: currentColor; opacity: 0.4; }
-.ph-resultbar { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; }
-/* 已安装页：搜索、状态筛选和检查结果压在一行，滚动列表从更高的位置开始。 */
-.ph-installed-bar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
-.ph-installed-search { flex: 0 1 260px; min-width: 180px; }
-.ph-h3 {
-  display: flex;
-  align-items: center;
-  gap: 7px;
-  margin: 0;
-  font-size: 12px;
-  font-weight: 600;
-  color: var(--ph-muted);
-}
-.ph-sort {
-  display: flex;
-  gap: 2px;
-  padding: 2px;
-  border: 1px solid var(--ph-border);
-  border-radius: 8px;
-  background: var(--ph-layer);
-}
-.ph-sort button {
-  padding: 3px 8px;
-  border: 0;
-  border-radius: 6px;
-  background: transparent;
-  color: var(--ph-muted);
-  font-family: inherit;
-  font-size: 10.5px;
-  cursor: pointer;
-}
-.ph-sort button:hover { color: var(--ph-strong); background: var(--ph-hover); }
-.ph-sort button[data-active="true"] {
-  color: var(--ph-accent);
-  background: color-mix(in srgb, var(--ph-accent) 11%, transparent);
-}
-
-/* cards */
-/* 浏览卡片：每列至少 296px，按可用宽度排 3–4 列，不再出现超宽单列。 */
-.ph-list {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(296px, 1fr));
-  gap: 10px;
-  align-items: stretch;
-  justify-content: center;
-}
-.ph-card {
-  position: relative;
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-  padding: 11px 12px 10px;
-  border: 1px solid var(--ph-border);
-  border-radius: 12px;
-  background: var(--ph-layer);
-  transition: border-color 0.15s, background 0.15s, box-shadow 0.15s;
-}
-.ph-card:hover {
-  border-color: var(--ph-border-strong);
-  background: var(--ph-layer-2);
-  box-shadow: 0 3px 14px rgba(0, 0, 0, 0.05);
-}
-/* Highlight cards whose plugin has a pending update. */
-.ph-card[data-stale="true"] {
-  border-color: color-mix(in srgb, var(--ph-accent) 36%, transparent);
-  background: color-mix(in srgb, var(--ph-accent) 5%, transparent);
-}
-/* While an install or update runs, pulse and sweep the card. */
-.ph-card[data-busy="true"] {
-  border-color: color-mix(in srgb, var(--ph-accent) 45%, transparent);
-  animation: ph-busy-pulse 1.1s ease-in-out infinite;
-}
-.ph-card[data-busy="true"]::after {
-  content: "";
-  position: absolute;
-  inset: 0;
-  border-radius: inherit;
-  background: linear-gradient(
-    100deg,
-    transparent 32%,
-    color-mix(in srgb, var(--ph-accent) 12%, transparent) 50%,
-    transparent 68%
-  );
-  background-size: 220% 100%;
-  animation: ph-shimmer 1.1s linear infinite;
-  pointer-events: none;
-}
-@keyframes ph-busy-pulse {
-  0%,
-  100% {
-    box-shadow: 0 0 0 0 color-mix(in srgb, var(--ph-accent) 20%, transparent);
-  }
-  50% {
-    box-shadow: 0 0 0 5px color-mix(in srgb, var(--ph-accent) 8%, transparent);
-  }
-}
-.ph-card-main { display: flex; flex: 1; flex-direction: column; gap: 8px; min-width: 0; }
-.ph-card-body { display: flex; flex: 1; flex-direction: column; gap: 5px; min-width: 0; }
-.ph-card-body[role="button"] { cursor: pointer; border-radius: 6px; }
-/* 加载失败时把服务端给出的原因放在卡片里，而不是只留一个徽章。 */
-.ph-runtime-error {
-  display: flex;
-  align-items: flex-start;
-  gap: 4px;
-  color: var(--ph-danger);
-  font-size: 10.5px;
-  line-height: 1.45;
-  overflow-wrap: anywhere;
-}
-.ph-card-head { display: flex; align-items: flex-start; gap: 9px; }
-.ph-card-titles { display: flex; flex: 1; flex-direction: column; gap: 2px; min-width: 0; }
-.ph-tile {
-  flex: 0 0 auto;
-  display: grid;
-  place-items: center;
-  width: 32px;
-  height: 32px;
-  border: 1px solid color-mix(in srgb, var(--ph-accent) 20%, transparent);
-  border-radius: 9px;
-  background: color-mix(in srgb, var(--ph-accent) 10%, transparent);
-  color: var(--ph-accent);
-  font-size: 13px;
-  font-weight: 700;
-  overflow: hidden;
-}
-.ph-name-row { display: flex; align-items: center; gap: 7px; min-width: 0; }
-.ph-name {
-  min-width: 0;
-  font-size: 13.5px;
-  font-weight: 600;
-  color: var(--ph-strong);
-  /* 名称必须单行：徽章、版本再长也只省略名称，不把名字挤成两行。 */
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.ph-pkg {
-  font-size: 10.5px;
-  color: var(--ph-faint);
-  font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
-  overflow-wrap: anywhere;
-}
-.ph-version { font-size: 10.5px; font-weight: 400; color: var(--ph-muted); }
-.ph-version-arrow { color: var(--ph-accent); }
-.ph-desc {
-  font-size: 12px;
-  line-height: 1.55;
-  color: var(--ph-muted);
-  /* 两张卡描述长短不同也保持同一基线，底部操作区才不会忽高忽低。 */
-  min-height: calc(1.55em * 2);
-}
-.ph-clamp {
-  display: -webkit-box;
-  -webkit-line-clamp: 2;
-  -webkit-box-orient: vertical;
-  overflow: hidden;
-}
-.ph-type {
-  font-size: 9.5px;
-  font-weight: 600;
-  letter-spacing: 0.05em;
-  text-transform: uppercase;
-  color: var(--ph-faint);
-}
-.ph-actions {
-  display: flex;
-  align-items: center;
-  justify-content: flex-end;
-  gap: 4px;
-  flex-wrap: wrap;
-  margin-top: auto;
-  padding-top: 8px;
-  border-top: 1px solid var(--ph-border);
-}
-
-/* 已安装卡片：与发现卡片同一骨架，但版本/作者只占副标题一行，
-   状态徽章单独一行，名称始终单行，描述固定两行，卡片等高。 */
-.ph-installed-meta {
-  display: flex;
-  align-items: center;
-  gap: 5px;
-  min-width: 0;
-  overflow: hidden;
-  white-space: nowrap;
-  font-size: 10.5px;
-  line-height: 1.45;
-  color: var(--ph-muted);
-}
-.ph-installed-meta > span {
-  flex: 0 0 auto;
-  min-width: 0;
-}
-/* 整行只有 ID 这一段落会被压缩：给每段都挂省略号，窄卡片上会同时冒出三四个「…」，
-   看起来不像排版，像坏了。版本和作者都短，固定住更易读。 */
-.ph-installed-meta > span[data-ellipsis] {
-  flex: 0 1 auto;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-.ph-installed-meta > .ph-dot { flex: 0 0 auto; overflow: visible; }
-.ph-card-status {
-  display: flex;
-  align-items: center;
-  gap: 4px;
-  flex-wrap: wrap;
-  padding-top: 2px;
-}
-.ph-tile[data-runtime="failed"] {
-  color: var(--ph-danger);
-  border-color: color-mix(in srgb, var(--ph-danger) 28%, transparent);
-  background: color-mix(in srgb, var(--ph-danger) 9%, transparent);
-}
-.ph-tile[data-runtime="pending"] { opacity: 0.72; }
-.ph-tile[data-runtime="unknown"] { opacity: 0.55; }
-
-/* badges and chips */
-.ph-badge {
-  display: inline-flex;
-  align-items: center;
-  gap: 3px;
-  padding: 2px 7px;
-  border: 1px solid var(--ph-border);
-  border-radius: 99px;
-  background: var(--ph-layer-2);
-  color: var(--ph-muted);
-  font-size: 9.5px;
-  font-weight: 600;
-  line-height: 1.5;
-  white-space: nowrap;
-}
-.ph-badge[data-tone="accent"] {
-  color: var(--ph-accent);
-  border-color: color-mix(in srgb, var(--ph-accent) 30%, transparent);
-  background: color-mix(in srgb, var(--ph-accent) 9%, transparent);
-}
-.ph-badge[data-tone="success"] {
-  color: var(--ph-success);
-  border-color: color-mix(in srgb, var(--ph-success) 30%, transparent);
-  background: color-mix(in srgb, var(--ph-success) 9%, transparent);
-}
-.ph-badge[data-tone="warning"] {
-  color: var(--ph-warning);
-  border-color: color-mix(in srgb, var(--ph-warning) 30%, transparent);
-  background: color-mix(in srgb, var(--ph-warning) 9%, transparent);
-}
-.ph-badge[data-tone="danger"] {
-  color: var(--ph-danger);
-  border-color: color-mix(in srgb, var(--ph-danger) 30%, transparent);
-  background: color-mix(in srgb, var(--ph-danger) 9%, transparent);
-}
-/* 运行状态徽章：加载成功用成功色，失败用危险色，待加载/未知保持中性——
-   待生效不是错误，不能一进列表就满屏红色。 */
-.ph-badge[data-runtime="loaded"] {
-  color: var(--ph-success);
-  border-color: color-mix(in srgb, var(--ph-success) 30%, transparent);
-  background: color-mix(in srgb, var(--ph-success) 9%, transparent);
-}
-.ph-badge[data-runtime="failed"] {
-  color: var(--ph-danger);
-  border-color: color-mix(in srgb, var(--ph-danger) 30%, transparent);
-  background: color-mix(in srgb, var(--ph-danger) 9%, transparent);
-}
-/* 暂停是用户主动选择的状态，用中性偏冷的边框表达“它存在、但没在跑”，不是故障。 */
-.ph-badge[data-runtime="paused"] {
-  color: var(--ph-muted);
-  border-color: var(--ph-border-strong);
-  background: transparent;
-}
-.ph-tile[data-runtime="paused"] { opacity: 0.5; }
-.ph-tile[data-runtime="rule"] { opacity: 0.45; }
-.ph-card[data-paused="true"] { opacity: 0.86; }
-.ph-chips { display: flex; align-items: center; gap: 4px; flex-wrap: wrap; }
-.ph-chip {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  padding: 2px 8px;
-  border: 1px solid var(--ph-border);
-  border-radius: 99px;
-  background: var(--ph-layer-2);
-  color: var(--ph-muted);
-  font-family: inherit;
-  font-size: 10.5px;
-  line-height: 1.5;
-  white-space: nowrap;
-  max-width: 100%;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-button.ph-chip { cursor: pointer; transition: color 0.15s, border-color 0.15s, background 0.15s; }
-button.ph-chip:hover { color: var(--ph-strong); border-color: var(--ph-border-strong); }
-button.ph-chip[data-active="true"] {
-  color: var(--ph-accent);
-  border-color: color-mix(in srgb, var(--ph-accent) 32%, transparent);
-  background: color-mix(in srgb, var(--ph-accent) 10%, transparent);
-}
-.ph-chip[data-disabled="true"] { opacity: 0.45; cursor: default; }
-.ph-chip-count { font-size: 9px; opacity: 0.7; }
-
-/* empty and loading */
-.ph-empty {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  gap: 7px;
-  padding: 38px 18px;
-  border: 1px dashed var(--ph-border);
-  border-radius: 12px;
-  color: var(--ph-muted);
-  text-align: center;
-}
-.ph-empty strong { font-size: 13px; font-weight: 600; color: var(--ph-strong); }
-.ph-empty span { font-size: 12px; line-height: 1.55; max-width: 48ch; }
-.ph-empty .ph-chips { justify-content: center; margin-top: 2px; }
-.ph-skeleton {
-  height: 70px;
-  border: 1px solid var(--ph-border);
-  border-radius: 12px;
-  background: linear-gradient(90deg, var(--ph-layer) 0%, var(--ph-layer-2) 50%, var(--ph-layer) 100%);
-  background-size: 200% 100%;
-  animation: ph-shimmer 1.4s ease-in-out infinite;
-}
-@keyframes ph-shimmer {
-  0% { background-position: 200% 0; }
-  100% { background-position: -200% 0; }
-}
-
-/* detail dialog */
-.ph-detail { display: flex; flex-direction: column; gap: 14px; }
-.ph-detail-head { display: flex; flex-direction: column; gap: 5px; }
-.ph-detail-title { font-size: 16px; font-weight: 650; color: var(--ph-strong); overflow-wrap: anywhere; }
-.ph-detail-desc { font-size: 12.5px; line-height: 1.6; color: var(--ph-muted); }
-.ph-detail-stats { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; }
-.ph-detail-stat {
-  padding: 9px 10px;
-  border: 1px solid var(--ph-border);
-  border-radius: 10px;
-  background: var(--ph-layer);
-}
-.ph-detail-stat b { display: block; font-size: 15px; font-weight: 650; line-height: 1.25; color: var(--ph-strong); }
-.ph-detail-stat span { display: block; margin-top: 1px; font-size: 10px; color: var(--ph-muted); }
-.ph-detail-meta { display: flex; align-items: center; gap: 5px; flex-wrap: wrap; }
-.ph-detail-links { display: flex; align-items: center; gap: 5px; flex-wrap: wrap; }
-.ph-dialog-footer { display: flex; align-items: center; gap: 6px; width: 100%; flex-wrap: wrap; }
-.ph-detail-error {
-  max-width: 34ch;
-  font-size: 10.5px;
-  line-height: 1.4;
-  color: var(--ph-danger);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.ph-detail-loading {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  gap: 10px;
-  min-height: 220px;
-  font-size: 12px;
-  color: var(--ph-muted);
-}
-.ph-warning {
-  display: flex;
-  align-items: flex-start;
-  gap: 7px;
-  padding: 9px 11px;
-  border: 1px solid color-mix(in srgb, var(--ph-warning) 28%, transparent);
-  border-radius: 9px;
-  background: color-mix(in srgb, var(--ph-warning) 7%, transparent);
-  color: var(--ph-warning);
-  font-size: 11.5px;
-  line-height: 1.5;
-}
-.ph-warning[data-tone="danger"] {
-  border-color: color-mix(in srgb, var(--ph-danger) 28%, transparent);
-  background: color-mix(in srgb, var(--ph-danger) 7%, transparent);
-  color: var(--ph-danger);
-}
-.ph-section { display: flex; flex-direction: column; gap: 8px; }
-.ph-section-title {
-  font-size: 10.5px;
-  font-weight: 700;
-  letter-spacing: 0.09em;
-  text-transform: uppercase;
-  color: var(--ph-faint);
-}
-.ph-details {
-  padding: 8px 10px;
-  border: 1px solid var(--ph-border);
-  border-radius: 10px;
-  background: var(--ph-layer);
-}
-.ph-details summary { cursor: pointer; font-size: 11.5px; color: var(--ph-muted); }
-.ph-details .ph-chips { margin-top: 8px; }
-.ph-readme { font-size: 12.5px; line-height: 1.65; }
-.ph-readme img { max-width: 100%; height: auto; }
-.ph-readme pre { overflow: auto; }
-.ph-readme table { display: block; max-width: 100%; overflow: auto; }
-.ph-readme-empty {
-  padding: 16px;
-  border: 1px dashed var(--ph-border);
-  border-radius: 10px;
-  color: var(--ph-muted);
-  font-size: 12px;
-  line-height: 1.55;
-}
-.ph-readme-note { font-size: 10.5px; color: var(--ph-faint); }
-
-.ph-tab:focus-visible,
-.ph-sort button:focus-visible,
-button.ph-chip:focus-visible,
-.ph-card-body[role="button"]:focus-visible {
-  outline: 2px solid color-mix(in srgb, var(--ph-accent) 55%, transparent);
-  outline-offset: 2px;
-}
-
-/* embedded in the standalone dialog */
-.ph-root[data-embedded="true"] {
-  max-width: none;
-  padding: 0 0 8px;
-}
-/* 对话框已有标题栏，这里不再重复大标题：只留一行来源说明和配置路径。 */
-.ph-root[data-embedded="true"] .ph-hero {
-  padding: 0 0 10px;
-  border: 0;
-  border-bottom: 1px solid var(--ph-border);
-  border-radius: 0;
-  background: none;
-}
-.ph-root[data-embedded="true"] .ph-kicker { display: none; }
-.ph-root[data-embedded="true"] .ph-sub {
-  max-width: none;
-  overflow: hidden;
-  display: -webkit-box;
-  -webkit-line-clamp: 1;
-  -webkit-box-orient: vertical;
-  font-size: 11.5px;
-}
-.ph-root[data-embedded="true"] .ph-path { font-size: 10.5px; }
-/* The host caps "x-large" at 980x600. Give the standalone hub more room and
-   let the dialog be resized from its bottom-right corner, within the window. */
-[data-component="dialog-v2"][data-size="x-large"]:has(.ph-root[data-embedded="true"]) [data-slot="dialog-container"] {
-  width: min(100vw - 48px, 1180px);
-  height: min(100vh - 88px, 780px);
-  min-width: min(100vw - 48px, 720px);
-  min-height: min(100vh - 88px, 480px);
-  max-width: calc(100vw - 24px);
-  max-height: calc(100vh - 24px);
-  resize: both;
-}
-[data-component="dialog-v2"][data-size="x-large"]:has(.ph-detail) [data-slot="dialog-container"] {
-  width: min(100vw - 48px, 1180px);
-  height: min(100vh - 88px, 780px);
-  min-width: min(100vw - 48px, 720px);
-  min-height: min(100vh - 88px, 480px);
-  max-width: calc(100vw - 24px);
-  max-height: calc(100vh - 24px);
-  resize: both;
-}
-/* Notices and the toolbar share one sticky head, so a note raised after an
-   action (e.g. updating a plugin near the bottom of the list) is always on
-   screen instead of appearing far above the current scroll position. */
-.ph-head {
-  position: sticky;
-  top: 0;
-  z-index: 3;
-  display: flex;
-  flex-direction: column;
-  gap: 14px;
-  padding: 6px 0;
-  margin: -6px 0;
-  background: color-mix(in srgb, var(--color-v2-background-bg-base, Canvas) 92%, transparent);
-  backdrop-filter: blur(8px);
-}
-
-/* footer */
-.ph-footer {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  padding-top: 12px;
-  border-top: 1px solid var(--ph-border);
-}
-.ph-footer-note { flex: 1; font-size: 11px; line-height: 1.55; color: var(--ph-muted); }
-
-@media (max-width: 760px) {
-  .ph-hero { flex-direction: column; }
-  .ph-list { grid-template-columns: 1fr; }
-  .ph-detail-stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-}
-`
 
 interface DetailDialogProps {
   ctx: Context
@@ -862,69 +162,53 @@ function DetailDialog(props: DetailDialogProps) {
   }
 
   const version = () => data()?.version || props.fallback?.version || ""
+  const current = () => data()?.current || ""
   const description = () => data()?.description || props.fallback?.description || ""
   const homepage = () => data()?.homepage || props.fallback?.homepage || ""
   const repo = () => data()?.repo || props.fallback?.repo || ""
   const npm = () => data()?.npm || props.fallback?.npm || `https://www.npmjs.com/package/${props.name}`
+  const bugs = () => data()?.bugs || ""
   const canInstall = () => !loading() && data() !== undefined && !failure() && (data()?.version ?? "") !== ""
   const update = () => data()?.hasUpdate === true
   const installed = () => data()?.installed === true
 
   return (
     <ui.Dialog
-      title={props.name}
+      title="插件详情"
       size="x-large"
       footer={
         <div class="ph-dialog-footer">
-          <Show when={homepage()}>
-            <ui.Button size="small" variant="ghost" icon="globe" onClick={() => open(homepage())}>
-              主页
-            </ui.Button>
-          </Show>
-          <Show when={repo()}>
-            <ui.Button
-              size="small"
-              variant="ghost"
-              icon="github"
-              onClick={() => open(repoLink(repo(), data()?.repoDir ?? ""))}
-            >
-              源码
-            </ui.Button>
-          </Show>
-          <Show when={npm()}>
-            <ui.Button size="small" variant="ghost" icon="cube" onClick={() => open(npm())}>
-              npm
-            </ui.Button>
-          </Show>
+          <div class="ph-dialog-links">
+            <Show when={homepage()}>
+              <ui.Button size="small" variant="ghost" icon="globe" onClick={() => open(homepage())}>
+                主页
+              </ui.Button>
+            </Show>
+            <Show when={repo()}>
+              <ui.Button
+                size="small"
+                variant="ghost"
+                icon="github"
+                onClick={() => open(repoLink(repo(), data()?.repoDir ?? ""))}
+              >
+                源码
+              </ui.Button>
+            </Show>
+            <Show when={npm()}>
+              <ui.Button size="small" variant="ghost" icon="cube" onClick={() => open(npm())}>
+                npm
+              </ui.Button>
+            </Show>
+            <Show when={bugs()}>
+              <ui.Button size="small" variant="ghost" icon="bubble-5" onClick={() => open(bugs())}>
+                问题反馈
+              </ui.Button>
+            </Show>
+          </div>
           <span class="ph-spacer" />
-          <Show when={failure()}>
-            <span class="ph-detail-error" title={failure()}>
-              {failure()}
-            </span>
-          </Show>
           <ui.Button size="small" onClick={props.onClose}>
             关闭
           </ui.Button>
-          <Show when={canInstall()}>
-            <Show
-              when={update() || !installed()}
-              fallback={
-                <ui.Button size="small" disabled>
-                  已安装
-                </ui.Button>
-              }
-            >
-              <ui.Button
-                variant="contrast"
-                size="small"
-                icon="download"
-                busy={props.busy}
-                onClick={() => props.onInstall(data()!.version)}
-              >
-                {update() ? `更新到 v${version()}` : `安装 v${version()}`}
-              </ui.Button>
-            </Show>
-          </Show>
         </div>
       }
     >
@@ -938,51 +222,50 @@ function DetailDialog(props: DetailDialogProps) {
 
         <Show when={!loading() && data()}>
           <div class="ph-detail-head">
-            <div class="ph-name-row">
-              <Show when={version()}>
-                <span class="ph-badge" data-tone="accent">
-                  v{version()}
-                </span>
-              </Show>
-              <Show when={installed()}>
-                <span class="ph-badge" data-tone="success">
-                  已安装{data()!.current ? ` v${data()!.current}` : ""}
-                </span>
-              </Show>
-              <Show when={update()}>
-                <span class="ph-badge" data-tone="warning">
-                  可更新
-                </span>
-              </Show>
-              <Show when={data()!.deprecated}>
-                <span class="ph-badge" data-tone="danger">
-                  已废弃
-                </span>
+            <div class="ph-detail-identity">
+              <div class="ph-tile ph-detail-avatar">{initial(data()!.name || props.name)}</div>
+              <div class="ph-detail-titles">
+                <div class="ph-detail-name">{data()!.name || props.name}</div>
+                <div class="ph-detail-pkg">npm 包 · {props.name}</div>
+                <div class="ph-detail-badges">
+                  <Show when={version()}>
+                    <span class="ph-badge" data-tone="accent">
+                      最新 v{version()}
+                    </span>
+                  </Show>
+                  <Show when={installed()}>
+                    <span class="ph-badge" data-tone="success">
+                      已安装{current() ? ` v${current()}` : ""}
+                    </span>
+                  </Show>
+                  <Show when={update()}>
+                    <span class="ph-badge" data-tone="warning">
+                      可更新
+                    </span>
+                  </Show>
+                  <Show when={data()!.deprecated}>
+                    <span class="ph-badge" data-tone="danger">
+                      已废弃
+                    </span>
+                  </Show>
+                </div>
+                <div class="ph-detail-desc">{description() || "这个包没有提供描述。"}</div>
+              </div>
+            </div>
+            <div class="ph-detail-primary">
+              <Show when={canInstall() && (update() || !installed())}>
+                <ui.Button
+                  variant="contrast"
+                  size="small"
+                  icon="download"
+                  busy={props.busy}
+                  onClick={() => props.onInstall(data()!.version)}
+                >
+                  {update() ? `更新到 v${version()}` : `安装 v${version()}`}
+                </ui.Button>
               </Show>
             </div>
-            <div class="ph-detail-desc">{description() || "这个包没有提供描述。"}</div>
           </div>
-
-          <Show when={data()!.version}>
-            <div class="ph-detail-stats">
-              <div class="ph-detail-stat">
-                <b title={countTitle(data()!.weekly, "周下载")}>{formatCount(data()!.weekly)}</b>
-                <span>周下载</span>
-              </div>
-              <div class="ph-detail-stat">
-                <b title={countTitle(data()!.monthly, "月下载")}>{formatCount(data()!.monthly)}</b>
-                <span>月下载</span>
-              </div>
-              <div class="ph-detail-stat">
-                <b>{data()!.versions || "—"}</b>
-                <span>已发布版本</span>
-              </div>
-              <div class="ph-detail-stat">
-                <b>{data()!.unpacked ? formatBytes(data()!.unpacked) : "—"}</b>
-                <span>{data()!.files ? `解包体积 · ${data()!.files} 文件` : "解包体积"}</span>
-              </div>
-            </div>
-          </Show>
 
           <Show when={data()!.deprecated}>
             <div class="ph-warning">
@@ -998,65 +281,110 @@ function DetailDialog(props: DetailDialogProps) {
             </div>
           </Show>
 
-          <div class="ph-detail-meta">
-            <Show when={data()!.license}>
-              <span class="ph-chip">许可证 {data()!.license}</span>
-            </Show>
-            <Show when={data()!.published}>
-              <span class="ph-chip">发布于 {relativeDate(data()!.published)}</span>
-            </Show>
-            <Show when={data()!.created}>
-              <span class="ph-chip">首次发布 {relativeDate(data()!.created)}</span>
-            </Show>
-            <Show when={data()!.maintainers.length > 0}>
-              <span class="ph-chip">维护者 {data()!.maintainers.join(", ")}</span>
-            </Show>
-          </div>
-
-          <Show when={data()!.keywords.length > 0}>
-            <div class="ph-chips">
-              <For each={data()!.keywords}>{(keyword) => <span class="ph-chip">{keyword}</span>}</For>
-            </div>
-          </Show>
-
-          <Show when={data()!.bugs}>
-            <div class="ph-detail-links">
-              <ui.Button
-                size="small"
-                variant="ghost-muted"
-                icon="bubble-5"
-                onClick={() => open(data()!.bugs)}
-              >
-                问题反馈
-              </ui.Button>
-            </div>
-          </Show>
-
-          <Show when={data()!.dependencies.length > 0}>
-            <details class="ph-details">
-              <summary>依赖 {data()!.dependencies.length} 个</summary>
-              <div class="ph-chips">
-                <For each={data()!.dependencies}>{(dep) => <span class="ph-chip">{dep}</span>}</For>
-              </div>
-            </details>
-          </Show>
-
-          <section class="ph-section">
-            <div class="ph-section-title">README</div>
-            <Show
-              when={data()!.readme}
-              fallback={
-                <div class="ph-readme-empty">
-                  这个包没有附带 README。可以打开 npm 页面或项目主页进一步了解。
+          <div class="ph-detail-layout">
+            <div class="ph-detail-main">
+              <section class="ph-section">
+                <div class="ph-section-head">
+                  <span class="ph-section-title">README</span>
+                  <span class="ph-readme-note">来自 npm</span>
                 </div>
-              }
-            >
-              <ui.Markdown text={data()!.readme} class="ph-readme" />
-              <Show when={data()!.readmeTruncated}>
-                <div class="ph-readme-note">README 较长，这里只显示前一部分。完整内容见 npm 页面。</div>
+                <Show
+                  when={data()!.readme}
+                  fallback={
+                    <div class="ph-readme-empty">
+                      这个包没有附带 README。可以打开 npm 页面或项目主页进一步了解。
+                    </div>
+                  }
+                >
+                  <ui.Markdown text={data()!.readme} class="ph-readme" />
+                  <Show when={data()!.readmeTruncated}>
+                    <div class="ph-readme-note">README 较长，这里只显示前一部分。完整内容见 npm 页面。</div>
+                  </Show>
+                </Show>
+              </section>
+            </div>
+
+            <aside class="ph-detail-side">
+              <Show when={data()!.version}>
+                <div class="ph-detail-stats">
+                  <div class="ph-detail-stat">
+                    <b title={countTitle(data()!.weekly, "周下载")}>{formatCount(data()!.weekly)}</b>
+                    <span>周下载</span>
+                  </div>
+                  <div class="ph-detail-stat">
+                    <b title={countTitle(data()!.monthly, "月下载")}>{formatCount(data()!.monthly)}</b>
+                    <span>月下载</span>
+                  </div>
+                  <div class="ph-detail-stat">
+                    <b>{data()!.versions || "—"}</b>
+                    <span>已发布版本</span>
+                  </div>
+                  <div class="ph-detail-stat">
+                    <b>{data()!.unpacked ? formatBytes(data()!.unpacked) : "—"}</b>
+                    <span>{data()!.files ? `解包体积 · ${data()!.files} 文件` : "解包体积"}</span>
+                  </div>
+                </div>
               </Show>
-            </Show>
-          </section>
+
+              <div class="ph-side-block">
+                <div class="ph-side-title">发布信息</div>
+                <div class="ph-meta-list">
+                  <div class="ph-meta-row">
+                    <span class="ph-meta-key">最新版本</span>
+                    <span class="ph-meta-value">{version() ? `v${version()}` : "—"}</span>
+                  </div>
+                  <div class="ph-meta-row">
+                    <span class="ph-meta-key">当前安装</span>
+                    <span class="ph-meta-value">{installed() ? (current() ? `v${current()}` : "已安装") : "未安装"}</span>
+                  </div>
+                  <Show when={data()!.published}>
+                    <div class="ph-meta-row">
+                      <span class="ph-meta-key">最新发布</span>
+                      <span class="ph-meta-value">{relativeDate(data()!.published)}</span>
+                    </div>
+                  </Show>
+                  <Show when={data()!.created}>
+                    <div class="ph-meta-row">
+                      <span class="ph-meta-key">首次发布</span>
+                      <span class="ph-meta-value">{relativeDate(data()!.created)}</span>
+                    </div>
+                  </Show>
+                  <Show when={data()!.license}>
+                    <div class="ph-meta-row">
+                      <span class="ph-meta-key">许可证</span>
+                      <span class="ph-meta-value">{data()!.license}</span>
+                    </div>
+                  </Show>
+                  <Show when={data()!.maintainers.length > 0}>
+                    <div class="ph-meta-row">
+                      <span class="ph-meta-key">维护者</span>
+                      <span class="ph-meta-value">{data()!.maintainers.join(", ")}</span>
+                    </div>
+                  </Show>
+                </div>
+              </div>
+
+              <Show when={data()!.keywords.length > 0}>
+                <div class="ph-side-block">
+                  <div class="ph-side-title">关键词</div>
+                  <div class="ph-chips">
+                    <For each={data()!.keywords}>{(keyword) => <span class="ph-chip">{keyword}</span>}</For>
+                  </div>
+                </div>
+              </Show>
+
+              <Show when={data()!.dependencies.length > 0}>
+                <div class="ph-side-block">
+                  <details class="ph-details">
+                    <summary>依赖 {data()!.dependencies.length} 个</summary>
+                    <div class="ph-chips">
+                      <For each={data()!.dependencies}>{(dep) => <span class="ph-chip">{dep}</span>}</For>
+                    </div>
+                  </details>
+                </div>
+              </Show>
+            </aside>
+          </div>
         </Show>
 
         <Show when={!loading() && !data()}>
@@ -1081,6 +409,9 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
   const [hits, setHits] = createSignal<readonly SearchHit[]>([])
   const [query, setQuery] = createSignal("")
   const [searched, setSearched] = createSignal(false)
+  /** 这批结果对应的关键词；输入框会先变，结果区只说已经搜过的那个词。 */
+  const [resultQuery, setResultQuery] = createSignal("")
+  const [searchError, setSearchError] = createSignal("")
   const [sort, setSort] = createSignal<Sort>("relevance")
   /** 搜索结果分批渲染：50 张卡一次挂载会拖慢首屏。 */
   const [hitLimit, setHitLimit] = createSignal(12)
@@ -1146,7 +477,15 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
       end(key)
     }
   }
-  const notify = (text: string, tone: Tone = "info") => setNote(text ? { text, tone } : undefined)
+  /** scope 让目录/搜索的失败只留在对应页签，不跟着用户跑到「已安装」。 */
+  const notify = (text: string, tone: Tone = "info", scope?: Tab) =>
+    setNote(text ? { text, tone, scope } : undefined)
+  const visibleNote = () => {
+    const current = note()
+    if (!current) return undefined
+    if (current.scope && current.scope !== tab()) return undefined
+    return current
+  }
 
   const refresh = async () => {
     try {
@@ -1215,11 +554,11 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
         setMeta(result)
         // A fallback source still shows the full list, so a network miss is a downgrade to note,
         // not an error to alarm about. Only the stale built-in snapshot is worth a warning.
-        if (result.error) notify(result.error, result.source === "builtin" ? "warning" : "info")
+        if (result.error) notify(result.error, result.source === "builtin" ? "warning" : "info", "catalog")
         // Keep the installed view in sync with what the catalog just reported.
         await refresh()
       } catch (error) {
-        notify(readableError(error), "error")
+        notify(readableError(error), "error", "catalog")
       }
     })
   }
@@ -1233,11 +572,18 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
         const result = await props.admin.search({ query: text })
         if (seq !== searchSeq) return
         setHits(result.hits)
+        setResultQuery(text.trim())
+        setSearchError(result.error)
         setSearched(true)
-        if (result.error) notify(result.error, "error")
+        if (result.error) notify(result.error, "error", "search")
       } catch (error) {
         if (seq !== searchSeq) return
-        notify(readableError(error), "error")
+        // 搜索失败时清空旧结果，避免用户把上一个关键词的结果当成这一次的。
+        setHits([])
+        setResultQuery(text.trim())
+        setSearchError(readableError(error))
+        setSearched(true)
+        notify(readableError(error), "error", "search")
       }
     })
   }
@@ -1464,6 +810,8 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
     return list
   })
   const visibleHits = createMemo(() => sortedHits().slice(0, hitLimit()))
+  const searchInstalledCount = createMemo(() => hits().filter((hit) => hit.installed).length)
+  const searchUpdateCount = createMemo(() => hits().filter((hit) => hit.hasUpdate).length)
   // 结果集合变化（新搜索、清空）后回到首批；副作用放在 createEffect 而不是 memo 里。
   createEffect(() => {
     void hits()
@@ -1512,6 +860,15 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
     pending: pendingRuntimeCount(),
     unknown: unknownCount(),
   }))
+  /** 只有确实存在问题项时才显示摘要；顺序与列表严重程度一致。 */
+  const attentionItems = createMemo(() => {
+    const items: { id: InstalledFilter; label: string; count: number; tone: "danger" | "accent" | "warning" }[] = []
+    if (failedCount() > 0) items.push({ id: "failed", label: "加载失败", count: failedCount(), tone: "danger" })
+    if (pendingRuntimeCount() > 0)
+      items.push({ id: "pending", label: "待加载", count: pendingRuntimeCount(), tone: "accent" })
+    if (outdated() > 0) items.push({ id: "update", label: "可更新", count: outdated(), tone: "warning" })
+    return items
+  })
   /** 问题项排前面：加载失败 → 待加载 → 可更新 → 未验证 → 已暂停 → 正常 → 配置规则，同级保持配置顺序。 */
   const severity = (entry: PluginEntry): number => {
     const status = runtimeState(entry)
@@ -1520,8 +877,9 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
     if (status === "pending") return 1
     if (updates().get(entry.spec)?.hasUpdate) return 2
     if (status === "unknown") return 3
-    if (status === "paused") return 5
-    return 4
+    // 暂停是用户主动造成的“不生效”，比正常项更值得先看到，但仍排在故障之后。
+    if (status === "paused") return 4
+    return 5
   }
   const visiblePlugins = createMemo(() => {
     const needle = installedQuery().trim().toLowerCase()
@@ -1632,12 +990,38 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
                 <span class="ph-name" title={entry.name}>
                   {entry.name}
                 </span>
+                <Show when={stale()}>
+                  <span class="ph-badge" data-tone="accent" title={`可更新至 v${info()!.latest}`}>
+                    可更新
+                  </span>
+                </Show>
+                <Show when={!stale() && entry.installed}>
+                  <span class="ph-badge" data-tone="success">
+                    已安装
+                  </span>
+                </Show>
               </div>
-              <Show when={entry.pkg}>
-                <span class="ph-pkg" title={entry.pkg}>
-                  {entry.pkg}
-                </span>
-              </Show>
+              <div class="ph-card-sub">
+                <Show
+                  when={entry.pkg}
+                  fallback={
+                    <span class="ph-pkg" title={entry.repo}>
+                      GitHub 仓库
+                    </span>
+                  }
+                >
+                  <span class="ph-pkg" title={entry.pkg}>
+                    {entry.pkg}
+                  </span>
+                </Show>
+                <Show when={entry.version}>
+                  <span class="ph-dot" />
+                  <span class="ph-version">v{entry.version}</span>
+                </Show>
+                <Show when={stale()}>
+                  <span class="ph-version-arrow">→ v{info()!.latest}</span>
+                </Show>
+              </div>
             </div>
           </div>
           <div
@@ -1656,20 +1040,6 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
             <div class="ph-desc ph-clamp">{entry.desc || entry.long || "—"}</div>
             <div class="ph-meta">
               <span class="ph-type">{TYPE_LABEL[entry.type] ?? entry.type}</span>
-              <Show when={entry.version}>
-                <span class="ph-dot" />
-                <span>v{entry.version}</span>
-              </Show>
-              <Show when={entry.installed}>
-                <span class="ph-badge" data-tone="success">
-                  已安装
-                </span>
-              </Show>
-              <Show when={stale()}>
-                <span class="ph-badge" data-tone="accent">
-                  可更新 → v{info()!.latest}
-                </span>
-              </Show>
               <Show when={!entry.pkg}>
                 <span class="ph-dot" />
                 <span>仅 GitHub 发布</span>
@@ -1682,44 +1052,48 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
           </div>
         </div>
         <div class="ph-actions">
-          <Show when={entry.pkg}>
-            <ui.Button variant="ghost" size="small" icon="eye" onClick={detail}>
-              详情
-            </ui.Button>
-          </Show>
-          <ui.Button
-            variant="ghost-muted"
-            size="small"
-            icon="square-arrow-top-right"
-            onClick={() => void openUrl(entry.repo)}
-          >
-            源码
-          </ui.Button>
-          <Show when={stale()}>
+          <div class="ph-actions-left">
+            <Show when={entry.pkg}>
+              <ui.Button variant="ghost" size="small" icon="eye" onClick={detail}>
+                详情
+              </ui.Button>
+            </Show>
             <ui.Button
-              variant="ghost"
+              variant="ghost-muted"
               size="small"
-              icon="download"
-              busy={busy()}
-              onClick={() => void updatePlugin(specFor(entry.pkg), entry.pkg)}
+              icon="square-arrow-top-right"
+              onClick={() => void openUrl(entry.repo)}
             >
-              更新
+              源码
             </ui.Button>
-          </Show>
-          <Show when={!stale() && !entry.installed && entry.pkg}>
-            <ui.Button
-              variant="neutral"
-              size="small"
-              icon="download"
-              busy={busy()}
-              onClick={() => void install(entry.pkg)}
-            >
-              安装
-            </ui.Button>
-          </Show>
-          <Show when={!stale() && !entry.installed && !entry.pkg}>
-            <span class="ph-badge">需手动</span>
-          </Show>
+          </div>
+          <div class="ph-actions-right">
+            <Show when={!stale() && !entry.installed && !entry.pkg}>
+              <span class="ph-badge">需手动</span>
+            </Show>
+            <Show when={stale()}>
+              <ui.Button
+                variant="neutral"
+                size="small"
+                icon="download"
+                busy={busy()}
+                onClick={() => void updatePlugin(specFor(entry.pkg), entry.pkg)}
+              >
+                更新
+              </ui.Button>
+            </Show>
+            <Show when={!stale() && !entry.installed && entry.pkg}>
+              <ui.Button
+                variant="neutral"
+                size="small"
+                icon="download"
+                busy={busy()}
+                onClick={() => void install(entry.pkg)}
+              >
+                安装
+              </ui.Button>
+            </Show>
+          </div>
         </div>
       </article>
     )
@@ -1735,7 +1109,11 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
         npm: hit.npm,
       })
     return (
-      <article class="ph-card" data-busy={isBusy(`install:${hit.name}`) ? "true" : undefined}>
+      <article
+        class="ph-card"
+        data-stale={hit.hasUpdate ? "true" : undefined}
+        data-busy={isBusy(`install:${hit.name}`) ? "true" : undefined}
+      >
         <div class="ph-card-main">
           <div class="ph-card-head">
             <div class="ph-tile">{initial(hit.name)}</div>
@@ -1744,8 +1122,28 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
                 <span class="ph-name" title={hit.name}>
                   {hit.name}
                 </span>
+                <Show when={hit.hasUpdate}>
+                  <span class="ph-badge" data-tone="accent">
+                    可更新
+                  </span>
+                </Show>
+                <Show when={!hit.hasUpdate && hit.installed}>
+                  <span class="ph-badge" data-tone="success">
+                    已安装
+                  </span>
+                </Show>
               </div>
-              <span class="ph-pkg">v{hit.version}</span>
+              <div class="ph-card-sub">
+                <span class="ph-pkg">npm</span>
+                <Show when={hit.version}>
+                  <span class="ph-dot" />
+                  <span class="ph-version">v{hit.version}</span>
+                </Show>
+                <Show when={hit.installed && hit.current}>
+                  <span class="ph-dot" />
+                  <span class="ph-version">当前 v{hit.current}</span>
+                </Show>
+              </div>
             </div>
           </div>
           <div
@@ -1762,7 +1160,7 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
           >
             <div class="ph-desc ph-clamp">{hit.description || "—"}</div>
             <div class="ph-meta">
-              <span title={countTitle(hit.weekly, "周下载")}>
+              <span class="ph-meta-strong" title={countTitle(hit.weekly, "周下载")}>
                 <ui.Icon name="download" size="small" />
                 {countWithUnit(hit.weekly, "周")}
               </span>
@@ -1776,60 +1174,54 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
                 <span class="ph-dot" />
                 <span>{relativeDate(hit.published)}更新</span>
               </Show>
-              <Show when={hit.installed}>
-                <span class="ph-badge" data-tone="success">
-                  已安装{hit.current ? ` v${hit.current}` : ""}
-                </span>
-              </Show>
-              <Show when={hit.hasUpdate}>
-                <span class="ph-badge" data-tone="accent">
-                  可更新 → v{hit.version}
-                </span>
-              </Show>
             </div>
           </div>
         </div>
         <div class="ph-actions">
-          <Show when={hit.homepage}>
-            <ui.Tooltip value="主页">
-              <ui.IconButton icon="globe" size="small" label="主页" onClick={() => void openUrl(hit.homepage)} />
-            </ui.Tooltip>
-          </Show>
-          <Show when={hit.repo}>
-            <ui.Tooltip value="源码仓库">
-              <ui.IconButton
-                icon="github"
+          <div class="ph-actions-left">
+            <Show when={hit.homepage}>
+              <ui.Tooltip value="主页">
+                <ui.IconButton icon="globe" size="small" label="主页" onClick={() => void openUrl(hit.homepage)} />
+              </ui.Tooltip>
+            </Show>
+            <Show when={hit.repo}>
+              <ui.Tooltip value="源码仓库">
+                <ui.IconButton
+                  icon="github"
+                  size="small"
+                  label="源码仓库"
+                  onClick={() => void openUrl(hit.repo)}
+                />
+              </ui.Tooltip>
+            </Show>
+            <ui.Button variant="ghost" size="small" icon="eye" onClick={detail}>
+              详情
+            </ui.Button>
+          </div>
+          <div class="ph-actions-right">
+            <Show when={hit.hasUpdate}>
+              <ui.Button
+                variant="neutral"
                 size="small"
-                label="源码仓库"
-                onClick={() => void openUrl(hit.repo)}
-              />
-            </ui.Tooltip>
-          </Show>
-          <ui.Button variant="ghost" size="small" icon="eye" onClick={detail}>
-            详情
-          </ui.Button>
-          <Show when={hit.hasUpdate}>
-            <ui.Button
-              variant="ghost"
-              size="small"
-              icon="download"
-              busy={isBusy(`install:${hit.name}`)}
-              onClick={() => void updatePlugin(specFor(hit.name), hit.name)}
-            >
-              更新
-            </ui.Button>
-          </Show>
-          <Show when={!hit.hasUpdate && !hit.installed}>
-            <ui.Button
-              variant="neutral"
-              size="small"
-              icon="download"
-              busy={isBusy(`install:${hit.name}`)}
-              onClick={() => void install(hit.name)}
-            >
-              安装
-            </ui.Button>
-          </Show>
+                icon="download"
+                busy={isBusy(`install:${hit.name}`)}
+                onClick={() => void updatePlugin(specFor(hit.name), hit.name)}
+              >
+                更新
+              </ui.Button>
+            </Show>
+            <Show when={!hit.hasUpdate && !hit.installed}>
+              <ui.Button
+                variant="neutral"
+                size="small"
+                icon="download"
+                busy={isBusy(`install:${hit.name}`)}
+                onClick={() => void install(hit.name)}
+              >
+                安装
+              </ui.Button>
+            </Show>
+          </div>
         </div>
       </article>
     )
@@ -1855,6 +1247,15 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
     const runtimeStatus = () => runtimeState(entry)
     /** 运行时 ID 与包名不一致时单独列出来：暂停/恢复用的就是这个 ID。 */
     const runtimeId = () => runtimeInfo()?.id || ""
+    /** 徽章的语气与运行状态一一对应；暂停和规则用中性，不把用户的选择画成故障。 */
+    const runtimeTone = () => {
+      const status = runtimeStatus()
+      if (status === "failed") return "danger"
+      if (status === "unknown") return "warning"
+      if (status === "pending") return "accent"
+      if (status === "loaded") return "success"
+      return undefined
+    }
     const runtimeLabel = () =>
       runtimeStatus() === "loaded"
         ? "运行中"
@@ -1897,12 +1298,14 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
         class="ph-card"
         data-stale={stale() ? "true" : undefined}
         data-busy={busy() ? "true" : undefined}
-        data-paused={runtimeStatus() === "paused" ? "true" : undefined}
+        data-status={runtimeStatus()}
       >
         <div class="ph-card-main">
           <div class="ph-card-head">
             <div class="ph-tile" data-runtime={runtimeStatus()}>
-              {initial(entry.name)}
+              <Show when={control() || rule()} fallback={initial(entry.name)}>
+                <ui.Icon name={control() ? "circle-ban-sign" : "check"} size="normal" />
+              </Show>
             </div>
             <div class="ph-card-titles">
               <div class="ph-name-row">
@@ -1928,28 +1331,13 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
               </div>
             </div>
           </div>
-          <div class="ph-card-body">
-            {/* 失败原因占用描述的两行位置，而不是把卡片撑高、让同排卡片留白。 */}
-            <Show
-              when={runtimeInfo()?.error}
-              fallback={
-                <div class="ph-desc ph-clamp" title={summary() || entry.spec}>
-                  {summary() || entry.spec}
-                </div>
-              }
-            >
-              <div class="ph-runtime-error ph-clamp" title={`${entry.spec}\n${runtimeInfo()!.error}`}>
-                加载失败：{runtimeInfo()!.error}
-              </div>
-            </Show>
-          </div>
           <div class="ph-card-status">
-            <span class="ph-badge" data-runtime={runtimeStatus()} title={runtimeHint()}>
+            <span class="ph-badge" data-runtime={runtimeStatus()} data-tone={runtimeTone()} title={runtimeHint()}>
               {runtimeLabel()}
             </span>
             <Show when={entry.kind === "path"}>
               <span class="ph-badge" title="本地目录插件由外部维护：目录里可能有你的改动，插件中心不会覆盖它">
-                本地目录 · 外部维护
+                本地目录
               </span>
             </Show>
             <Show when={stale()}>
@@ -1974,62 +1362,81 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
               </span>
             </Show>
           </div>
+          <div class="ph-card-body">
+            {/* 失败原因占用描述的两行位置，而不是把卡片撑高、让同排卡片留白。 */}
+            <Show
+              when={runtimeInfo()?.error}
+              fallback={
+                <div class="ph-desc ph-clamp" title={summary() || entry.spec}>
+                  {summary() || entry.spec}
+                </div>
+              }
+            >
+              <div class="ph-runtime-error ph-clamp" title={`${entry.spec}\n${runtimeInfo()!.error}`}>
+                加载失败：{runtimeInfo()!.error}
+              </div>
+            </Show>
+          </div>
         </div>
         <div class="ph-actions">
-          <Show when={packageLike() && NPM_LIKE.test(entry.name)}>
-            <ui.Button
-              variant="ghost"
-              size="small"
-              icon="eye"
-              onClick={() => openDetail(entry.name, { version: current() })}
-            >
-              详情
-            </ui.Button>
-          </Show>
-          <Show when={stale()}>
-            <ui.Button
-              variant="ghost"
-              size="small"
-              icon="download"
-              busy={busy()}
-              onClick={() => void updatePlugin(entry.spec, entry.name)}
-            >
-              更新
-            </ui.Button>
-          </Show>
-          <Show when={canPause()}>
-            <ui.Button
-              variant="ghost-muted"
-              size="small"
-              icon="circle-ban-sign"
-              busy={busy()}
-              onClick={() => void pausePlugin(entry)}
-            >
-              暂停
-            </ui.Button>
-          </Show>
-          <Show when={runtimeStatus() === "paused"}>
-            <ui.Button
-              variant="ghost"
-              size="small"
-              icon="check"
-              busy={busy()}
-              onClick={() => void resumePlugin(entry)}
-            >
-              恢复
-            </ui.Button>
-          </Show>
-          <Show when={entry.removable}>
-            <ui.Button
-              variant="ghost-muted"
-              size="small"
-              icon="trash"
-              busy={busy()}
-              onClick={() => void uninstall(entry)}
-            >
-              移除
-            </ui.Button>
-          </Show>
+          <div class="ph-actions-left">
+            <Show when={packageLike() && NPM_LIKE.test(entry.name)}>
+              <ui.Button
+                variant="ghost"
+                size="small"
+                icon="eye"
+                onClick={() => openDetail(entry.name, { version: current() })}
+              >
+                详情
+              </ui.Button>
+            </Show>
+          </div>
+          <div class="ph-actions-right">
+            <Show when={stale()}>
+              <ui.Button
+                variant="neutral"
+                size="small"
+                icon="download"
+                busy={busy()}
+                onClick={() => void updatePlugin(entry.spec, entry.name)}
+              >
+                更新
+              </ui.Button>
+            </Show>
+            <Show when={canPause()}>
+              <ui.Button
+                variant="ghost-muted"
+                size="small"
+                icon="circle-ban-sign"
+                busy={busy()}
+                onClick={() => void pausePlugin(entry)}
+              >
+                暂停
+              </ui.Button>
+            </Show>
+            <Show when={runtimeStatus() === "paused"}>
+              <ui.Button
+                variant="ghost"
+                size="small"
+                icon="check"
+                busy={busy()}
+                onClick={() => void resumePlugin(entry)}
+              >
+                恢复
+              </ui.Button>
+            </Show>
+            <Show when={entry.removable}>
+              <ui.Button
+                variant="ghost-muted"
+                size="small"
+                icon="trash"
+                busy={busy()}
+                onClick={() => void uninstall(entry)}
+              >
+                移除
+              </ui.Button>
+            </Show>
+          </div>
         </div>
       </article>
     )
@@ -2053,12 +1460,13 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
 
       <section class="ph-hero">
         <div class="ph-hero-copy">
-          <div class="ph-kicker">
-            <ui.Icon name="extensions" size="small" />
-            PLUGIN HUB
-          </div>
           <Show when={!props.embedded}>
-            <h2 class="ph-title">插件中心</h2>
+            <h2 class="ph-title">
+              <span class="ph-title-icon">
+                <ui.Icon name="extensions" size="small" />
+              </span>
+              插件中心
+            </h2>
           </Show>
           <p class="ph-sub">
             浏览{" "}
@@ -2070,114 +1478,133 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
             >
               awesome-opencode
             </button>{" "}
-            社区维护的精选目录、搜索 npm 上的 OpenCode 插件。安装前先看下载量、README 和主页，确认它到底能做什么。
+            社区维护的精选目录与 npm 上的 OpenCode 插件。安装前先看 README 与来源。
           </p>
-          <div class="ph-path" title={state()?.configPath}>
-            配置：<code>{state()?.configPath ?? "读取中…"}</code> · <code>{state()?.configKey ?? "plugins"}[]</code>
-          </div>
+        </div>
+        <div class="ph-path" title={state()?.configPath}>
+          <span class="ph-path-key">配置</span>
+          <code>{state()?.configPath ?? "读取中…"}</code>
+          <span class="ph-dot" />
+          <code>{state()?.configKey ?? "plugins"}[]</code>
         </div>
       </section>
 
+      <Show when={visibleNote() || state()?.error || runtimeError()}>
+        <div class="ph-notices">
+          <Show when={visibleNote()}>
+            <div class="ph-notice" data-tone={visibleNote()!.tone}>
+              <ui.Icon name={noteIcon(visibleNote()!.tone)} size="small" />
+              <span class="ph-notice-text">{visibleNote()!.text}</span>
+              <button type="button" class="ph-notice-close" aria-label="关闭提示" onClick={() => setNote(undefined)}>
+                <ui.Icon name="close" size="small" />
+              </button>
+            </div>
+          </Show>
+
+          <Show when={state()?.error}>
+            <div class="ph-notice" data-tone="error">
+              <ui.Icon name="circle-exclamation" size="small" />
+              <span class="ph-notice-text">{state()!.error}</span>
+            </div>
+          </Show>
+
+          {/* 运行时读取失败不是一次弹完就忘的提示：留在页面上，直到重试成功或用户处理。 */}
+          <Show when={runtimeError()}>
+            <div class="ph-notice" data-tone="warning">
+              <ui.Icon name="circle-exclamation" size="small" />
+              <span class="ph-notice-body">{runtimeError()}。配置操作不受影响，可重试读取。</span>
+              <div class="ph-notice-action">
+                <ui.Button size="small" variant="ghost" icon="outline-rotate-clockwise" onClick={() => void loadRuntime()}>
+                  重试
+                </ui.Button>
+              </div>
+            </div>
+          </Show>
+        </div>
+      </Show>
+
       <div class="ph-head">
-        <Show when={note()}>
-          <div class="ph-notice" data-tone={note()!.tone}>
-            <ui.Icon name={noteIcon(note()!.tone)} size="small" />
-            <span>{note()!.text}</span>
-            <button type="button" class="ph-notice-close" aria-label="关闭提示" onClick={() => setNote(undefined)}>
-              <ui.Icon name="close" size="small" />
+        {/* 待生效变更常驻在工具栏，不占用正文高度；点击即可重载。 */}
+        <Show when={hasPendingChanges()}>
+          <div
+            class="ph-pending"
+            title="受监控的配置由 OpenCode 自动重新加载。需要立刻确认时点「立即重载」；插件中心只写配置，不接管宿主进程。"
+          >
+            <ui.Icon name="outline-rotate-clockwise" size="small" />
+            <span>{pendingChangesCount()} 项配置变更等待宿主加载</span>
+            <button type="button" class="ph-link" onClick={() => void reload()}>
+              立即重载
             </button>
           </div>
         </Show>
 
-        <Show when={state()?.error}>
-          <div class="ph-notice" data-tone="error">
-            <ui.Icon name="circle-exclamation" size="small" />
-            <span>{state()!.error}</span>
-          </div>
-        </Show>
-
-        {/* 待生效变更常驻在工具栏上方，直到宿主加载为止；不能只在安装后提示一次。 */}
-        <Show when={runtimeError()}>
-          <div class="ph-notice" data-tone="warning">
-            <ui.Icon name="circle-exclamation" size="small" />
-            <span>{runtimeError()}。配置操作不受影响，可重试读取。</span>
-            <ui.Button size="small" variant="ghost" icon="outline-rotate-clockwise" onClick={() => void loadRuntime()}>
-              重试
-            </ui.Button>
-          </div>
-        </Show>
-        <Show when={hasPendingChanges()}>
-          <div class="ph-notice" data-tone="info">
-            <ui.Icon name="outline-rotate-clockwise" size="small" />
-            <span>
-              有 {pendingChangesCount()} 项配置变更尚未被宿主加载。受监控的配置由 OpenCode 自动重新加载，需要立刻确认时点工具栏「重载配置」。插件中心只写配置，不接管宿主进程。
-            </span>
-          </div>
-        </Show>
-
         <div class="ph-toolbar">
-        <div class="ph-tabs" role="tablist">
-          {tabButton("catalog", "精选目录", "extensions", meta() ? catalog().length : undefined)}
-          {tabButton("search", "npm 搜索", "magnifying-glass", searched() ? hits().length : undefined)}
-          {tabButton("installed", "已安装", "checklist", state()?.plugins.length ?? 0, outdated())}
-        </div>
-        <span class="ph-spacer" />
-        <Show when={tab() === "catalog"}>
-          <ui.Button
-            variant="ghost"
-            size="small"
-            icon="refresh"
-            busy={isBusy("catalog")}
-            onClick={() => void loadCatalog(true)}
-          >
-            更新目录
-          </ui.Button>
-        </Show>
-        <Show when={tab() === "search"}>
-          <Show when={searched()}>
+          <div class="ph-tabs" role="tablist">
+            {tabButton("catalog", "精选目录", "extensions", meta() ? catalog().length : undefined)}
+            {tabButton("search", "npm 搜索", "magnifying-glass", searched() ? hits().length : undefined)}
+            {tabButton("installed", "已安装", "checklist", state()?.plugins.length ?? 0, outdated())}
+          </div>
+          <span class="ph-spacer" />
+          <Show when={tab() === "catalog"}>
             <ui.Button
               variant="ghost"
               size="small"
-              icon="close"
-              onClick={() => {
-                setHits([])
-                setSearched(false)
-                setQuery("")
-                setNote(undefined)
-                searchSeq += 1 // 丢弃仍在路上的搜索结果
-              }}
+              icon="refresh"
+              busy={isBusy("catalog")}
+              onClick={() => void loadCatalog(true)}
             >
-              清空
+              更新目录
             </ui.Button>
           </Show>
-        </Show>
-        <Show when={tab() === "installed"}>
-          <ui.Button
-            variant="ghost"
-            size="small"
-            icon="refresh"
-            busy={isBusy("updates")}
-            onClick={() => void checkUpdates()}
-          >
-            检查更新
-          </ui.Button>
+          <Show when={tab() === "search"}>
+            <Show when={searched()}>
+              <ui.Button
+                variant="ghost"
+                size="small"
+                icon="close"
+                onClick={() => {
+                  if (searchTimer) window.clearTimeout(searchTimer)
+                  lastSearch = ""
+                  searchSeq += 1 // 丢弃仍在路上的搜索结果
+                  setHits([])
+                  setSearched(false)
+                  setQuery("")
+                  setResultQuery("")
+                  setSearchError("")
+                  setNote(undefined)
+                }}
+              >
+                清空
+              </ui.Button>
+            </Show>
           </Show>
-        {/* 低频管理操作收进溢出菜单，工具栏只留当前任务需要的动作 */}
-        <ui.Menu
-          label="更多操作"
-          icon="outline-dots"
-          placement="bottom-end"
-          items={[
-            {
-              type: "group",
-              label: "配置",
-              items: [
-                { label: "打开配置文件", icon: "open-file", onSelect: () => void openConfig() },
-                { label: "重载配置", icon: "refresh", onSelect: () => void reload() },
-              ],
-            },
-          ]}
-        />
+          <Show when={tab() === "installed"}>
+            <ui.Button
+              variant="ghost"
+              size="small"
+              icon="refresh"
+              busy={isBusy("updates")}
+              onClick={() => void checkUpdates()}
+            >
+              检查更新
+            </ui.Button>
+          </Show>
+          {/* 低频管理操作收进溢出菜单，工具栏只留当前任务需要的动作 */}
+          <ui.Menu
+            label="更多操作"
+            icon="outline-dots"
+            placement="bottom-end"
+            items={[
+              {
+                type: "group",
+                label: "配置",
+                items: [
+                  { label: "打开配置文件", icon: "open-file", onSelect: () => void openConfig() },
+                  { label: "重载配置", icon: "refresh", onSelect: () => void reload() },
+                ],
+              },
+            ]}
+          />
         </div>
       </div>
 
@@ -2218,6 +1645,29 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
               </div>
             </div>
 
+            <Show when={catalog().length > 0 || filter() !== "" || typeFilter() !== "all"}>
+              <div class="ph-resultline">
+                <span>
+                  共 <strong>{catalog().length}</strong> 个精选
+                </span>
+                <Show when={filter() !== "" || typeFilter() !== "all"}>
+                  <span>
+                    · 匹配 <strong>{visible().length}</strong> 个
+                  </span>
+                  <button
+                    class="ph-clear"
+                    onClick={() => {
+                      setFilter("")
+                      setTypeFilter("all")
+                      setLimit(PAGE)
+                    }}
+                  >
+                    清除筛选
+                  </button>
+                </Show>
+              </div>
+            </Show>
+
             <Show when={isBusy("catalog") && catalog().length === 0}>
               <div class="ph-list">
                 <For each={[0, 1, 2, 3]}>{() => <div class="ph-skeleton" />}</For>
@@ -2234,7 +1684,9 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
                     when={meta()?.error && catalog().length === 0}
                     fallback={
                       <div class="ph-empty">
-                        <ui.Icon name="magnifying-glass" size="large" />
+                        <div class="ph-empty-icon">
+                          <ui.Icon name="magnifying-glass" size="large" />
+                        </div>
                         <strong>没有匹配的插件</strong>
                         <span>试试别的关键词，或者清除筛选条件。</span>
                         <ui.Button
@@ -2243,6 +1695,7 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
                           onClick={() => {
                             setFilter("")
                             setTypeFilter("all")
+                            setLimit(PAGE)
                           }}
                         >
                           清除筛选
@@ -2251,7 +1704,9 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
                     }
                   >
                     <div class="ph-empty">
-                      <ui.Icon name="circle-exclamation" size="large" />
+                      <div class="ph-empty-icon">
+                        <ui.Icon name="circle-exclamation" size="large" />
+                      </div>
                       <strong>插件目录没能加载</strong>
                       <span>{meta()!.error}</span>
                       <ui.Button
@@ -2270,9 +1725,11 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
                   <For each={visible().slice(0, limit())}>{(entry) => catalogRow(entry)}</For>
                 </div>
                 <Show when={visible().length > limit()}>
-                  <ui.Button variant="ghost" size="small" onClick={() => setLimit((n) => n + PAGE)}>
-                    显示更多（还有 {visible().length - limit()} 个）
-                  </ui.Button>
+                  <div class="ph-more">
+                    <ui.Button variant="ghost" size="small" onClick={() => setLimit((n) => n + PAGE)}>
+                      显示更多（还有 {visible().length - limit()} 个）
+                    </ui.Button>
+                  </div>
                 </Show>
               </Show>
             </Show>
@@ -2312,7 +1769,9 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
 
             <Show when={!searched()}>
               <div class="ph-empty">
-                <ui.Icon name="magnifying-glass" size="large" />
+                <div class="ph-empty-icon">
+                  <ui.Icon name="magnifying-glass" size="large" />
+                </div>
                 <strong>搜索 npm 上的 OpenCode 插件</strong>
                 <span>按名称或用途搜索，例如 auth、notify、memory。点开任意结果可以看 README、下载量和主页。</span>
                 <div class="ph-chips">
@@ -2329,9 +1788,22 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
 
             <Show when={searched()}>
               <div class="ph-resultbar">
-                <h3 class="ph-h3">
-                  搜索结果 <span class="ph-count">{sortedHits().length}</span>
-                </h3>
+                <div class="ph-resultline">
+                  <Show when={resultQuery()} fallback={<span>搜索结果</span>}>
+                    <span>
+                      “<strong>{resultQuery()}</strong>” 的结果
+                    </span>
+                  </Show>
+                  <span>
+                    · 共 <strong>{sortedHits().length}</strong> 个
+                  </span>
+                  <Show when={searchInstalledCount() > 0}>
+                    <span>· {searchInstalledCount()} 个已安装</span>
+                  </Show>
+                  <Show when={searchUpdateCount() > 0}>
+                    <span>· {searchUpdateCount()} 个可更新</span>
+                  </Show>
+                </div>
                 <div class="ph-sort">
                   <For each={SORTS}>
                     {(item) => (
@@ -2353,24 +1825,49 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
                 <Show
                   when={sortedHits().length > 0}
                   fallback={
-                    <div class="ph-empty">
-                      <ui.Icon name="magnifying-glass" size="large" />
-                      <strong>没有找到匹配的插件</strong>
-                      <span>换个关键词试试，或者清空搜索查看建议。</span>
-                    </div>
+                    <Show
+                      when={searchError()}
+                      fallback={
+                        <div class="ph-empty">
+                          <div class="ph-empty-icon">
+                            <ui.Icon name="magnifying-glass" size="large" />
+                          </div>
+                          <strong>没有找到匹配的插件</strong>
+                          <span>换个关键词试试，或者清空搜索查看建议。</span>
+                        </div>
+                      }
+                    >
+                      <div class="ph-empty">
+                        <div class="ph-empty-icon">
+                          <ui.Icon name="circle-exclamation" size="large" />
+                        </div>
+                        <strong>搜索没有完成</strong>
+                        <span>{searchError()}</span>
+                        <ui.Button
+                          variant="ghost"
+                          size="small"
+                          busy={isBusy("search")}
+                          onClick={() => void runSearch(resultQuery() || query())}
+                        >
+                          重试
+                        </ui.Button>
+                      </div>
+                    </Show>
                   }
                 >
                   <div class="ph-list">
                     <For each={visibleHits()}>{(hit) => searchRow(hit)}</For>
                   </div>
                   <Show when={sortedHits().length > visibleHits().length}>
-                    <ui.Button
-                      variant="ghost"
-                      size="small"
-                      onClick={() => setHitLimit((n) => n + 12)}
-                    >
-                      显示更多（还有 {sortedHits().length - visibleHits().length} 个）
-                    </ui.Button>
+                    <div class="ph-more">
+                      <ui.Button
+                        variant="ghost"
+                        size="small"
+                        onClick={() => setHitLimit((n) => n + 12)}
+                      >
+                        显示更多（还有 {sortedHits().length - visibleHits().length} 个）
+                      </ui.Button>
+                    </div>
                   </Show>
                 </Show>
               </Show>
@@ -2380,10 +1877,30 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
 
         <Match when={tab() === "installed"}>
           <section class="ph-panel" role="tabpanel" id="ph-tabpanel" aria-labelledby={`ph-tab-${tab()}`}>
+            <Show when={attentionItems().length > 0}>
+              <div class="ph-attention">
+                <span class="ph-attention-lead">
+                  <ui.Icon name="circle-exclamation" size="small" />
+                  需要关注
+                </span>
+                <div class="ph-attention-items">
+                  <For each={attentionItems()}>
+                    {(item) => (
+                      <button
+                        class="ph-attention-chip"
+                        data-tone={item.tone}
+                        onClick={() => setInstalledFilter(item.id)}
+                      >
+                        {item.count} {item.label}
+                      </button>
+                    )}
+                  </For>
+                </div>
+                <span class="ph-attention-hint">点击按状态筛选</span>
+              </div>
+            </Show>
+
             <div class="ph-installed-bar">
-              <h3 class="ph-h3">
-                已安装 <span class="ph-count">{state()?.plugins.length ?? 0}</span>
-              </h3>
               <div class="ph-installed-search">
                 <ui.TextInput
                   label="搜索已安装插件"
@@ -2401,22 +1918,44 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
                 {installedFilterButton("pending", "待加载")}
                 {installedFilterButton("unknown", "未验证")}
               </div>
-              <span class="ph-spacer" />
-              <Show when={checked()}>
-                <span class="ph-meta">
-                  {uncheckedCount() > 0
-                    ? `已检查 ${Math.max(0, (state()?.plugins.length ?? 0) - uncheckedCount())} 个 · ${uncheckedCount()} 个未能检查${outdated() > 0 ? ` · ${outdated()} 个可更新` : ""}`
-                    : outdated() > 0
-                      ? `检查过 npm registry · ${outdated()} 个可更新`
-                      : "检查过 npm registry · 已检查的插件均为最新"}
-                </span>
+              <Show when={installedQuery() !== "" || installedFilter() !== "all"}>
+                <button
+                  class="ph-clear"
+                  onClick={() => {
+                    setInstalledFilter("all")
+                    setInstalledQuery("")
+                  }}
+                >
+                  清除筛选
+                </button>
               </Show>
             </div>
+
+            <div class="ph-resultline">
+              <span>
+                显示 <strong>{visiblePlugins().length}</strong> / {state()?.plugins.length ?? 0} 个
+              </span>
+              <Show when={checked()}>
+                <span>
+                  ·{" "}
+                  {uncheckedCount() > 0
+                    ? `已检查 ${Math.max(0, (state()?.plugins.length ?? 0) - uncheckedCount())} 个，${uncheckedCount()} 个未能检查${outdated() > 0 ? `，${outdated()} 个可更新` : ""}`
+                    : outdated() > 0
+                      ? `检查过 npm registry，${outdated()} 个可更新`
+                      : "检查过 npm registry，已检查的插件均为最新"}
+                </span>
+              </Show>
+              <span class="ph-spacer" />
+              <span title="同级条目保持配置里的原始顺序">按严重程度排序</span>
+            </div>
+
             <Show
               when={(state()?.plugins.length ?? 0) > 0}
               fallback={
                 <div class="ph-empty">
-                  <ui.Icon name="extensions" size="large" />
+                  <div class="ph-empty-icon">
+                    <ui.Icon name="extensions" size="large" />
+                  </div>
                   <strong>还没有安装插件</strong>
                   <span>去「精选目录」看看 awesome-opencode 的推荐，或者在「npm 搜索」里找长尾插件。</span>
                 </div>
@@ -2426,7 +1965,9 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
                 when={visiblePlugins().length > 0}
                 fallback={
                   <div class="ph-empty">
-                    <ui.Icon name={installedQuery().trim() ? "magnifying-glass" : "checklist"} size="large" />
+                    <div class="ph-empty-icon">
+                      <ui.Icon name={installedQuery().trim() ? "magnifying-glass" : "checklist"} size="large" />
+                    </div>
                     <Show
                       when={installedQuery().trim()}
                       fallback={
@@ -2457,7 +1998,12 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
                 </div>
                 {/* 运行时里存在、但全局配置没列出的插件：来自发现目录或项目配置，只做告知。 */}
                 <Show when={discovered().length > 0}>
-                  <div class="ph-meta" title={discovered().map((item) => `${item.id || "(无 ID)"} ${item.version || ""} ${item.source}`).join("\n")}>
+                  <div
+                    class="ph-meta"
+                    title={discovered()
+                      .map((item) => `${item.id || "(无 ID)"} ${item.version || ""} ${item.source}`)
+                      .join("\n")}
+                  >
                     <ui.Icon name="info" size="small" />
                     运行时还报告了 {discovered().length} 个不在全局配置里的插件（发现目录或项目配置）：
                     {discovered()
