@@ -12,10 +12,48 @@
  *    改一行，下标就指错了条目 —— 那会删掉别人的插件。因此这里只接受「计划函数」，
  *    计划函数拿到的是队列内刚刚重读的文件。
  */
-import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises"
+import { chmod, lstat, mkdir, readFile, realpath, rename, rm, stat, writeFile } from "node:fs/promises"
 import { homedir } from "node:os"
 import { dirname, join } from "node:path"
 import { applyEdits, modify, parse, type ParseError } from "jsonc-parser"
+
+/**
+ * 新建配置文件的权限：只有属主可读写。
+ *
+ * 这里不能用 `0644`：配置文件里可能写着带 token 的 options 或私有 registry 地址，
+ * 顺手建成全用户可读等于把用户的凭据摊开。
+ */
+const DEFAULT_MODE = 0o600
+
+/**
+ * 一份「编辑计划成立的前提」快照。
+ *
+ * `text` 是计划所依据的原文，提交前逐字节比对；`dev`/`ino` 是文件身份，用来发现
+ * 「被换成另一个文件但内容恰好一样」；`mode` 是原权限，写入后要原样保持。
+ */
+export interface FileBaseline {
+  text: string
+  dev: number
+  ino: number
+  mode: number
+}
+
+/**
+ * 外部改了配置，所以这次写入被放弃。
+ *
+ * 单独成类型是因为调用方要把它和「磁盘写不进去」区分开：一个是有人同时在改，
+ * 一个是权限/磁盘问题，用户该做的事完全不同。
+ */
+export class ConcurrentEditError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = "ConcurrentEditError"
+  }
+}
+
+function oct(mode: number): string {
+  return `0${(mode & 0o777).toString(8)}`
+}
 
 /** One entry of the `plugins` array, keeping its position so edits hit the right element. */
 export interface ConfigEntry {
@@ -40,6 +78,11 @@ export interface ConfigFile {
    * the file is *not* an empty config, and writing to it would destroy whatever the user meant.
    */
   parseError: string
+  /**
+   * What this read saw on disk; `null` when the file did not exist yet.
+   * A write built on this file is refused if the disk no longer matches it.
+   */
+  baseline: FileBaseline | null
 }
 
 export interface Edit {
@@ -114,11 +157,17 @@ export async function readConfig(): Promise<ConfigFile> {
   let fallback: ConfigFile | undefined
   for (const path of candidates) {
     let text: string
+    let info: Awaited<ReturnType<typeof stat>>
     try {
+      info = await stat(path)
+      // A directory or a fifo here is not a config; skipping keeps `readFile` from throwing EISDIR
+      // and keeps the next candidate in play.
+      if (!info.isFile()) continue
       text = await readFile(path, "utf8")
     } catch {
       continue
     }
+    const baseline: FileBaseline = { text, dev: info.dev, ino: info.ino, mode: info.mode & 0o777 }
     const errors: ParseError[] = []
     const doc = parse(text, errors, { allowTrailingComma: true, disallowComments: false }) as
       | Record<string, unknown>
@@ -131,12 +180,13 @@ export async function readConfig(): Promise<ConfigFile> {
         raw: [],
         entries: [],
         parseError: parseMessage(errors, text),
+        baseline,
       }
     }
     const record = doc && typeof doc === "object" ? doc : {}
     const key = Array.isArray(record.plugins) ? "plugins" : Array.isArray(record.plugin) ? "plugin" : "plugins"
     const list = Array.isArray(record[key]) ? (record[key] as unknown[]) : []
-    const file: ConfigFile = { path, text, key, raw: list, entries: normalize(list), parseError: "" }
+    const file: ConfigFile = { path, text, key, raw: list, entries: normalize(list), parseError: "", baseline }
     if (file.entries.length > 0) return file
     if (!fallback) fallback = file
   }
@@ -149,19 +199,146 @@ export async function readConfig(): Promise<ConfigFile> {
     raw: [],
     entries: [],
     parseError: "",
+    baseline: null,
   }
 }
 
-/** Write via a temp file in the same directory, then rename over the target (atomic on the same volume). */
-export async function atomicWrite(path: string, text: string): Promise<void> {
-  const tmp = `${path}.plugin-hub-${process.pid}-${Date.now()}.tmp`
+/**
+ * The path a rename has to hit.
+ *
+ * If the config is a symlink (dotfiles managers do this), replacing the link itself would turn it
+ * into a regular file and silently detach it from the user's repo. So the write goes to whatever
+ * the link points at, and the link stays a link.
+ */
+async function resolveTarget(path: string): Promise<string> {
+  let info: Awaited<ReturnType<typeof lstat>>
   try {
-    await mkdir(dirname(path), { recursive: true })
-    await writeFile(tmp, text, "utf8")
-    await rename(tmp, path)
-  } finally {
-    await rm(tmp, { force: true }).catch(() => undefined)
+    info = await lstat(path)
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return path
+    throw error
   }
+  if (info.isSymbolicLink()) {
+    try {
+      return await realpath(path)
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+        throw new Error(`${path} 是指向不存在目标的符号链接，未写入`)
+      }
+      throw error
+    }
+  }
+  if (!info.isFile()) throw new Error(`${path} 不是普通文件，未写入`)
+  return path
+}
+
+/** A temp file that already holds the new content and can still be abandoned. */
+export interface StagedWrite {
+  /** The path the rename will overwrite (symlinks resolved). */
+  target: string
+  /** The temp file; removed on commit, and on failure. */
+  tmp: string
+  /** The permission the temp file must still have at commit time. */
+  mode: number
+  /** What the plan was computed from; `null` when the target did not exist. */
+  expected: FileBaseline | null
+}
+
+/**
+ * Writes the new content to a temp file next to the target, with the target's own permission.
+ *
+ * `writeFile`'s `mode` is filtered through the process umask, so a 0640 file would land at 0600
+ * under a 0077 umask. The explicit `chmod` afterwards, plus the `stat` check, is what actually
+ * keeps the permission — and a file that existed as 0600 stays 0600 no matter who runs the hub.
+ */
+export async function stageWrite(file: ConfigFile, text: string): Promise<StagedWrite> {
+  const target = await resolveTarget(file.path)
+  const expected = file.baseline
+  const mode = expected ? expected.mode : DEFAULT_MODE
+  await mkdir(dirname(target), { recursive: true })
+  const tmp = `${target}.plugin-hub-${process.pid}-${Date.now()}.tmp`
+  try {
+    await writeFile(tmp, text, { encoding: "utf8", mode })
+    await chmod(tmp, mode)
+    const got = (await stat(tmp)).mode & 0o777
+    if (got !== mode) {
+      throw new Error(`无法把临时文件权限设为 ${oct(mode)}（实际 ${oct(got)}），未替换原文件`)
+    }
+  } catch (error) {
+    await rm(tmp, { force: true }).catch(() => undefined)
+    throw error
+  }
+  return { target, tmp, mode, expected }
+}
+
+/** Reads the file as it is right now, for the pre-commit comparison. */
+async function observe(path: string): Promise<FileBaseline | null> {
+  let info: Awaited<ReturnType<typeof stat>>
+  try {
+    info = await stat(path)
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null
+    throw new ConcurrentEditError(`无法再次读取配置以确认未被外部修改：${describe(error)}`)
+  }
+  if (!info.isFile()) throw new ConcurrentEditError("配置路径已经不是普通文件，未覆盖")
+  let text: string
+  try {
+    text = await readFile(path, "utf8")
+  } catch (error) {
+    throw new ConcurrentEditError(`配置在操作期间变得不可读：${describe(error)}`)
+  }
+  return { text, dev: info.dev, ino: info.ino, mode: info.mode & 0o777 }
+}
+
+/** Empty string means the disk is still the file the plan was computed from. */
+function compareBaseline(expected: FileBaseline | null, now: FileBaseline | null): string {
+  if (!expected) return now ? "配置在操作期间被创建，未覆盖" : ""
+  if (!now) return "配置在操作期间被删除，未重新创建"
+  if (now.text !== expected.text) return "配置在操作期间被外部修改，未覆盖"
+  // Same text but different inode: something replaced the file wholesale. The content the user
+  // has right now is what a plan must be rebuilt from, so this is still a refusal.
+  if (now.dev !== expected.dev || now.ino !== expected.ino) {
+    return "配置在操作期间被另一个文件替换，未覆盖"
+  }
+  return ""
+}
+
+/**
+ * Renames the staged file over the target — but only if the target still looks like the file the
+ * plan was built from.
+ *
+ * What this does and does not buy:
+ * - It catches every external change made between the read and this moment, including a wholesale
+ *   file replacement (inode check) and a deletion.
+ * - It does *not* close the race completely: there is still a window of a few syscalls between the
+ *   comparison and the `rename`. Node exposes no compare-and-swap for files (`renameat2` with
+ *   `RENAME_EXCHANGE` is not in libuv, and adding a native helper for this would be worse than the
+ *   window). So: the window is narrowed from "the whole operation" to "microseconds", and the
+ *   limited guarantee is documented rather than claimed as atomic.
+ */
+export async function commitWrite(staged: StagedWrite): Promise<void> {
+  try {
+    const drift = compareBaseline(staged.expected, await observe(staged.target))
+    if (drift) throw new ConcurrentEditError(drift)
+    const got = (await stat(staged.tmp)).mode & 0o777
+    if (got !== staged.mode) {
+      throw new Error(`临时文件权限在写入后被改变（期望 ${oct(staged.mode)}，实际 ${oct(got)}），未替换原文件`)
+    }
+    await rename(staged.tmp, staged.target)
+  } finally {
+    await rm(staged.tmp, { force: true }).catch(() => undefined)
+  }
+}
+
+/** Abandons a staged write without touching the target. */
+export async function discardWrite(staged: StagedWrite): Promise<void> {
+  await rm(staged.tmp, { force: true }).catch(() => undefined)
+}
+
+/** Stage + commit: keeps the two steps separate so tests (and the concurrency check) can split them. */
+export async function atomicWrite(file: ConfigFile, text: string): Promise<void> {
+  const staged = await stageWrite(file, text)
+  await commitWrite(staged)
 }
 
 /**
@@ -216,8 +393,17 @@ export async function editConfig(plan: EditPlan): Promise<EditOutcome> {
       return { ok: true, error: "", file }
     }
     try {
-      await atomicWrite(file.path, text)
+      await atomicWrite(file, text)
     } catch (error) {
+      if (error instanceof ConcurrentEditError) {
+        // Someone else owns the newest content now. Report their version, not ours: the caller
+        // must re-read before deciding what to do, and must never retry the old plan.
+        return {
+          ok: false,
+          error: `${error.message}；为避免丢掉外部改动，本次没有写入，请刷新后重新操作`,
+          file: await readConfig(),
+        }
+      }
       // atomicWrite only renames over the target on success, so the old file is still intact.
       return { ok: false, error: `写入配置失败（原文件未改动）：${describe(error)}`, file }
     }

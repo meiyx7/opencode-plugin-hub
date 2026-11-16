@@ -20,7 +20,6 @@ import {
   type CliResult,
 } from "./cli"
 import {
-  atomicWrite,
   configDir,
   describe,
   editConfig,
@@ -1069,7 +1068,7 @@ async function scratchEnv(): Promise<{ root: string; configHome: string; cwd: st
   const cwd = join(root, "work")
   await mkdir(join(configHome, "opencode"), { recursive: true })
   await mkdir(cwd, { recursive: true })
-  await writeFile(join(configHome, "opencode", "opencode.json"), '{"plugins":[]}\n', "utf8")
+  await writeFile(join(configHome, "opencode", "opencode.json"), '{"plugins":[]}\n', { encoding: "utf8", mode: 0o600 })
   return { root, configHome, cwd }
 }
 

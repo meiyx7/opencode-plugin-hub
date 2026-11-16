@@ -2,6 +2,7 @@ import { createEffect, createMemo, createSignal, For, onMount, Show, Switch, Mat
 import type { Context, IconName, IpcClient } from "@opencode/plugin/gui"
 import type { Admin } from "../contract"
 import { countTitle, countWithUnit, formatCount } from "./download-format"
+import { explainMutation, type Tone } from "./feedback"
 
 type AdminClient = IpcClient<typeof Admin.spec>
 type HubState = Awaited<ReturnType<AdminClient["snapshot"]>>
@@ -12,15 +13,12 @@ type CatalogResult = Awaited<ReturnType<AdminClient["browse"]>>
 type UpdateInfo = Awaited<ReturnType<AdminClient["updates"]>>["items"][number]
 type PackageDetail = Awaited<ReturnType<AdminClient["detail"]>>
 type MutationResult = Awaited<ReturnType<AdminClient["install"]>>
-/** 每个阶段各说一句话：命令、配置、运行时、回滚。少一段就可能把「命令成功」说成「已生效」。 */
-type MutationStages = NonNullable<MutationResult["stages"]>
 type RuntimeInfo = Awaited<ReturnType<AdminClient["runtime"]>>["items"][number]
 type DiscoveredPlugin = NonNullable<Awaited<ReturnType<AdminClient["runtime"]>>["discovered"]>[number]
 
 type Tab = "catalog" | "search" | "installed"
 /** 已安装页的状态筛选；管理页先看问题项，而不是按配置顺序翻。 */
 type InstalledFilter = "all" | "update" | "paused" | "failed" | "pending" | "unknown"
-type Tone = "info" | "success" | "warning" | "error"
 type Note = { text: string; tone: Tone }
 
 const PAGE = 24
@@ -1265,40 +1263,12 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
   }
 
   /**
-   * 操作结果分两段写：服务端那句话（它已经按阶段措辞），加一句界面自己的判定。
-   * 语气由阶段决定，而不是只看 ok：配置改了但运行时没确认，是警告不是成功。
+   * 所有生命周期操作结果的唯一出口：文案和语气都来自 explainMutation。
+   * 入口自己不判断成没成功——服务端已经按阶段说清了，界面不再猜第二遍。
    */
-  const stageTail = (stages: MutationStages) => {
-    const parts: string[] = []
-    if (stages.config === "updated" && stages.runtime === "unknown") parts.push("配置已切换，运行时未确认")
-    else if (stages.config === "updated" && stages.runtime === "loaded") parts.push("配置与运行时均已确认")
-    else if (stages.config === "updated") parts.push("配置已切换")
-    else if (stages.config === "unchanged") parts.push("配置未改动")
-    else if (stages.config === "failed") parts.push("配置写入未完成")
-    if (stages.rollback === "succeeded") parts.push("已回滚到原版本")
-    else if (stages.rollback === "failed") parts.push("回滚未成功")
-    return parts.join("；")
-  }
-
-  const describeMutation = (result: MutationResult) => {
-    const stages = result.stages
-    if (!stages) return result.verification ? `${result.message}（${result.verification}）` : result.message
-    const tail = stageTail(stages)
-    return tail ? `${result.message}（${tail}）` : result.message
-  }
-
-  /** 语气：失败且配置已变 = 警告（还有救），失败且配置没变 = 错误。自升级永远是警告。 */
-  const toneFor = (result: MutationResult, successTone: Tone = "success"): Tone => {
-    if (result.selfUpdated) return "warning"
-    if (result.ok) {
-      const runtime = result.stages?.runtime
-      return runtime === "unknown" || runtime === "unchanged" ? "warning" : successTone
-    }
-    return result.stages?.config === "updated" ? "warning" : "error"
-  }
-
   const reportMutation = (result: MutationResult, successTone: Tone = "success") => {
-    notify(describeMutation(result), toneFor(result, successTone))
+    const report = explainMutation(result, successTone)
+    notify(report.text, report.tone)
   }
 
   const specFor = (name: string) => state()?.plugins.find((entry) => entry.name === name)?.spec ?? name

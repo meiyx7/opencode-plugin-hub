@@ -18,6 +18,8 @@ const entries = [
   "official-parse.test.ts",
   "official-cli.test.ts",
   "lifecycle-safety.test.ts",
+  "config-safety.test.ts",
+  "feedback.test.ts",
   "release-guard.test.ts",
 ]
 
