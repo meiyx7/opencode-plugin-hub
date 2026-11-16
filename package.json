@@ -1,7 +1,7 @@
 {
   "name": "opencode-plugin-hub",
-  "version": "0.4.0",
-  "description": "Plugin manager for OpenCode Desktop: browse community plugins, search npm, inspect README and downloads, install and update without editing JSON.",
+  "version": "0.5.0",
+  "description": "Plugin manager for OpenCode Desktop: browse community plugins, search npm, install / update / remove / pause / resume, and see the real runtime state — package work goes through the official CLI.",
   "type": "module",
   "license": "MIT",
   "author": "meiyx7",
@@ -19,7 +19,8 @@
     "plugin-manager",
     "plugin-hub",
     "marketplace",
-    "npm"
+    "npm",
+    "pause-plugin"
   ],
   "main": "./dist/index.js",
   "module": "./dist/index.js",

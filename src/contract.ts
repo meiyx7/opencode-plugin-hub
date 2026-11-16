@@ -22,6 +22,12 @@ export const InstalledEntry = Schema.Struct({
   license: Schema.optional(Schema.String),
   homepage: Schema.optional(Schema.String),
   repo: Schema.optional(Schema.String),
+  /** Runtime plugin ID the host reports for this entry; empty when it is not loaded. */
+  id: Schema.optional(Schema.String),
+  /** True when the entry is a bare-ID rule this hub appended to re-enable a plugin. */
+  rule: Schema.optional(Schema.Boolean),
+  /** True when the entry is `{package, options}`; the options are preserved by every edit. */
+  options: Schema.optional(Schema.Boolean),
 })
 
 export const HubState = Schema.Struct({
@@ -100,17 +106,27 @@ export const PackageDetail = Schema.Struct({
   error: Schema.String,
 })
 
-/** One row of the update check performed against the npm registry. */
+/** One row of the update check performed by `opencode plugin check`. */
 export const UpdateInfo = Schema.Struct({
   spec: Schema.String,
   /** Real package name; for a directory plugin this comes from its package.json. */
   name: Schema.String,
+  /** Runtime plugin ID the CLI used in its own report; empty when the plugin is not loaded. */
+  id: Schema.optional(Schema.String),
   kind: Schema.String,
   current: Schema.String,
+  /** Newer version the CLI named; empty when it did not name one. */
   latest: Schema.String,
+  /** True only when the official check reports an update; the registry never sets this. */
   hasUpdate: Schema.Boolean,
-  /** False for directory plugins, whose files are replaced instead of re-resolved from the registry. */
+  /** What the official check said: current, outdated, failed, skipped or unknown. */
+  official: Schema.optional(Schema.String),
+  /** Why this row cannot be updated, in words; empty when it is current or updatable. */
+  reason: Schema.optional(Schema.String),
+  /** False for directory plugins, which the official npm flow never touches. */
   managed: Schema.Boolean,
+  /** True when the config pins an exact version, which the CLI deliberately leaves alone. */
+  pinned: Schema.optional(Schema.Boolean),
   /** One-line summary from the package manifest; empty when it cannot be read. */
   description: Schema.optional(Schema.String),
   /** SPDX license from the package manifest; empty when unknown. */
@@ -125,6 +141,10 @@ export const UpdateInfo = Schema.Struct({
 export const UpdatesResult = Schema.Struct({
   items: Schema.Array(UpdateInfo),
   error: Schema.String,
+  /** False when the check never ran; per-row results then carry no meaning. */
+  checked: Schema.optional(Schema.Boolean),
+  /** The CLI's own words when the whole check failed. */
+  raw: Schema.optional(Schema.String),
 })
 
 export const SearchResult = Schema.Struct({
@@ -180,24 +200,51 @@ export const Mutation = Schema.Struct({
    * Optional so a window and a service built from different revisions still decode each other.
    */
   selfUpdated: Schema.optional(Schema.Boolean),
+  /** What the config, the CLI and the runtime each reported after the operation. */
+  verification: Schema.optional(Schema.String),
 })
 
 /** One configured plugin's runtime truth as the running server reports it. */
 export const RuntimeInfo = Schema.Struct({
   spec: Schema.String,
   name: Schema.String,
-  /** "loaded" (server runs it), "failed" (server reports an error) or "unknown" (no runtime answer). */
-  status: Schema.Union([Schema.Literal("loaded"), Schema.Literal("failed"), Schema.Literal("unknown")]),
+  /** Runtime plugin ID; empty when the host did not load it (or printed `-`). */
+  id: Schema.optional(Schema.String),
+  /**
+   * "loaded" (the host runs it), "failed" (it reports an error), "unknown" (no runtime answer),
+   * or "control" (a config rule, not a plugin package).
+   */
+  status: Schema.Union([
+    Schema.Literal("loaded"),
+    Schema.Literal("failed"),
+    Schema.Literal("unknown"),
+    Schema.Literal("control"),
+  ]),
   /** Version the running server loaded, empty when unknown. */
   runtimeVersion: Schema.String,
   /** The server's failure message for a plugin that failed to load. */
   error: Schema.String,
-  /** True when the server itself could not be asked; per-plugin status stays "unknown". */
+  /** True when a runtime source answered; false when none could be asked. */
   available: Schema.Boolean,
+  /** True when config rules currently disable this plugin. */
+  paused: Schema.optional(Schema.Boolean),
+  /** The rule that decides the enabled/disabled verdict, as written in the config. */
+  rule: Schema.optional(Schema.String),
+  /** Every rule that mentions this plugin, in config order. */
+  rules: Schema.optional(Schema.Array(Schema.String)),
+})
+
+/** A plugin the runtime reports that the global config does not list (discovery directories). */
+export const DiscoveredPlugin = Schema.Struct({
+  id: Schema.String,
+  version: Schema.String,
+  source: Schema.String,
+  section: Schema.String,
 })
 
 export const RuntimeResult = Schema.Struct({
   items: Schema.Array(RuntimeInfo),
+  discovered: Schema.optional(Schema.Array(DiscoveredPlugin)),
   error: Schema.String,
 })
 
@@ -226,7 +273,10 @@ export const Admin = Ipc.define({
     openUrl: { input: Url, output: Opened },
     openConfig: { output: Opened },
     install: { input: Target, output: Mutation },
+    update: { input: Target, output: Mutation },
     remove: { input: Target, output: Mutation },
+    pause: { input: Target, output: Mutation },
+    resume: { input: Target, output: Mutation },
     reload: { output: Mutation },
     runtime: { output: RuntimeResult },
   },

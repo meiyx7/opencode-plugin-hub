@@ -14,6 +14,9 @@ const outDir = join(root, "node_modules", ".cache", "plugin-hub-tests")
 const entries = [
   "downloads.test.ts",
   "self-update.test.ts",
+  "rules.test.ts",
+  "official-parse.test.ts",
+  "official-cli.test.ts",
   "release-guard.test.ts",
 ]
 

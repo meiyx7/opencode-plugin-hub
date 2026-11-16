@@ -19,6 +19,7 @@ const fakeState = {
     { spec: "magpie-workbuddy-growth", name: "magpie-workbuddy-growth", kind: "package", version: "1.0.3", removable: true },
     { spec: "@magpie-community/opencode-zcode-auth@0.1.61", name: "@magpie-community/opencode-zcode-auth", kind: "package", version: "0.1.61", removable: true },
     { spec: "@magpie-community/opencode-qoder-auth@0.2.67", name: "@magpie-community/opencode-qoder-auth", kind: "package", version: "0.2.67", removable: true },
+    { spec: "-acme.reviewer", name: "acme.reviewer", kind: "control", version: "", removable: true },
   ],
   error: "",
 }
@@ -49,23 +50,38 @@ const fakeStateWithSummary = {
   }),
 }
 
+/** 真实的官方检查结果：每条都带 official 与 reason，界面据此决定按钮与徽章。 */
 const fakeUpdates = fakeState.plugins.map((entry) => {
   const summary = summaries[entry.name] ?? { description: "", license: "", publisher: "" }
-  const latest = entry.name === "opencode-usage-center" ? "0.3.2" : entry.name === "opencode-timeline-gui" ? "0.2.8" : entry.version
+  const outdated = entry.name === "opencode-usage-center"
+  const failed = entry.name === "magpie-workbuddy-growth"
+  const control = entry.kind === "control"
+  const path = entry.kind === "path"
+  const pinned = /\d+\.\d+\.\d+$/.test(entry.spec)
   return {
     spec: entry.spec,
     name: entry.name,
+    id: entry.name === "opencode-mobile-notifications" ? "opencode-notify-callback" : entry.name.replace(/^opencode-/, ""),
     kind: entry.kind,
     current: entry.version,
-    latest,
-    hasUpdate: latest !== entry.version,
-    managed: entry.kind !== "path",
-    description: entry.kind === "path" ? "本地 directory 插件，直接加载工作区里的实现。" : summary.description,
+    latest: outdated ? "0.3.2" : "",
+    hasUpdate: outdated && !pinned,
+    official: control ? "skipped" : path ? "skipped" : failed ? "failed" : outdated ? "outdated" : "current",
+    reason: control
+      ? "配置规则，不是插件包"
+      : path
+        ? "本地目录插件由外部维护，官方更新流程会跳过它（目录里的改动不会被覆盖）"
+        : failed
+          ? "官方检查这个插件时出错"
+          : "",
+    managed: !control && !path,
+    pinned,
+    description: path ? "本地 directory 插件，直接加载工作区里的实现。" : summary.description,
     license: summary.license,
     homepage: "",
     repo: "",
     publisher: summary.publisher,
-    error: entry.name === "opencode-trae-auth-multi" ? "不是 npm 包名，无法查询版本" : "",
+    error: failed ? "Plugin must export a default definition with an id and an effect or setup function." : "",
   }
 })
 
@@ -323,21 +339,31 @@ const ctx = {
     openUrl: async (input: { url: string }) => { window.open(input.url, "_blank"); return { ok: true } },
     openConfig: async () => ({ ok: true }),
     install: async () => ({ ok: false, message: "预览模式不执行安装", state: fakeState }),
+    update: async () => ({ ok: false, message: "预览模式不执行更新", state: fakeState }),
     remove: async () => ({ ok: false, message: "预览模式不执行移除", state: fakeState }),
+    pause: async () => ({ ok: false, message: "预览模式不写配置规则", state: fakeState }),
+    resume: async () => ({ ok: false, message: "预览模式不写配置规则", state: fakeState }),
     reload: async () => ({ ok: true, message: "预览模式", state: fakeState }),
     // 预览里展示运行状态徽章：一条已加载、一条未知，用于核对 UI 呈现。
     runtime: async () => ({
-      items: fakeState.plugins.map((entry) => ({
-        spec: entry.spec,
-        name: entry.name,
-        status: entry.name === "magpie-workbuddy-growth" ? "failed" : "loaded",
-        runtimeVersion: entry.version,
-        error:
-          entry.name === "magpie-workbuddy-growth"
-            ? "Plugin must export a default definition with an id and an effect or setup function."
-            : "",
-        available: true,
-      })),
+      items: fakeState.plugins.map((entry) => {
+        const control = entry.kind === "control"
+        const failed = entry.name === "magpie-workbuddy-growth"
+        const paused = entry.name === "opencode-timeline-gui"
+        return {
+          spec: entry.spec,
+          name: entry.name,
+          id: control ? "" : entry.name.replace(/^@[^/]+\//, "").replace(/^opencode-/, ""),
+          status: control ? "control" : failed ? "failed" : paused ? "unknown" : "loaded",
+          runtimeVersion: entry.version,
+          error: failed ? "Plugin must export a default definition with an id and an effect or setup function." : "",
+          available: true,
+          paused,
+          rule: paused ? "-opencode-timeline-gui" : "",
+          rules: paused ? ["-opencode-timeline-gui"] : [],
+        }
+      }),
+      discovered: [{ id: "workspace-scratch", version: "local", source: "/Users/meiyx/project/.opencode/plugins/scratch", section: "Server" }],
       error: "",
     }),
   }),

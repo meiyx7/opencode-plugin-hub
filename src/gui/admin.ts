@@ -1,9 +1,29 @@
 import { spawn } from "node:child_process"
-import { homedir, tmpdir } from "node:os"
-import { basename, isAbsolute, join, resolve } from "node:path"
-import { copyFile, cp, mkdir, mkdtemp, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises"
+import { homedir } from "node:os"
+import { isAbsolute, join, resolve } from "node:path"
+import { mkdir, readFile, readdir, rename, rm, writeFile } from "node:fs/promises"
 import { applyEdits, modify, parse, type ParseError } from "jsonc-parser"
 import { downloadsFor, registryFetch, type Downloads } from "./registry"
+import {
+  classify,
+  cliCommand,
+  configureCli,
+  hasCli,
+  pluginAdd,
+  pluginCheck,
+  pluginList,
+  pluginReload,
+  pluginRemove,
+  pluginUpdate,
+  runCli,
+  type CliOutcome,
+  type CliResult,
+} from "./cli"
+import { isPathSource, packageNameOf, parsePluginCheck, parsePluginList, type CheckRow, type PluginListRow } from "./official-parse"
+import { disableRule, enableRule, evaluateRules, exactRulesFor, isControlSpec, parseControl } from "./rules"
+import { forgetRule, lookupId, readStore, rememberId, rememberRule } from "./store"
+
+export { isControlSpec } from "./rules"
 
 export interface InstalledEntryValue {
   spec: string
@@ -17,6 +37,12 @@ export interface InstalledEntryValue {
   license?: string
   homepage?: string
   repo?: string
+  /** Runtime plugin ID the host reports for this entry; empty when it is not loaded. */
+  id?: string
+  /** True when the entry is a bare ID rule this hub appended to re-enable a plugin. */
+  rule?: boolean
+  /** True when the config entry carries plugin options (`{package, options}`), which are preserved. */
+  options?: boolean
 }
 
 export interface HubStateValue {
@@ -89,29 +115,51 @@ export interface SearchResultValue {
   error: string
 }
 
+/**
+ * One row of the update view.
+ *
+ * `official` is what `opencode plugin check` said about this plugin, and it — not the registry —
+ * decides whether an update may be offered:
+ * - `current`   the CLI reports the installed version as current
+ * - `outdated`  the CLI reports a newer version, and `latest` holds it
+ * - `failed`    the CLI could not check this plugin (bad manifest, offline, …)
+ * - `skipped`   the CLI never reported it: local directories and exact revisions are skipped by design
+ * - `unknown`   the CLI answered with something this build does not recognise; nothing is claimed
+ */
 export interface UpdateInfoValue {
   spec: string
   /** Real package name: for a directory plugin this comes from its package.json, not the folder name. */
   name: string
+  /** Runtime plugin ID the CLI used in its own report; empty when it is not loaded. */
+  id: string
   kind: string
   current: string
+  /** Newer version the CLI named; empty when it did not name one. */
   latest: string
   hasUpdate: boolean
-  /** False for directory plugins, whose files are copied rather than resolved from the registry. */
+  official: string
+  /** Why this row is not updatable, in words; empty when it is current or updatable. */
+  reason: string
+  /** False for directory plugins, which the official npm flow never touches. */
   managed: boolean
-  /** One-line summary from the package manifest; empty when it cannot be read. */
+  /** True when the config pins an exact version, which the CLI deliberately leaves alone. */
+  pinned: boolean
   description?: string
   license?: string
   homepage?: string
   repo?: string
-  /** Publisher or first maintainer from the registry; empty for local directories. */
   publisher?: string
   error: string
 }
 
 export interface UpdatesResultValue {
   items: UpdateInfoValue[]
+  /** Set when the update check itself could not run; per-row results then carry no meaning. */
   error: string
+  /** The CLI's own words when the check failed as a whole. */
+  raw?: string
+  /** False when the check never ran because no CLI is reachable. */
+  checked: boolean
 }
 
 export interface MutationValue {
@@ -124,12 +172,19 @@ export interface MutationValue {
    * loading to OpenCode's own mechanism; the hub never restarts the host. See contract.ts.
    */
   selfUpdated?: boolean
+  /** What the config, the CLI and the runtime each said after the operation. */
+  verification?: string
 }
 
 const SELF_PACKAGE = "opencode-plugin-hub"
 const NPM_KEYWORD = "opencode-plugin"
 /** A registry lookup is reused for this long, so opening the page twice is not two requests. */
 const VERSION_TTL = 5 * 60 * 1000
+
+/** The host's own CLI, handed over once at startup; every package operation goes through it. */
+export function useCli(argv: readonly string[] | undefined): void {
+  configureCli(argv)
+}
 
 function configDir() {
   const xdg = process.env.XDG_CONFIG_HOME
@@ -141,15 +196,51 @@ function cacheDir() {
   return xdg ? join(xdg, "opencode", "npm") : join(homedir(), ".cache", "opencode", "npm")
 }
 
+/** One entry of the `plugins` array, keeping its position so edits hit the right element. */
+interface ConfigEntry {
+  /** Position in the raw array; edits and removals are addressed by this. */
+  index: number
+  /** The configured spec: the string itself, or an object's `package`. */
+  spec: string
+  /** True when the entry is `{package, options}` — replacing it must keep the options. */
+  options: boolean
+  raw: unknown
+}
+
 interface ConfigFile {
   path: string
   text: string
   key: string
-  plugins: string[]
+  /** The array exactly as written, including entries this build does not manage. */
+  raw: unknown[]
+  entries: ConfigEntry[]
+}
+
+/**
+ * Reads the entries the hub understands while keeping everything else on disk untouched.
+ * Unknown shapes (an object without `package`, a number) are preserved but not managed.
+ */
+function normalize(raw: unknown[]): ConfigEntry[] {
+  const entries: ConfigEntry[] = []
+  for (const [index, value] of raw.entries()) {
+    if (typeof value === "string") {
+      entries.push({ index, spec: value, options: false, raw: value })
+      continue
+    }
+    if (value && typeof value === "object") {
+      const pkg = (value as { package?: unknown }).package
+      if (typeof pkg === "string" && pkg.trim().length > 0) {
+        entries.push({ index, spec: pkg, options: true, raw: value })
+      }
+    }
+  }
+  return entries
 }
 
 async function readConfig(): Promise<ConfigFile> {
   const dir = configDir()
+  // Same order the official CLI uses: opencode.json first, then opencode.jsonc. Reading a
+  // different file than the CLI writes would make every "re-read after the command" a lie.
   const candidates = [join(dir, "opencode.json"), join(dir, "opencode.jsonc")]
   let fallback: ConfigFile | undefined
   for (const path of candidates) {
@@ -165,14 +256,14 @@ async function readConfig(): Promise<ConfigFile> {
       | undefined
     const record = doc && typeof doc === "object" ? doc : {}
     const key = Array.isArray(record.plugins) ? "plugins" : Array.isArray(record.plugin) ? "plugin" : "plugins"
-    const list = Array.isArray(record[key]) ? (record[key] as unknown[]).filter((v) => typeof v === "string") : []
-    const file: ConfigFile = { path, text, key, plugins: list as string[] }
-    if (file.plugins.length > 0) return file
+    const list = Array.isArray(record[key]) ? (record[key] as unknown[]) : []
+    const file: ConfigFile = { path, text, key, raw: list, entries: normalize(list) }
+    if (file.entries.length > 0) return file
     if (!fallback) fallback = file
   }
   if (fallback) return fallback
   // Nothing on disk yet: create the JSON config next to whatever exists.
-  return { path: join(dir, "opencode.json"), text: "{}\n", key: "plugins", plugins: [] }
+  return { path: join(dir, "opencode.json"), text: "{}\n", key: "plugins", raw: [], entries: [] }
 }
 
 /** A registry package name: optional `@scope/`, then letters, digits, `-`, `_`, `.` — but no path traversal. */
@@ -183,61 +274,9 @@ function isPackageName(name: string): boolean {
   return base.length > 0 && !base.startsWith(".")
 }
 
-/** One dot-separated part of a plugin id: `acme`, `reviewer`, `opencode-notify`. */
-const ID_PART = /^[a-z0-9_-]+$/i
-
-/**
- * Drops a leading `@scope/` from a plugin id. Returns `null` when the entry carries an
- * npm version suffix (`foo@*`, `@scope/foo@1.2.3`): there the text after `@` is a version
- * range, so the entry installs a package instead of being a rule.
- */
-function stripScope(id: string): string | null {
-  if (!id.startsWith("@")) return id.includes("@") ? null : id
-  const slash = id.indexOf("/")
-  if (slash < 0) return null
-  const rest = id.slice(slash + 1)
-  return rest.includes("@") ? null : rest
-}
-
-/** A bare plugin id with no version: `acme`, `acme.reviewer`, `@scope/foo`. */
-function isBarePluginId(id: string): boolean {
-  const unscoped = stripScope(id)
-  if (unscoped === null || unscoped.length === 0) return false
-  return unscoped.split(".").every((part) => ID_PART.test(part))
-}
-
-/** A wildcard plugin id: `*`, `.*`, `acme.*`, `acme.reviewer.*`, `@scope/acme.*`. */
-function isWildcardPluginId(id: string): boolean {
-  const unscoped = stripScope(id)
-  if (unscoped === null) return false
-  if (unscoped === "*" || unscoped === ".*") return true
-  if (!unscoped.endsWith(".*")) return false
-  const prefix = unscoped.slice(0, -2)
-  return prefix.length > 0 && prefix.split(".").every((part) => ID_PART.test(part))
-}
-
-/**
- * A config control entry instead of a plugin, using OpenCode's own syntax: `-id` disables a
- * plugin, while `*`, `.*`, `acme.*` and `-acme.*` are wildcards. These are user rules, not
- * installable packages, so they are shown as rules and are never resolved, updated or sent
- * to the registry.
- *
- * `foo@*` and `@scope/foo@*` are deliberately *not* control entries: `@` starts a version
- * range there, so they install (or pin) a package and their `*` has nothing to do with
- * wildcards.
- */
-export function isControlSpec(spec: string): boolean {
-  const trimmed = spec.trim()
-  if (trimmed.length === 0) return false
-  const negated = trimmed.startsWith("-")
-  const body = negated ? trimmed.slice(1) : trimmed
-  if (body.length === 0) return false
-  return negated ? isBarePluginId(body) || isWildcardPluginId(body) : isWildcardPluginId(body)
-}
-
 export function splitSpec(spec: string): { name: string; range: string; kind: string } {
   const trimmed = spec.trim()
-  if (trimmed.startsWith("/") || trimmed.startsWith(".") || trimmed.startsWith("~/")) {
+  if (isPathSource(trimmed)) {
     const base = trimmed.replace(/\/+$/, "").split("/").pop() ?? trimmed
     return { name: base, range: "", kind: "path" }
   }
@@ -308,11 +347,6 @@ async function readInstalledManifest(name: string, range: string): Promise<Manif
   return undefined
 }
 
-/** Best-effort installed version of a registry plugin, read from OpenCode's unpacked npm cache. */
-async function installedVersion(name: string, range: string): Promise<string> {
-  return (await readInstalledManifest(name, range))?.version ?? ""
-}
-
 /** A version range is not a version: only a bare `x.y.z` can be compared. */
 function literalVersion(range: string): string {
   const cleaned = range.trim().replace(/^[\^~=v]+/, "").replace(/^>\=?|^<\=?/, "")
@@ -363,6 +397,8 @@ const versionCache = new Map<string, { at: number; value: VersionLookup }>()
  * `ok` separates "the registry says there is nothing newer" from "the registry was never
  * reached" — showing the second as "up to date" would be a lie.
  *
+ * This is display data only: whether an update may be applied is decided by `opencode plugin check`.
+ *
  * `/latest` is a single small manifest: the full packument can be megabytes and is only
  * needed by the detail dialog. A 404 means no published version (removed or placeholder).
  */
@@ -404,6 +440,7 @@ export async function npmLatest(name: string, force = false): Promise<VersionLoo
 }
 
 interface ResolvedEntry {
+  entry: ConfigEntry
   spec: string
   name: string
   kind: string
@@ -412,23 +449,30 @@ interface ResolvedEntry {
   license: string
   homepage: string
   repo: string
+  /** True when this entry is a bare ID rule the hub itself appended to re-enable a plugin. */
+  rule: boolean
 }
 
 /** Normalizes one config entry, looking inside directory plugins for their real identity. */
-async function resolveEntry(spec: string): Promise<ResolvedEntry> {
+async function resolveEntry(entry: ConfigEntry): Promise<ResolvedEntry> {
+  const spec = entry.spec
+  const hubRule = !entry.options && readStore().rules.includes(spec)
   // Control entries carry no installable identity: `-acme.reviewer` is a disable rule for
   // the plugin ID `acme.reviewer`, and `*` / `.*` are wildcards. Reporting them as
   // installed packages (with a `-` prefix) would misstate what is actually loading.
-  if (isControlSpec(spec)) {
+  if (isControlSpec(spec) || hubRule) {
+    const rule = parseControl(spec, entry.index)
     return {
+      entry,
       spec,
-      name: spec.trim().replace(/^-/, ""),
-      kind: "control",
+      name: rule ? rule.target : spec.trim().replace(/^-/, ""),
+      kind: hubRule ? "enable-rule" : "control",
       version: "",
       description: "",
       license: "",
       homepage: "",
       repo: "",
+      rule: hubRule,
     }
   }
   const parsed = splitSpec(spec)
@@ -439,6 +483,7 @@ async function resolveEntry(spec: string): Promise<ResolvedEntry> {
     const repo = repository(manifest?.repository)
     const version = literalVersion(parsed.range) || manifest?.version || ""
     return {
+      entry,
       spec,
       name: parsed.name,
       kind: parsed.kind,
@@ -447,11 +492,13 @@ async function resolveEntry(spec: string): Promise<ResolvedEntry> {
       license: licenseText(manifest?.license),
       homepage: cleanUrl(manifest?.homepage) || repo.url,
       repo: repo.url,
+      rule: false,
     }
   }
   const manifest = await readManifest(expandPath(spec))
   const repo = repository(manifest?.repository)
   return {
+    entry,
     spec,
     name: manifest?.name && isPackageName(manifest.name) ? manifest.name : parsed.name,
     kind: "path",
@@ -460,11 +507,12 @@ async function resolveEntry(spec: string): Promise<ResolvedEntry> {
     license: licenseText(manifest?.license),
     homepage: cleanUrl(manifest?.homepage) || repo.url,
     repo: repo.url,
+    rule: false,
   }
 }
 
 async function resolveAll(file: ConfigFile): Promise<ResolvedEntry[]> {
-  return Promise.all(file.plugins.map((spec) => resolveEntry(spec)))
+  return Promise.all(file.entries.map((entry) => resolveEntry(entry)))
 }
 
 export async function snapshot(): Promise<HubStateValue> {
@@ -483,6 +531,8 @@ export async function snapshot(): Promise<HubStateValue> {
       license: entry.license,
       homepage: entry.homepage,
       repo: entry.repo,
+      rule: entry.rule || undefined,
+      options: entry.entry.options || undefined,
     }))
     return { configPath: file.path, configKey: file.key, plugins, error: "" }
   } catch (error) {
@@ -495,65 +545,330 @@ export async function snapshot(): Promise<HubStateValue> {
   }
 }
 
-/** Compares every configured plugin against the registry. One request per package, in parallel. */
-export async function updates(): Promise<UpdatesResultValue> {
-  try {
-    const file = await readConfig()
-    const resolved = await resolveAll(file)
-    const items = await Promise.all(
-      resolved.map(async (entry): Promise<UpdateInfoValue> => {
-        // A control entry (`-id`, `*`) is a rule, not a package: no registry question to ask.
-        if (entry.kind === "control") {
-          return {
-            spec: entry.spec,
-            name: entry.name,
-            kind: entry.kind,
-            current: "",
-            latest: "",
-            hasUpdate: false,
-            managed: false,
-            description: "",
-            license: "",
-            homepage: "",
-            repo: "",
-            publisher: "",
-            error: "",
-          }
-        }
-        const lookupable = isPackageName(entry.name)
-        const lookup: VersionLookup = lookupable ? await npmLatest(entry.name) : emptyLookup(false)
-        return {
-          spec: entry.spec,
-          name: entry.name,
-          kind: entry.kind,
-          current: entry.version,
-          latest: lookup.version,
-          hasUpdate: lookup.ok && isNewer(lookup.version, entry.version),
-          managed: entry.kind !== "path",
-          // Directory plugins already carry their package.json summary; registry
-          // plugins get it from the `/latest` manifest in the same request.
-          description: entry.description || lookup.description,
-          license: entry.license || lookup.license,
-          homepage: entry.homepage || lookup.homepage,
-          repo: entry.repo || lookup.repo,
-          publisher: lookup.publisher,
-          error: !lookupable
-            ? "不是 npm 包名，无法查询版本"
-            : !lookup.ok
-              ? "无法连接 npm registry，本次未检查（可设置 OPENCODE_PLUGIN_HUB_REGISTRY 指向可用镜像）"
-              : "",
-        }
-      }),
-    )
-    return { items, error: "" }
-  } catch (error) {
-    return { items: [], error: describe(error) }
-  }
+// ---------------------------------------------------------------------------
+// Runtime truth: the official `plugin list` plus the sidecar's failure details
+// ---------------------------------------------------------------------------
+
+/** One configured plugin's runtime truth, as the running host reports it. */
+export interface RuntimeInfoValue {
+  spec: string
+  name: string
+  /** Runtime plugin ID; empty when the host did not load it (or printed `-`). */
+  id: string
+  /** "loaded", "failed", "unknown" (no runtime answer) or "control" (a config rule, not a plugin). */
+  status: "loaded" | "failed" | "unknown" | "control"
+  /** Version the runtime loaded, empty when unknown. */
+  runtimeVersion: string
+  /** The runtime's failure message for a plugin that failed to load. */
+  error: string
+  /** True when a runtime source answered; false when none could be asked. */
+  available: boolean
+  /** True when config rules currently disable this plugin. */
+  paused: boolean
+  /** The rule that decides the disabled/enabled verdict, as written in the config. */
+  rule: string
+  /** Every rule that mentions this plugin, in config order. */
+  rules: string[]
+}
+
+/** A plugin the runtime reports that the global config does not list. */
+export interface DiscoveredPluginValue {
+  id: string
+  version: string
+  source: string
+  section: string
+}
+
+export interface RuntimeResultValue {
+  items: RuntimeInfoValue[]
+  /** Plugins loaded from discovery directories or project config, not from the global list. */
+  discovered: DiscoveredPluginValue[]
+  error: string
+}
+
+interface PluginListInfo {
+  source?:
+    | { type: "builtin" }
+    | { type: "package"; target?: string; version?: string; outdated?: true; updating?: true }
+    | { type: "local"; path?: string }
+    | { type: "sdk" }
+  state?: { status: "active" } | { status: "failed"; error?: string }
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms))
 }
 
 /**
- * Edits one value in place, so the user's comments, ordering and indentation survive on every other line.
- * `path` is a jsonc path such as `["plugins", 2]`.
+ * The rows `opencode plugin list` reports for the current project.
+ *
+ * The managed service can answer with an empty table while it is still starting (right after a
+ * reload, for instance). One short retry keeps the UI from painting every plugin as "unverified"
+ * for a reason that is not about the plugins at all.
+ */
+async function readRuntimeRows(expectRows: boolean): Promise<{ rows: PluginListRow[]; ok: boolean; message: string }> {
+  if (!hasCli()) return { rows: [], ok: false, message: "找不到 opencode CLI" }
+  const first = await pluginList()
+  const rows = first.ok ? parsePluginList(first.stdout) : []
+  if (first.ok && rows.length === 0 && expectRows) {
+    await delay(250)
+    const second = await pluginList()
+    return { rows: second.ok ? parsePluginList(second.stdout) : rows, ok: second.ok, message: second.message }
+  }
+  return { rows, ok: first.ok, message: first.message }
+}
+
+/** Runtime rows keyed by the package name or absolute path a config entry would resolve to. */
+function indexRows(rows: readonly PluginListRow[]): Map<string, PluginListRow> {
+  const map = new Map<string, PluginListRow>()
+  for (const row of rows) {
+    const key = row.kind === "path" ? `path:${resolve(expandPath(row.source))}` : `pkg:${packageNameOf(row.source).toLowerCase()}`
+    // The first row for a target wins; a duplicate config entry does not get a second identity.
+    if (!map.has(key)) map.set(key, row)
+  }
+  return map
+}
+
+function rowKeyFor(entry: ResolvedEntry): string {
+  return entry.kind === "path" ? `path:${resolve(expandPath(entry.spec))}` : `pkg:${entry.name.toLowerCase()}`
+}
+
+/**
+ * Cross-references the config with the running host, so the UI can tell 已配置待生效 from 已加载,
+ * 已暂停 from 加载失败. Two sources, on purpose:
+ * - `opencode plugin list` answers "what ID did it load under, and at which version";
+ * - the sidecar's `/api/plugin` answers "did it fail, and why".
+ * When neither answers, every item stays "unknown" instead of pretending to know.
+ */
+export async function runtime(
+  endpoint: { url: string; headers: Readonly<Record<string, string>> } | undefined,
+): Promise<RuntimeResultValue> {
+  const file = await readConfig()
+  const resolved = await resolveAll(file)
+
+  const list = await readRuntimeRows(resolved.length > 0)
+  const rows = list.rows
+  const byKey = indexRows(rows)
+
+  const sidecar = endpoint ? await readSidecar(endpoint) : { list: [] as PluginListInfo[], error: endpoint ? "" : "无法连接后台服务，运行状态未知" }
+  const failures = new Map<string, string>()
+  const sidecarLoaded = new Set<string>()
+  for (const info of sidecar.list) {
+    const source = info.source
+    if (!source) continue
+    const key =
+      source.type === "package" && typeof source.target === "string"
+        ? `pkg:${packageNameOf(source.target).toLowerCase()}`
+        : source.type === "local" && typeof source.path === "string"
+          ? `path:${resolve(source.path)}`
+          : ""
+    if (!key) continue
+    sidecarLoaded.add(key)
+    if (info.state?.status === "failed") failures.set(key, info.state.error ?? "加载失败")
+  }
+
+  const items: RuntimeInfoValue[] = []
+  const claimed = new Set<string>()
+  for (const entry of resolved) {
+    const base = { spec: entry.spec, name: entry.name }
+    if (entry.kind === "control" || entry.kind === "enable-rule") {
+      items.push({ ...base, id: "", status: "control", runtimeVersion: "", error: "", available: true, paused: false, rule: entry.spec, rules: [] })
+      continue
+    }
+    const key = rowKeyFor(entry)
+    const row = byKey.get(key)
+    claimed.add(key)
+    const id = row?.id ?? ""
+    if (id) rememberId(key, id)
+
+    // Rules are evaluated against the real ID when it is known, and against the configured name
+    // otherwise. The verdict says which rule decided it, so the UI can name it.
+    const targets = Array.from(new Set([id, entry.name].filter((value) => value.length > 0)))
+    const verdict = targets.length > 0 ? evaluateRules(file.raw, targets[0]!) : undefined
+    const paused = verdict?.disabled === true
+    // Only syntax-level control rules are listed as rules: a package entry that names the plugin
+    // is the plugin itself, not a rule the user wrote about it.
+    const rules = (verdict?.matches ?? []).filter((rule) => isControlSpec(rule.raw)).map((rule) => rule.raw)
+
+    const failure = failures.get(key)
+    const loaded = sidecarLoaded.has(key) || (row !== undefined && row.id.length > 0)
+    const status: RuntimeInfoValue["status"] = failure
+      ? "failed"
+      : loaded
+        ? "loaded"
+        : "unknown"
+    items.push({
+      ...base,
+      id,
+      status,
+      runtimeVersion: row?.version && row.version !== "local" ? row.version : entry.version,
+      error: failure ?? "",
+      available: sidecar.error === "" || list.ok,
+      paused,
+      rule: paused ? verdict?.rule?.raw ?? "" : "",
+      rules,
+    })
+  }
+
+  const discovered: DiscoveredPluginValue[] = rows
+    .filter((row) => !claimed.has(row.kind === "path" ? `path:${resolve(expandPath(row.source))}` : `pkg:${packageNameOf(row.source).toLowerCase()}`))
+    .map((row) => ({ id: row.id, version: row.version, source: row.source, section: row.section }))
+
+  const error = sidecar.error && !list.ok ? `${sidecar.error}${list.message ? `；${list.message}` : ""}` : ""
+  return { items, discovered, error }
+}
+
+async function readSidecar(endpoint: { url: string; headers: Readonly<Record<string, string>> }): Promise<{ list: PluginListInfo[]; error: string }> {
+  try {
+    // The sidecar serves its web UI at `/`, so `/plugin` is an HTML page. The JSON API lives
+    // under `/api`; asking the wrong path yields 200 HTML and a confusing parse error.
+    const response = await fetch(`${endpoint.url.replace(/\/+$/, "")}/api/plugin`, {
+      signal: AbortSignal.timeout(8_000),
+      headers: { accept: "application/json", ...endpoint.headers },
+    })
+    if (!response.ok) return { list: [], error: `后台服务返回 ${response.status}，运行状态未知` }
+    const text = await response.text()
+    let body: { data?: PluginListInfo[] } | PluginListInfo[]
+    try {
+      body = JSON.parse(text) as { data?: PluginListInfo[] } | PluginListInfo[]
+    } catch {
+      return { list: [], error: "后台返回的不是 JSON，运行状态未知" }
+    }
+    return { list: Array.isArray(body) ? body : body.data ?? [], error: "" }
+  } catch (error) {
+    return { list: [], error: `无法读取运行状态：${describe(error)}` }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Update check: `opencode plugin check` decides, the registry only explains
+// ---------------------------------------------------------------------------
+
+/** Compares every configured plugin against the official update check. */
+export async function updates(): Promise<UpdatesResultValue> {
+  if (!hasCli()) {
+    return { items: [], error: "找不到 opencode CLI，无法执行官方更新检查", checked: false }
+  }
+  let file: ConfigFile
+  let resolved: ResolvedEntry[]
+  try {
+    file = await readConfig()
+    resolved = await resolveAll(file)
+  } catch (error) {
+    return { items: [], error: describe(error), checked: false }
+  }
+
+  const list = await readRuntimeRows(resolved.length > 0)
+  const byKey = indexRows(list.rows)
+
+  const check = await pluginCheck()
+  // Exit code 1 is normal here: `plugin check` also exits non-zero when one plugin could not be
+  // checked while the rest succeeded. Only a total failure (no parsable rows, no CLI) is fatal.
+  const checkRows = parsePluginCheck(`${check.stdout}\n${check.stderr}`)
+  const byId = new Map<string, CheckRow>()
+  for (const row of checkRows) byId.set(row.id.toLowerCase(), row)
+
+  const items = await Promise.all(
+    resolved.map(async (entry): Promise<UpdateInfoValue> => {
+      const base: UpdateInfoValue = {
+        spec: entry.spec,
+        name: entry.name,
+        id: "",
+        kind: entry.kind,
+        current: entry.version,
+        latest: "",
+        hasUpdate: false,
+        official: "unknown",
+        reason: "",
+        managed: entry.kind !== "path" && entry.kind !== "control" && entry.kind !== "enable-rule",
+        pinned: literalVersion(splitSpec(entry.spec).range) !== "",
+        description: entry.description,
+        license: entry.license,
+        homepage: entry.homepage,
+        repo: entry.repo,
+        publisher: "",
+        error: "",
+      }
+      if (entry.kind === "control" || entry.kind === "enable-rule") {
+        return { ...base, official: "skipped", reason: "配置规则，不是插件包", managed: false }
+      }
+      const row = byKey.get(rowKeyFor(entry))
+      const id = row?.id ?? ""
+      const official = id ? byId.get(id.toLowerCase()) : undefined
+      // Registry metadata is display-only: it never decides that an update exists.
+      const lookup = isPackageName(entry.name) ? await npmLatest(entry.name) : emptyLookup(false)
+      const shared = {
+        ...base,
+        id,
+        publisher: lookup.publisher,
+        description: base.description || lookup.description,
+        license: base.license || lookup.license,
+        homepage: base.homepage || lookup.homepage,
+        repo: base.repo || lookup.repo,
+      }
+      if (entry.kind === "path") {
+        return {
+          ...shared,
+          official: "skipped",
+          managed: false,
+          reason: "本地目录插件由外部维护，官方更新流程会跳过它（目录里的改动不会被覆盖）",
+        }
+      }
+      if (!official) {
+        if (base.pinned) {
+          return { ...shared, official: "skipped", reason: `配置精确锁定 ${base.current}，官方更新会跳过精确版本` }
+        }
+        return {
+          ...shared,
+          official: "unknown",
+          reason: id
+            ? "官方检查结果里没有这个插件"
+            : "宿主尚未加载这个插件，官方检查拿不到它的 ID（安装后需要先加载一次）",
+        }
+      }
+      if (official.status === "outdated") {
+        return {
+          ...shared,
+          official: "outdated",
+          latest: official.latest,
+          current: official.version || base.current,
+          // A pinned version is never offered as a one-click update: `plugin update` skips exact
+          // revisions, so the button would only ever produce "nothing to update".
+          hasUpdate: official.latest !== "" && !base.pinned,
+          reason: base.pinned
+            ? `配置精确锁定 ${base.current || official.version}，官方更新会跳过精确版本；要换版本请用「npm 搜索」安装指定版本`
+            : "",
+        }
+      }
+      if (official.status === "failed") {
+        return { ...shared, official: "failed", reason: official.note || "官方检查这个插件时出错", error: official.note }
+      }
+      if (official.status === "current") {
+        return { ...shared, official: "current", current: official.version || base.current }
+      }
+      if (official.status === "skipped") {
+        return { ...shared, official: "skipped", reason: official.note || "官方更新会跳过这个插件" }
+      }
+      return { ...shared, official: "unknown", reason: official.note ? `官方输出无法识别：${official.note}` : "官方输出无法识别" }
+    }),
+  )
+
+  const totalFailure = checkRows.length === 0 && !check.ok
+  return {
+    items,
+    error: totalFailure ? "官方更新检查没有返回可解析的结果" : "",
+    raw: totalFailure ? check.message : undefined,
+    checked: !totalFailure,
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Config edits: one atomic, queued writer
+// ---------------------------------------------------------------------------
+
+/**
+ * Edits values in place, so the user's comments, ordering and indentation survive on every other line.
+ * Paths are jsonc paths such as `["plugins", 2]`.
  *
  * All config mutations funnel through this function while holding a module-level
  * queue: two overlapping edits (two cards, or the settings page and the dialog)
@@ -567,14 +882,30 @@ function enqueue<T>(task: () => Promise<T>): Promise<T> {
   return next
 }
 
-async function applyEdit(file: ConfigFile, path: (string | number)[], value: unknown): Promise<HubStateValue> {
+interface Edit {
+  path: (string | number)[]
+  value: unknown
+}
+
+/**
+ * Applies one or more edits under the queue. Removals must be ordered by descending index by the
+ * caller; the edits are applied to the same text, so a lower index would otherwise shift.
+ */
+async function applyEditsTo(file: ConfigFile, edits: readonly Edit[]): Promise<void> {
+  const fresh = await readConfig()
+  let text = fresh.text.trim().length > 0 ? fresh.text : "{}\n"
+  const options = { formattingOptions: { insertSpaces: true, tabSize: 2, eol: "\n" } }
+  for (const edit of edits) {
+    text = applyEdits(text, modify(text, edit.path, edit.value, options))
+  }
+  await atomicWrite(fresh.path, text)
+}
+
+async function editConfig(edits: readonly Edit[]): Promise<HubStateValue> {
   return enqueue(async () => {
     // Re-read inside the queue: the file may have changed since the caller read it.
     const fresh = await readConfig()
-    const text = fresh.text.trim().length > 0 ? fresh.text : "{}\n"
-    const options = { formattingOptions: { insertSpaces: true, tabSize: 2, eol: "\n" } }
-    const edits = modify(text, path, value, options)
-    await atomicWrite(fresh.path, applyEdits(text, edits))
+    await applyEditsTo(fresh, edits)
     return snapshot()
   })
 }
@@ -590,177 +921,248 @@ async function atomicWrite(path: string, text: string): Promise<void> {
   }
 }
 
-/** Index of the entry that owns `name`, matching either the raw name or a directory's package.json name. */
-async function findEntry(file: ConfigFile, name: string): Promise<number> {
-  for (const [index, spec] of file.plugins.entries()) {
-    if (splitSpec(spec).name === name) return index
+/** The config entry that owns `name`, matching either the raw name or a directory's package.json name. */
+async function findEntry(file: ConfigFile, name: string): Promise<ResolvedEntry | undefined> {
+  for (const entry of file.entries) {
+    if (splitSpec(entry.spec).name === name) return resolveEntry(entry)
   }
-  for (const [index, spec] of file.plugins.entries()) {
-    const parsed = splitSpec(spec)
-    if (parsed.kind !== "path") continue
-    const manifest = await readManifest(expandPath(spec))
-    if (manifest?.name === name) return index
+  for (const entry of file.entries) {
+    if (splitSpec(entry.spec).kind !== "path") continue
+    const manifest = await readManifest(expandPath(entry.spec))
+    if (manifest?.name === name) return resolveEntry(entry)
   }
-  return -1
+  return undefined
 }
 
-interface Packument {
-  "dist-tags"?: Record<string, string>
-  versions?: Record<string, { dist?: { tarball?: string } }>
+async function findBySpec(file: ConfigFile, spec: string): Promise<ResolvedEntry | undefined> {
+  const wanted = spec.trim()
+  const entry = file.entries.find((item) => item.spec.trim() === wanted)
+  return entry ? resolveEntry(entry) : undefined
 }
 
-async function packument(name: string, version: string): Promise<{ tarball: string; version: string } | undefined> {
-  const url = `/${encodeURIComponent(name)}`
-  try {
-    const response = await registryFetch(url, {
-      timeoutMs: 15_000,
-      accept: "application/vnd.npm.install-v1+json",
-    })
-    if (!response.ok) return undefined
-    const body = (await response.json()) as Packument
-    const resolved = version || body["dist-tags"]?.latest || ""
-    const entry = resolved ? body.versions?.[resolved] : undefined
-    const tarball = entry?.dist?.tarball
-    return tarball ? { tarball, version: resolved } : undefined
-  } catch {
-    return undefined
-  }
+// ---------------------------------------------------------------------------
+// Mutations that go through the official CLI
+// ---------------------------------------------------------------------------
+
+function outputDetail(outcome: CliOutcome): string {
+  const text = outcome.result.message
+  return text ? `（CLI：${text}）` : ""
 }
 
-async function copyTree(from: string, to: string): Promise<void> {
-  const entries = await readdir(from, { withFileTypes: true })
-  await mkdir(to, { recursive: true })
-  for (const entry of entries) {
-    const source = join(from, entry.name)
-    const target = join(to, entry.name)
-    if (entry.isDirectory()) await copyTree(source, target)
-    else if (entry.isFile()) await copyFile(source, target)
-  }
+/** Re-reads config and runtime after a command, and says what each of them now reports. */
+async function verify(endpoint?: { url: string; headers: Readonly<Record<string, string>> }): Promise<{ state: HubStateValue; note: string }> {
+  const state = await snapshot()
+  const live = await runtime(endpoint)
+  const loaded = live.items.filter((item) => item.status === "loaded").length
+  const paused = live.items.filter((item) => item.paused).length
+  const failed = live.items.filter((item) => item.status === "failed").length
+  const parts = [`配置 ${state.plugins.length} 项`, `运行时已加载 ${loaded} 个`]
+  if (paused > 0) parts.push(`已暂停 ${paused} 个`)
+  if (failed > 0) parts.push(`加载失败 ${failed} 个`)
+  if (live.error) parts.push(live.error)
+  return { state, note: parts.join(" · ") }
 }
 
-/** Puts a directory back exactly as it was: drop files the update added, then copy the backup over. */
-async function restoreTree(from: string, to: string): Promise<void> {
-  const keep = new Set(await readdir(from))
-  for (const entry of await readdir(to, { withFileTypes: true })) {
-    if (keep.has(entry.name)) continue
-    await rm(join(to, entry.name), { recursive: true, force: true })
-  }
-  await copyTree(from, to)
+export interface MutationOptions {
+  endpoint?: { url: string; headers: Readonly<Record<string, string>> }
 }
 
 /**
- * Runs a command to completion and reports its truth: `started` says whether the process
- * was actually spawned (a missing binary reports `false`, not exit code 0), `code` is the
- * real exit status, and `output` holds stdout + stderr for the caller to quote.
+ * Installs or re-versions an npm plugin through `opencode plugin add`.
+ *
+ * The command is the only thing that may touch the package; the hub never copies files or writes
+ * an install cache of its own. A directory entry is refused here on purpose: rewriting files in a
+ * user's working tree is not something an install button should do (see README).
  */
-function run(
-  command: string,
-  args: string[],
-  cwd: string,
-): Promise<{ code: number; output: string; started: boolean }> {
-  return new Promise((resolve) => {
-    const child = spawn(command, args, { cwd, stdio: ["ignore", "pipe", "pipe"] })
-    let output = ""
-    let started = false
-    child.stdout?.on("data", (chunk) => (output += String(chunk)))
-    child.stderr?.on("data", (chunk) => (output += String(chunk)))
-    child.on("spawn", () => (started = true))
-    child.on("error", (error) => resolve({ code: -1, output: describe(error), started }))
-    child.on("close", (code) => resolve({ code: code ?? -1, output, started }))
-  })
-}
-
-/**
- * Refreshes a directory plugin from the registry: unpack the new tarball over the folder, then
- * rerun `scripts/repatch.mjs` when present so a local patch is reapplied rather than silently lost.
- * The previous contents are kept next to the folder; on any failure they are copied back.
- */
-async function refreshDirectory(dir: string, name: string, version: string): Promise<{ ok: boolean; message: string }> {
-  const target = await packument(name, version)
-  if (!target) return { ok: false, message: "在 npm 上找不到这个版本" }
-
-  let work = ""
-  try {
-    work = await mkdtemp(join(tmpdir(), "plugin-hub-"))
-    const archive = join(work, "package.tgz")
-    const download = await fetch(target.tarball, { signal: AbortSignal.timeout(60_000) })
-    if (!download.ok) return { ok: false, message: `下载失败：${download.status}` }
-    await writeFile(archive, Buffer.from(await download.arrayBuffer()))
-
-    const unpacked = join(work, "unpacked")
-    await mkdir(unpacked, { recursive: true })
-    const tar = await run("tar", ["-xzf", archive, "-C", unpacked], work)
-    if (tar.code !== 0) return { ok: false, message: `解包失败：${tar.output.slice(0, 160)}` }
-
-    const staged = join(unpacked, "package")
-    const stagedManifest = await readManifest(staged)
-    if (!stagedManifest) return { ok: false, message: "下载的包里没有 package.json" }
-
-    const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19)
-    const backup = `${dir}.backup-${stamp}`
-    await cp(dir, backup, { recursive: true })
-    try {
-      await copyTree(staged, dir)
-      const repatch = join(dir, "scripts", "repatch.mjs")
-      const hasRepatch = await stat(repatch).then(
-        () => true,
-        () => false,
-      )
-      let patched = ""
-      if (hasRepatch) {
-        // Patch from the freshly unpacked copy: the npm cache still holds the old version.
-        const result = await run(process.execPath, [repatch, "--from", staged], dir)
-        if (result.code !== 0) throw new Error(`重打补丁失败：${result.output.slice(0, 160)}`)
-        patched = "，已自动重打补丁"
-      }
-      const after = await readManifest(dir)
-      return {
-        ok: true,
-        message: `已更新到 ${after?.version ?? target.version}${patched}；旧版本备份在 ${basename(backup)}`,
-      }
-    } catch (error) {
-      await restoreTree(backup, dir).catch(() => undefined)
-      return { ok: false, message: `更新中断，已从备份还原：${describe(error)}` }
-    }
-  } catch (error) {
-    return { ok: false, message: describe(error) }
-  } finally {
-    if (work) await rm(work, { recursive: true, force: true }).catch(() => undefined)
-  }
-}
-
-export async function install(spec: string, version: string): Promise<MutationValue> {
+export async function install(spec: string, version: string, options: MutationOptions = {}): Promise<MutationValue> {
   try {
     const file = await readConfig()
     const parsed = splitSpec(spec)
     if (parsed.kind !== "package" || !isPackageName(parsed.name)) {
       return { ok: false, message: "只能按 npm 包名安装", state: await snapshot() }
     }
+    if (!hasCli()) {
+      return { ok: false, message: "找不到 opencode CLI，无法执行 opencode plugin add", state: await snapshot() }
+    }
     const name = parsed.name
-    const wanted = version.trim() ? `${name}@${version.trim()}` : name
-    const index = await findEntry(file, name)
+    const target = version.trim() ? `${name}@${version.trim()}` : name
+    const existing = await findEntry(file, name)
 
-    // A directory plugin cannot be updated by editing the config: its files have to be replaced.
-    if (index >= 0 && splitSpec(file.plugins[index]!).kind === "path") {
-      const dir = expandPath(file.plugins[index]!)
-      // The directory refresh rewrites files, not the config — still run it
-      // through the queue so it cannot interleave with a config edit.
-      const result = await enqueue(() => refreshDirectory(dir, name, version.trim()))
-      return { ok: result.ok, message: result.message, state: await snapshot() }
+    if (existing?.kind === "path") {
+      return {
+        ok: false,
+        message: `${existing.spec} 是本地目录插件，由外部维护：插件中心不会下载 npm 包覆盖它。请在配置里改为 npm 包，或自行更新目录内容。`,
+        state: await snapshot(),
+      }
+    }
+    if (existing && existing.spec.trim() === target) {
+      const verified = await verify(options.endpoint)
+      return {
+        ok: true,
+        message: `${name} 已在配置中（${existing.spec}），没有再次安装`,
+        state: verified.state,
+        verification: verified.note,
+      }
     }
 
-    const state =
-      index >= 0
-        ? await applyEdit(file, [file.key, index], wanted)
-        : await applyEdit(file, [file.key, file.plugins.length], wanted)
+    // A different version of an already configured package: the CLI appends instead of replacing,
+    // which would leave two entries for one package. Remove the old entry first, and put it back
+    // if the new one cannot be installed.
+    if (existing) {
+      const removed = await pluginRemove(existing.spec)
+      if (!removed.result.ok && removed.status !== "not-configured") {
+        return { ok: false, message: `换版本前移除旧条目失败${outputDetail(removed)}`, state: await snapshot() }
+      }
+      const added = await pluginAdd(target)
+      if (!added.result.ok) {
+        const restored = await pluginAdd(existing.spec)
+        const tail = restored.result.ok ? "已恢复原条目。" : `恢复原条目也失败了${outputDetail(restored)}`
+        return {
+          ok: false,
+          message: `安装 ${target} 失败${outputDetail(added)}。${tail}`,
+          state: await snapshot(),
+        }
+      }
+      const verified = await verify(options.endpoint)
+      return {
+        ok: true,
+        message: `已通过 opencode plugin add 把 ${name} 换成 ${target}（旧条目 ${existing.spec} 已移除）。配置与运行状态已重新读取。`,
+        selfUpdated: name === SELF_PACKAGE || undefined,
+        state: verified.state,
+        verification: verified.note,
+      }
+    }
+
+    const added = await pluginAdd(target)
+    if (!added.result.ok) {
+      return { ok: false, message: `安装 ${target} 失败${outputDetail(added)}`, state: await snapshot() }
+    }
+    const verified = await verify(options.endpoint)
+    const where = added.path ? `写入 ${added.path}` : "已写入配置"
+    const message =
+      added.status === "already"
+        ? `${target} 已配置，命令没有改动配置`
+        : `已通过 opencode plugin add 安装 ${target}，${where}`
     return {
       ok: true,
-      message: index >= 0 ? `已更新 ${wanted}` : `已添加 ${wanted}`,
-      // Updating this very package the window is running only rewrites the config: the
-      // running bundle (and the background service) still hold the old version until
-      // OpenCode reloads it. Flag it so the UI can say the running build is stale instead
-      // of implying the new version is already loaded.
+      message,
       selfUpdated: name === SELF_PACKAGE || undefined,
+      state: verified.state,
+      verification: verified.note,
+    }
+  } catch (error) {
+    return { ok: false, message: describe(error), state: await snapshot() }
+  }
+}
+
+/**
+ * Updates one plugin through `opencode plugin update <target>`.
+ *
+ * The official command skips local plugins and exact revisions, and says so — that reason is
+ * reported instead of being replaced with a made-up "up to date".
+ */
+export async function update(spec: string, options: MutationOptions = {}): Promise<MutationValue> {
+  try {
+    const file = await readConfig()
+    const entry = await findBySpec(file, spec)
+    if (!entry) return { ok: false, message: "配置中没有这一项", state: await snapshot() }
+    if (entry.kind === "path") {
+      return {
+        ok: false,
+        message: `${entry.spec} 是本地目录插件，官方更新流程会跳过它：目录里可能有你的改动。需要时请自行更新目录内容（插件中心不覆盖本地目录）。`,
+        state: await snapshot(),
+      }
+    }
+    if (entry.kind === "control" || entry.kind === "enable-rule") {
+      return { ok: false, message: "配置规则不是插件包，没有可更新的版本", state: await snapshot() }
+    }
+    if (!hasCli()) {
+      return { ok: false, message: "找不到 opencode CLI，无法执行 opencode plugin update", state: await snapshot() }
+    }
+    const before = entry.version
+    const outcome = await pluginUpdate(entry.spec)
+    const verified = await verify(options.endpoint)
+    // The command may rewrite the spec (`pkg` -> `pkg@1.2.0`), so match by name, not by spec.
+    const after = verified.state.plugins.find((item) => item.name === entry.name)?.version ?? before
+    if (!outcome.result.ok) {
+      return {
+        ok: false,
+        message: `更新 ${entry.name} 失败${outputDetail(outcome)}`,
+        state: verified.state,
+        verification: verified.note,
+      }
+    }
+    if (outcome.status === "no-updates") {
+      return {
+        ok: true,
+        message: `官方命令报告没有可更新的插件：本地插件与精确锁定版本会被跳过，${entry.name} 未发生变化`,
+        state: verified.state,
+        verification: verified.note,
+      }
+    }
+    const moved = after && after !== before ? (before ? `v${before} → v${after}` : `v${after}`) : "版本号未变化"
+    return {
+      ok: true,
+      message: `已执行 opencode plugin update ${entry.spec}：${moved}。配置与运行状态已重新读取${after ? "" : "，但读不到新版本号"}`,
+      selfUpdated: entry.name === SELF_PACKAGE || undefined,
+      state: verified.state,
+      verification: verified.note,
+    }
+  } catch (error) {
+    return { ok: false, message: describe(error), state: await snapshot() }
+  }
+}
+
+/**
+ * Removes a plugin.
+ *
+ * npm packages go through `opencode plugin remove`; a directory entry is edited out of the config
+ * only — the files stay on disk, and the message says so explicitly.
+ */
+export async function remove(spec: string): Promise<MutationValue> {
+  try {
+    const file = await readConfig()
+    const entry = await findBySpec(file, spec)
+    if (!entry) return { ok: false, message: "配置中没有这一项", state: await snapshot() }
+    if (entry.name === SELF_PACKAGE) {
+      return { ok: false, message: "不能移除正在运行的插件中心自身", state: await snapshot() }
+    }
+
+    if (entry.kind === "path" || entry.kind === "enable-rule" || entry.kind === "control") {
+      const state = await editConfig([{ path: [file.key, entry.entry.index], value: undefined }])
+      if (entry.kind === "enable-rule") forgetRule(entry.spec)
+      if (entry.kind === "control" && entry.name) forgetRule(entry.name)
+      const gone = state.plugins.every((item) => item.spec !== entry.spec)
+      return {
+        ok: gone,
+        message: gone
+          ? entry.kind === "enable-rule"
+            ? `已移除插件中心追加的启用规则 ${entry.spec}（配置里其他规则没有改动）`
+            : entry.kind === "control"
+              ? `已从配置移除规则 ${entry.spec}；其他规则与插件条目没有改动`
+              : `已从配置移除目录条目 ${entry.spec}；磁盘上的目录 ${expandPath(entry.spec)} 没有被删除`
+          : `移除失败：配置里仍然有 ${entry.spec}`,
+        state,
+      }
+    }
+
+    if (!hasCli()) {
+      return { ok: false, message: "找不到 opencode CLI，无法执行 opencode plugin remove", state: await snapshot() }
+    }
+    const outcome = await pluginRemove(entry.spec)
+    const state = await snapshot()
+    const gone = state.plugins.every((item) => item.spec !== entry.spec)
+    if (outcome.status === "not-configured" && !gone) {
+      return { ok: false, message: `官方命令没有找到 ${entry.spec}${outputDetail(outcome)}`, state }
+    }
+    if (!outcome.result.ok && !gone) {
+      return { ok: false, message: `移除 ${entry.spec} 失败${outputDetail(outcome)}`, state }
+    }
+    return {
+      ok: gone,
+      message: gone
+        ? `已通过 opencode plugin remove 移除 ${entry.spec}（只改配置，不删除 npm 缓存里的包文件）`
+        : `命令已执行，但配置里仍有 ${entry.spec}`,
       state,
     }
   } catch (error) {
@@ -768,22 +1170,201 @@ export async function install(spec: string, version: string): Promise<MutationVa
   }
 }
 
-export async function remove(spec: string): Promise<MutationValue> {
+// ---------------------------------------------------------------------------
+// Pause / resume: config rules, never process management
+// ---------------------------------------------------------------------------
+
+interface IdLookup {
+  id: string
+  /** Where the ID came from, for the message the user reads. */
+  from: "runtime" | "cache" | ""
+}
+
+/**
+ * The real plugin ID, which is *not* always the package name: `opencode-notify` loads as
+ * `opencode-notify-callback`, `opencode-plugin-hub` as `plugin-hub`.
+ *
+ * Order of trust: what the runtime reports right now, then what this hub has seen before for the
+ * same package/path. If neither knows, the caller must refuse — guessing an ID would write a rule
+ * that silently does nothing.
+ */
+async function resolveId(entry: ResolvedEntry): Promise<IdLookup> {
+  const key = rowKeyFor(entry)
+  if (hasCli()) {
+    const list = await pluginList()
+    if (list.ok) {
+      const row = indexRows(parsePluginList(list.stdout)).get(key)
+      if (row?.id) {
+        rememberId(key, row.id)
+        return { id: row.id, from: "runtime" }
+      }
+    }
+  }
+  const cached = lookupId(key)
+  return cached ? { id: cached, from: "cache" } : { id: "", from: "" }
+}
+
+function ruleText(matches: readonly { raw: string }[]): string {
+  return matches.map((rule) => rule.raw).join(" → ")
+}
+
+/** Asks the host to reload, and reports what the command said without claiming more than that. */
+async function reloadAfterEdit(): Promise<string> {
+  if (!hasCli()) return "未执行重载：找不到 opencode CLI"
+  const result = await pluginReload()
+  if (result.ok) return "已执行 opencode reload"
+  return `opencode reload 未成功（${result.message || `退出码 ${result.code}`}）`
+}
+
+/**
+ * Pauses a plugin by appending `-<real id>` to the plugin list.
+ *
+ * Nothing is uninstalled, no process is signalled: the entry stays in the config, the package stays
+ * on disk, and only the rule that disables it is added. Because rules are processed in order, the
+ * new rule is appended last so it wins over everything the user already wrote.
+ */
+export async function pause(spec: string, options: MutationOptions = {}): Promise<MutationValue> {
   try {
     const file = await readConfig()
-    const { name } = splitSpec(spec)
-    const index = file.plugins.findIndex((entry) => entry.trim() === spec.trim())
-    if (index < 0) return { ok: false, message: "配置中没有这一项", state: await snapshot() }
-    const resolved = await resolveEntry(file.plugins[index]!)
-    if (resolved.name === SELF_PACKAGE) {
-      return { ok: false, message: "不能移除正在运行的插件中心自身", state: await snapshot() }
+    const entry = await findBySpec(file, spec)
+    if (!entry) return { ok: false, message: "配置中没有这一项", state: await snapshot() }
+    if (entry.kind === "control" || entry.kind === "enable-rule") {
+      return { ok: false, message: "配置规则不是插件包，无法暂停", state: await snapshot() }
     }
-    const state = await applyEdit(file, [file.key, index], undefined)
-    return { ok: true, message: `已移除 ${resolved.name || name}`, state }
+    const lookup = await resolveId(entry)
+    if (!lookup.id) {
+      return {
+        ok: false,
+        message: `无法确认 ${entry.name} 的插件 ID：宿主没有报告它加载时使用的 ID。为避免写入无效规则，未修改配置（请先让它成功加载一次，再暂停）。`,
+        state: await snapshot(),
+      }
+    }
+    const strings = file.raw.filter((value): value is string => typeof value === "string")
+    const verdict = evaluateRules(strings, lookup.id)
+    if (verdict.disabled) {
+      return {
+        ok: true,
+        message: `${entry.name} 已经被规则 ${ruleText(verdict.matches)} 禁用，没有再次写入`,
+        state: await snapshot(),
+      }
+    }
+    const rule = disableRule(lookup.id)
+    const index = file.raw.length
+    const state = await editConfig([{ path: [file.key, index], value: rule }])
+    const written = state.plugins.some((item) => item.spec === rule)
+    if (!written) {
+      return { ok: false, message: `写入禁用规则 ${rule} 失败`, state }
+    }
+    const reloaded = await reloadAfterEdit()
+    const live = await runtime(options.endpoint)
+    const info = live.items.find((item) => item.spec === entry.spec)
+    const stillLoaded = info?.status === "loaded" && info.id === lookup.id
+    const verification = stillLoaded
+      ? `运行时仍报告 ${lookup.id} 已加载：规则已写入，但宿主尚未重新加载`
+      : `运行时不再报告 ${lookup.id}，配置中新增规则 ${rule}`
+    return {
+      ok: true,
+      message: `已暂停 ${entry.name}：在配置末尾追加禁用规则 ${rule}（ID 来自${lookup.from === "runtime" ? "宿主运行状态" : "本机记录的运行历史"}），插件条目与包文件都没有改动。${reloaded}。`,
+      state,
+      verification,
+    }
   } catch (error) {
     return { ok: false, message: describe(error), state: await snapshot() }
   }
 }
+
+/**
+ * Resumes a paused plugin.
+ *
+ * Not a reinstall: it deletes the exact `-<id>` rules the config holds for this plugin, and only
+ * when a wildcard rule still disables it does it append the positive ID rule that re-enables it.
+ * Wildcards themselves are never removed — they belong to the user and cover other plugins too.
+ */
+export async function resume(spec: string, options: MutationOptions = {}): Promise<MutationValue> {
+  try {
+    const file = await readConfig()
+    const entry = await findBySpec(file, spec)
+    if (!entry) return { ok: false, message: "配置中没有这一项", state: await snapshot() }
+    if (entry.kind === "control" || entry.kind === "enable-rule") {
+      return { ok: false, message: "配置规则不是插件包，无法恢复", state: await snapshot() }
+    }
+    const lookup = await resolveId(entry)
+    const ids = Array.from(new Set([lookup.id, entry.name, splitSpec(entry.spec).name].filter((value) => value.length > 0)))
+    const strings = file.raw.filter((value): value is string => typeof value === "string")
+    const exact = exactRulesFor(strings, ids)
+    const evalTarget = lookup.id || entry.name
+    const verdictBefore = evaluateRules(strings, evalTarget)
+    const wildcardBlocked = verdictBefore?.matches.some((rule) => rule.scope !== "exact" && rule.negate) === true
+
+    if (exact.length === 0 && !verdictBefore?.disabled) {
+      return {
+        ok: true,
+        message: `${entry.name} 没有被禁用规则挡住，不需要恢复${lookup.id ? `（运行时 ID ${lookup.id}）` : ""}`,
+        state: await snapshot(),
+      }
+    }
+    if (exact.length === 0 && !lookup.id) {
+      return {
+        ok: false,
+        message: `无法确认 ${entry.name} 的插件 ID：规则 ${verdictBefore ? ruleText(verdictBefore.matches) : ""} 覆盖了它，而宿主没有报告过它的 ID。为避免写入无效规则，未修改配置。`,
+        state: await snapshot(),
+      }
+    }
+
+    // Removals are applied from the highest index down so earlier positions stay valid.
+    const removals: Edit[] = exact
+      .slice()
+      .sort((a, b) => b.index - a.index)
+      .map((rule) => ({ path: [file.key, rule.index], value: undefined }))
+    if (removals.length > 0) await editConfig(removals)
+
+    const after = await readConfig()
+    const remainingStrings = after.raw.filter((value): value is string => typeof value === "string")
+    const verdictAfter = evaluateRules(remainingStrings, evalTarget)
+
+    if (verdictAfter?.disabled) {
+      if (!lookup.id) {
+        return {
+          ok: false,
+          message: `已删除精确禁用规则，但仍有通配规则 ${ruleText(verdictAfter.matches)} 覆盖它，且无法确认插件 ID，未写入启用规则。`,
+          state: await snapshot(),
+        }
+      }
+      const rule = enableRule(lookup.id)
+      rememberRule(rule)
+      const state = await editConfig([{ path: [after.key, after.raw.length], value: rule }])
+      const reloaded = await reloadAfterEdit()
+      const live = await runtime(options.endpoint)
+      const info = live.items.find((item) => item.spec === entry.spec)
+      return {
+        ok: true,
+        message: `已恢复 ${entry.name}：删除精确禁用规则后仍被 ${ruleText(verdictAfter.matches)} 挡住，因此在配置末尾追加启用规则 ${rule}。通配规则保持原样。${reloaded}。`,
+        state,
+        verification: info?.status === "loaded" ? `运行时已报告 ${lookup.id} 加载成功` : "运行时尚未报告加载：等待宿主重新加载",
+      }
+    }
+
+    const reloaded = removals.length > 0 ? await reloadAfterEdit() : "配置没有禁用规则，未改动"
+    const live = await runtime(options.endpoint)
+    const info = live.items.find((item) => item.spec === entry.spec)
+    const removedText = exact.map((rule) => rule.raw).join("、")
+    return {
+      ok: true,
+      message:
+        removals.length > 0
+          ? `已恢复 ${entry.name}：删除禁用规则 ${removedText}，插件的版本与配置参数没有改动。${reloaded}。`
+          : `已恢复 ${entry.name}：没有需要删除的禁用规则。${reloaded}。`,
+      state: await snapshot(),
+      verification: info?.status === "loaded" ? `运行时已报告 ${lookup.id || entry.name} 加载成功` : "运行时尚未报告加载：等待宿主重新加载",
+    }
+  } catch (error) {
+    return { ok: false, message: describe(error), state: await snapshot() }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Search / detail / open actions
+// ---------------------------------------------------------------------------
 
 interface RegistrySearchPackage {
   name?: string
@@ -1068,6 +1649,7 @@ export async function detail(name: string): Promise<PackageDetailValue> {
     npm: base().npm,
     installed,
     current,
+    // Only a registry comparison here: the *installable* update decision belongs to the official check.
     hasUpdate: installed && isNewer(remote.version, current),
     error: "",
   }
@@ -1168,6 +1750,7 @@ export async function search(query: string): Promise<SearchResultValue> {
         updated: pkg.date ?? "",
         installed: isInstalled,
         current,
+        // A hint from the registry, not an install decision: the button used here pins the version.
         hasUpdate: isInstalled && isNewer(pkg.version ?? "", current),
         weekly: looked?.counts.weekly ?? -1,
         monthly: looked?.counts.monthly ?? -1,
@@ -1222,15 +1805,13 @@ export async function openConfig(): Promise<boolean> {
  * does — provider snapshots and unmonitored local dependencies still need the host's own
  * restart, which is OpenCode's call, not the hub's.
  */
-export async function reload(argv: readonly string[]): Promise<MutationValue> {
-  if (argv.length === 0) return { ok: false, message: "找不到 opencode CLI", state: await snapshot() }
-  // Same working directory the old fire-and-forget spawn inherited, so the command targets
-  // the same project as before — only now its exit status is actually read.
-  const result = await run(argv[0]!, [...argv.slice(1), "reload"], process.cwd())
+export async function reload(): Promise<MutationValue> {
+  if (!hasCli()) return { ok: false, message: "找不到 opencode CLI", state: await snapshot() }
+  const result: CliResult = await runCli(["reload"], { timeoutMs: 60_000 })
   const state = await snapshot()
-  if (result.code !== 0) {
-    const detail = lastLines(result.output)
+  if (!result.ok) {
     const reason = result.started ? `opencode reload 退出码 ${result.code}` : "无法启动 opencode CLI"
+    const detail = result.message
     return {
       ok: false,
       message: detail ? `配置重载失败：${reason} — ${detail}` : `配置重载失败：${reason}`,
@@ -1245,114 +1826,18 @@ export async function reload(argv: readonly string[]): Promise<MutationValue> {
   }
 }
 
-/** One configured plugin's runtime truth, as the running server reports it. */
-export interface RuntimeInfoValue {
-  spec: string
-  name: string
-  status: "loaded" | "failed" | "unknown"
-  runtimeVersion: string
-  error: string
-  available: boolean
+/** The CLI argv the hub is using, so the UI can show which binary it drives. */
+export function cliInfo(): { available: boolean; command: string } {
+  const command = cliCommand()
+  return { available: command.length > 0, command: command.join(" ") }
 }
 
-export interface RuntimeResultValue {
-  items: RuntimeInfoValue[]
-  error: string
-}
-
-interface PluginListInfo {
-  source?:
-    | { type: "builtin" }
-    | { type: "package"; target?: string; version?: string; outdated?: true; updating?: true }
-    | { type: "local"; path?: string }
-    | { type: "sdk" }
-  state?: { status: "active" } | { status: "failed"; error?: string }
-}
-
-/**
- * Cross-references the config with the server's running plugin list, so the UI
- * can tell 已配置待生效 from 已加载. Best effort: when the server cannot be
- * asked, every item stays "unknown" instead of pretending to know.
- */
-export async function runtime(endpoint: { url: string; headers: Readonly<Record<string, string>> } | undefined): Promise<RuntimeResultValue> {
-  const state = await snapshot()
-  if (!endpoint) return { items: state.plugins.map(toUnknown), error: "无法连接后台服务，运行状态未知" }
-  try {
-    // The sidecar serves its web UI at `/`, so `/plugin` is an HTML page. The
-    // JSON API lives under `/api`; asking the wrong path yields 200 HTML and a
-    // confusing parse error.
-    const response = await fetch(`${endpoint.url.replace(/\/+$/, "")}/api/plugin`, {
-      signal: AbortSignal.timeout(8_000),
-      headers: { accept: "application/json", ...endpoint.headers },
-    })
-    if (!response.ok) {
-      return { items: state.plugins.map(toUnknown), error: `后台服务返回 ${response.status}，运行状态未知` }
-    }
-    // Do not assume JSON: a misrouted request can return an HTML page with 200.
-    const text = await response.text()
-    let body: { data?: PluginListInfo[] } | PluginListInfo[]
-    try {
-      body = JSON.parse(text) as { data?: PluginListInfo[] } | PluginListInfo[]
-    } catch {
-      return { items: state.plugins.map(toUnknown), error: "后台返回的不是 JSON，运行状态未知" }
-    }
-    const list = Array.isArray(body) ? body : body.data ?? []
-    const items = state.plugins.map((entry) => {
-      // The server reports the source target; the config holds the spec (name, name@range or a path).
-      const name = splitSpec(entry.spec).name
-      const loaded = list.find((info) => {
-        const source = info.source
-        if (!source) return false
-        if (source.type === "package" && typeof source.target === "string") {
-          return splitSpec(source.target).name === name
-        }
-        if (source.type === "local" && entry.kind === "path" && typeof source.path === "string") {
-          return resolve(source.path) === resolve(expandPath(entry.spec))
-        }
-        return false
-      })
-      // Only the fields in RuntimeInfo cross the IPC boundary; config details stay on this side.
-      const base = { spec: entry.spec, name: entry.name }
-      if (!loaded) return { ...base, status: "unknown" as const, runtimeVersion: "", error: "", available: true }
-      if (loaded.state?.status === "failed") {
-        return {
-          ...base,
-          status: "failed" as const,
-          runtimeVersion: "",
-          error: loaded.state.error ?? "加载失败",
-          available: true,
-        }
-      }
-      return {
-        ...base,
-        status: "loaded" as const,
-        runtimeVersion: loaded.source?.type === "package" ? (loaded.source.version ?? "") : entry.version,
-        error: "",
-        available: true,
-      }
-    })
-    return { items, error: "" }
-  } catch (error) {
-    return { items: state.plugins.map(toUnknown), error: `无法读取运行状态：${describe(error)}` }
-  }
-}
-
-function toUnknown(entry: InstalledEntryValue): RuntimeInfoValue {
-  return { spec: entry.spec, name: entry.name, status: "unknown", runtimeVersion: "", error: "", available: false }
-}
+/** Exposed for the UI: the same classifier the mutations use, so a test can assert on it. */
+export { classify as classifyCliResult }
 
 function describe(error: unknown): string {
   if (error instanceof Error) return error.message
   return String(error)
-}
-
-/** The last few non-empty lines of CLI output, so an error message stays one line. */
-function lastLines(output: string, count = 3): string {
-  const lines = output
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter((line) => line.length > 0)
-  return lines.slice(-count).join(" ")
 }
 
 /** Makes socket-level failures actionable: `fetch failed` alone says nothing about what to do. */

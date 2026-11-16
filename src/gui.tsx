@@ -56,6 +56,9 @@ export default Plugin.define({
   },
 
   main(ctx) {
+    // Every package operation goes through the host's own CLI; the hub never shells out to npm.
+    admin.useCli(ctx.cli.command)
+
     ctx.provide(Admin, {
       snapshot: () => admin.snapshot(),
       updates: () => admin.updates(),
@@ -68,10 +71,13 @@ export default Plugin.define({
       detail: (input) => admin.detail(input.name),
       openUrl: (input) => ({ ok: admin.openUrl(input.url) }),
       openConfig: async () => ({ ok: await admin.openConfig() }),
-      install: (input) => admin.install(input.spec, input.version),
+      // 运行事实来自应用自己的 sidecar 与官方 `plugin list`；读不到时页面如实显示“未知”。
+      install: (input) => admin.install(input.spec, input.version, { endpoint: ctx.serverEndpoints.get("sidecar") }),
+      update: (input) => admin.update(input.spec, { endpoint: ctx.serverEndpoints.get("sidecar") }),
       remove: (input) => admin.remove(input.spec),
-      reload: () => admin.reload(ctx.cli.command),
-      // 运行事实来自应用自己的 sidecar；读不到时页面如实显示“未知”。
+      pause: (input) => admin.pause(input.spec, { endpoint: ctx.serverEndpoints.get("sidecar") }),
+      resume: (input) => admin.resume(input.spec, { endpoint: ctx.serverEndpoints.get("sidecar") }),
+      reload: () => admin.reload(),
       runtime: () => admin.runtime(ctx.serverEndpoints.get("sidecar")),
     })
   },

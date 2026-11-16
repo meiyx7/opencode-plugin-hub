@@ -12,14 +12,18 @@ type CatalogResult = Awaited<ReturnType<AdminClient["browse"]>>
 type UpdateInfo = Awaited<ReturnType<AdminClient["updates"]>>["items"][number]
 type PackageDetail = Awaited<ReturnType<AdminClient["detail"]>>
 type RuntimeInfo = Awaited<ReturnType<AdminClient["runtime"]>>["items"][number]
+type DiscoveredPlugin = NonNullable<Awaited<ReturnType<AdminClient["runtime"]>>["discovered"]>[number]
 
 type Tab = "catalog" | "search" | "installed"
 /** 已安装页的状态筛选；管理页先看问题项，而不是按配置顺序翻。 */
-type InstalledFilter = "all" | "update" | "failed" | "pending" | "unknown"
+type InstalledFilter = "all" | "update" | "paused" | "failed" | "pending" | "unknown"
 type Tone = "info" | "success" | "warning" | "error"
 type Note = { text: string; tone: Tone }
 
 const PAGE = 24
+
+/** 一行的运行状态：服务端事实 + 配置规则一起决定，界面按它出徽章和按钮。 */
+type RowState = "loaded" | "failed" | "paused" | "pending" | "unknown" | "control" | "rule"
 
 const CATALOG_SOURCE_FALLBACK = "https://github.com/awesome-opencode/awesome-opencode"
 const CATALOG_SOURCE_TITLE = "精选目录来自 awesome-opencode 社区维护的 registry.json，不是 OpenCode 官方推荐"
@@ -514,7 +518,13 @@ const CSS = `
   color: var(--ph-muted);
 }
 .ph-installed-meta > span {
+  flex: 0 0 auto;
   min-width: 0;
+}
+/* 整行只有 ID 这一段落会被压缩：给每段都挂省略号，窄卡片上会同时冒出三四个「…」，
+   看起来不像排版，像坏了。版本和作者都短，固定住更易读。 */
+.ph-installed-meta > span[data-ellipsis] {
+  flex: 0 1 auto;
   overflow: hidden;
   text-overflow: ellipsis;
 }
@@ -581,6 +591,15 @@ const CSS = `
   border-color: color-mix(in srgb, var(--ph-danger) 30%, transparent);
   background: color-mix(in srgb, var(--ph-danger) 9%, transparent);
 }
+/* 暂停是用户主动选择的状态，用中性偏冷的边框表达“它存在、但没在跑”，不是故障。 */
+.ph-badge[data-runtime="paused"] {
+  color: var(--ph-muted);
+  border-color: var(--ph-border-strong);
+  background: transparent;
+}
+.ph-tile[data-runtime="paused"] { opacity: 0.5; }
+.ph-tile[data-runtime="rule"] { opacity: 0.45; }
+.ph-card[data-paused="true"] { opacity: 0.86; }
 .ph-chips { display: flex; align-items: center; gap: 4px; flex-wrap: wrap; }
 .ph-chip {
   display: inline-flex;
@@ -1072,16 +1091,20 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
   // 运行事实（服务端已加载/失败/未知），与“已在配置中”分开表达。
   const [runtime, setRuntime] = createSignal<Map<string, RuntimeInfo>>(new Map())
   const [runtimeError, setRuntimeError] = createSignal("")
+  /** 运行时里存在、但全局配置没有列出的插件（发现目录、项目配置）。 */
+  const [discovered, setDiscovered] = createSignal<readonly DiscoveredPlugin[]>([])
   /** 配置与上一次已知运行状态不一致的条目数：安装/移除后等待宿主加载的数量。 */
   const pendingCount = createMemo(() => {
     const map = runtime()
     if (map.size === 0) return 0 // 从未拿到过运行事实：不虚构“待生效”数量
     return (state()?.plugins ?? []).filter((entry) => {
-      if (entry.kind === "control") return false // 禁用/通配规则不参与加载状态统计
+      if (entry.kind === "control" || entry.kind === "enable-rule" || entry.rule) return false
       const info = map.get(entry.spec)
+      // 已暂停的插件本来就不该在运行时列表里，不算“等加载”。
+      if (info?.paused) return false
       // unknown：服务端已应答但没加载它；info 缺失：刚改过配置，尚未重新读取。
       // failed 是“已加载但报错”，不算等待加载。
-      return !info || info.status === "unknown"
+      return !info || (info.status === "unknown" && info.available)
     }).length
   })
   /**
@@ -1131,10 +1154,12 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
       const map = new Map<string, RuntimeInfo>()
       for (const item of result.items) map.set(item.spec, item)
       setRuntime(map)
+      setDiscovered(result.discovered ?? [])
       setRuntimeError(result.error)
     } catch (error) {
       // Older running builds have no runtime method: keep the honest unknown state.
       setRuntime(new Map())
+      setDiscovered([])
       setRuntimeError((state()) ? readableError(error) : "")
     }
   }
@@ -1151,15 +1176,18 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
         setChecked(result.error === "" && result.items.length > 0)
         if (silent) return
         const stale = result.items.filter((item) => item.hasUpdate).length
-        const failed = result.items.filter((item) => item.error).length
-        // Never report "up to date" for packages the registry could not be asked about.
+        const failed = result.items.filter((item) => item.official === "failed").length
+        const skipped = result.items.filter((item) => item.official === "skipped").length
+        // 官方命令跳过本地插件和精确锁定版本：这是设计行为，要说明原因而不是报错。
         const message = result.error
-          ? result.error
+          ? `${result.error}${result.raw ? `（${result.raw}）` : ""}`
           : failed > 0
-            ? `${failed} 个插件未能检查（registry 连接失败）${stale > 0 ? `，其余 ${stale} 个可更新` : ""}`
+            ? `${failed} 个插件官方检查失败${stale > 0 ? `，${stale} 个可更新` : ""}`
             : stale > 0
-              ? `发现 ${stale} 个可更新的插件`
-              : "已检查的插件均为最新版本"
+              ? `官方检查发现 ${stale} 个可更新的插件${skipped > 0 ? `（${skipped} 个按规则跳过）` : ""}`
+              : skipped > 0
+                ? `官方检查：没有可更新的插件（${skipped} 个被跳过，见每行原因）`
+                : "官方检查：已检查的插件均为最新版本"
         notify(
           message,
           result.error ? "error" : failed > 0 ? "warning" : stale > 0 ? "info" : "success",
@@ -1225,34 +1253,80 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
     }, 450)
   }
 
+  /** 操作结果 = CLI 说的话 + 配置/运行时的复核结论，两件事分开写清楚。 */
+  const describeMutation = (result: { message: string; verification?: string }) =>
+    result.verification ? `${result.message}（${result.verification}）` : result.message
+
+  const specFor = (name: string) => state()?.plugins.find((entry) => entry.name === name)?.spec ?? name
+
   const install = async (name: string, version = "") => {
     await track(`install:${name}`, async () => {
       try {
         const result = await props.admin.install({ spec: name, version })
         setState(result.state)
         if (!result.ok) {
-          notify(result.message, "error")
+          notify(describeMutation(result), "error")
           return
         }
         if (result.selfUpdated) {
           // The config now names the new version, but this window (and the background
           // service) still run the previous bundle. Say exactly that and leave loading to
           // OpenCode's own mechanism — the hub never restarts the host.
-          notify(`${result.message}。新版本已写入配置，当前窗口仍运行旧构建；OpenCode 重新加载后生效（工具栏「重载配置」即执行 opencode reload）。`, "warning")
+          notify(`${describeMutation(result)}。新版本已写入配置，当前窗口仍运行旧构建；OpenCode 重新加载后生效。`, "warning")
         } else {
-          notify(`${result.message}。配置已写入：受监控的配置由 OpenCode 自动重新加载，未自动生效时点工具栏「重载配置」。`, "success")
+          notify(describeMutation(result), "success")
         }
-        const latest = version || hits().find((hit) => hit.name === name)?.version || ""
         setCatalog((prev) => prev.map((entry) => (entry.pkg === name ? { ...entry, installed: true } : entry)))
         setHits((prev) =>
           prev.map((hit) =>
-            hit.name === name ? { ...hit, installed: true, current: latest, hasUpdate: false } : hit,
+            hit.name === name ? { ...hit, installed: true, current: version || hit.current, hasUpdate: false } : hit,
           ),
         )
-        // 配置变了：之前的运行事实已过期，重新读取；新 spec 在服务端列表里
-        // 出现之前，卡片会如实显示“待加载”。
-        await checkUpdates(true)
-        void loadRuntime()
+        // 配置变了：之前的运行事实与检查结果都已过期，全部重新读取。
+        await Promise.all([loadRuntime(), checkUpdates(true)])
+      } catch (error) {
+        notify(readableError(error), "error")
+      }
+    })
+  }
+
+  /** 更新走官方 `opencode plugin update <target>`，不走“再装一次”。 */
+  const updatePlugin = async (spec: string, name: string) => {
+    await track(`install:${name}`, async () => {
+      try {
+        const result = await props.admin.update({ spec, version: "" })
+        setState(result.state)
+        notify(describeMutation(result), result.ok ? "success" : "error")
+        if (!result.ok) return
+        await Promise.all([loadRuntime(), checkUpdates(true)])
+      } catch (error) {
+        notify(readableError(error), "error")
+      }
+    })
+  }
+
+  const pausePlugin = async (entry: PluginEntry) => {
+    await track(`install:${entry.name}`, async () => {
+      try {
+        const result = await props.admin.pause({ spec: entry.spec, version: "" })
+        setState(result.state)
+        notify(describeMutation(result), result.ok ? "info" : "error")
+        if (!result.ok) return
+        await loadRuntime()
+      } catch (error) {
+        notify(readableError(error), "error")
+      }
+    })
+  }
+
+  const resumePlugin = async (entry: PluginEntry) => {
+    await track(`install:${entry.name}`, async () => {
+      try {
+        const result = await props.admin.resume({ spec: entry.spec, version: "" })
+        setState(result.state)
+        notify(describeMutation(result), result.ok ? "success" : "error")
+        if (!result.ok) return
+        await loadRuntime()
       } catch (error) {
         notify(readableError(error), "error")
       }
@@ -1260,9 +1334,12 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
   }
 
   const uninstall = async (entry: PluginEntry) => {
+    const isPath = entry.kind === "path"
     const ok = await props.ctx.dialogs.confirm({
       title: `移除 ${entry.name}？`,
-      description: "只从 opencode.json 里删掉这一项，已安装的文件不会删除。",
+      description: isPath
+        ? "只从配置里移除这个目录条目，磁盘上的目录不会被删除。"
+        : "npm 插件走官方 opencode plugin remove：只改配置，不删除缓存里的包文件，也不会删除本地目录。",
       confirm: "移除",
       danger: true,
     })
@@ -1275,7 +1352,7 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
           notify(result.message, "error")
           return
         }
-        notify(`${result.message}。配置已写入：受监控的配置由 OpenCode 自动重新加载，未自动生效时点工具栏「重载配置」。`, "success")
+        notify(result.message, "success")
         setCatalog((prev) =>
           prev.map((item) => (item.pkg === entry.name ? { ...item, installed: false } : item)),
         )
@@ -1302,6 +1379,8 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
         const result = await props.admin.reload()
         setState(result.state)
         notify(result.message, result.ok ? "success" : "error")
+        // 重载之后运行事实必然过期，立即重新读取。
+        if (result.ok) await loadRuntime()
       } catch (error) {
         notify(readableError(error), "error")
       }
@@ -1385,14 +1464,20 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
 
   const registryUrl = () => meta()?.registry || CATALOG_SOURCE_FALLBACK
   const outdated = createMemo(() => [...updates().values()].filter((item) => item.hasUpdate).length)
-  // 未能检查的条目数：失败不能被总结成“全部已是最新”。
-  const uncheckedCount = createMemo(() => [...updates().values()].filter((item) => item.error).length)
+  // 未能检查的条目数：官方检查失败或结果无法识别，都不能被总结成“已是最新”。
+  const uncheckedCount = createMemo(
+    () => [...updates().values()].filter((item) => item.official === "failed" || item.official === "unknown").length,
+  )
 
-  /** 运行事实：服务端已加载 / 加载失败 / 待加载 / 未验证 / 禁用规则（非插件包）。 */
-  const runtimeState = (entry: PluginEntry): "loaded" | "failed" | "pending" | "unknown" | "control" => {
+  /** 运行事实：已加载 / 加载失败 / 已暂停 / 待加载 / 未验证 / 配置规则。 */
+  const runtimeState = (entry: PluginEntry): RowState => {
     // `-id` / `*` 是配置里的启用规则，不参与“是否已加载”的判断。
     if (entry.kind === "control") return "control"
+    // 插件中心自己追加的启用规则（裸 ID）看上去像包名，但它是规则。
+    if (entry.kind === "enable-rule" || entry.rule) return "rule"
     const info = runtime().get(entry.spec)
+    // 规则明确禁用时，运行时不报告它是正常现象 —— 先表达“已暂停”，不当作未验证。
+    if (info?.paused) return "paused"
     if (!info) return runtimeError() ? "unknown" : "pending"
     if (info.status === "failed") return "failed"
     if (info.status === "loaded") return "loaded"
@@ -1401,6 +1486,9 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
   }
   const failedCount = createMemo(
     () => (state()?.plugins ?? []).filter((entry) => runtimeState(entry) === "failed").length,
+  )
+  const pausedCount = createMemo(
+    () => (state()?.plugins ?? []).filter((entry) => runtimeState(entry) === "paused").length,
   )
   const pendingRuntimeCount = createMemo(
     () => (state()?.plugins ?? []).filter((entry) => runtimeState(entry) === "pending").length,
@@ -1411,18 +1499,20 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
   const filterCounts = createMemo<Record<InstalledFilter, number>>(() => ({
     all: state()?.plugins.length ?? 0,
     update: outdated(),
+    paused: pausedCount(),
     failed: failedCount(),
     pending: pendingRuntimeCount(),
     unknown: unknownCount(),
   }))
-  /** 问题项排前面：加载失败 → 待加载 → 可更新 → 未验证 → 正常 → 禁用规则，同级保持配置顺序。 */
+  /** 问题项排前面：加载失败 → 待加载 → 可更新 → 未验证 → 已暂停 → 正常 → 配置规则，同级保持配置顺序。 */
   const severity = (entry: PluginEntry): number => {
     const status = runtimeState(entry)
-    if (status === "control") return 5
+    if (status === "control" || status === "rule") return 6
     if (status === "failed") return 0
     if (status === "pending") return 1
     if (updates().get(entry.spec)?.hasUpdate) return 2
     if (status === "unknown") return 3
+    if (status === "paused") return 5
     return 4
   }
   const visiblePlugins = createMemo(() => {
@@ -1431,6 +1521,7 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
     return (state()?.plugins ?? [])
       .filter((entry) => {
         if (filter === "update" && updates().get(entry.spec)?.hasUpdate !== true) return false
+        if (filter === "paused" && runtimeState(entry) !== "paused") return false
         if (filter === "failed" && runtimeState(entry) !== "failed") return false
         if (filter === "pending" && runtimeState(entry) !== "pending") return false
         if (filter === "unknown" && runtimeState(entry) !== "unknown") return false
@@ -1602,7 +1693,7 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
               size="small"
               icon="download"
               busy={busy()}
-              onClick={() => void install(entry.pkg, info()!.latest)}
+              onClick={() => void updatePlugin(specFor(entry.pkg), entry.pkg)}
             >
               更新
             </ui.Button>
@@ -1715,7 +1806,7 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
               size="small"
               icon="download"
               busy={isBusy(`install:${hit.name}`)}
-              onClick={() => void install(hit.name, hit.version)}
+              onClick={() => void updatePlugin(specFor(hit.name), hit.name)}
             >
               更新
             </ui.Button>
@@ -1738,43 +1829,64 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
 
   const installedRow = (entry: PluginEntry) => {
     const info = () => bySpec(entry.spec)
-    const stale = () => info()?.hasUpdate === true
     const busy = () => isBusy(`install:${entry.name}`)
     const control = () => entry.kind === "control"
+    const rule = () => entry.kind === "enable-rule" || entry.rule === true
+    const packageLike = () => !control() && !rule() && entry.kind !== "path"
+    // 只有 npm 包才谈得上「有更新」：目录插件外部维护，规则条目根本不是插件。
+    const stale = () => packageLike() && info()?.hasUpdate === true
     const current = () => info()?.current || entry.version
-    const unchecked = () => entry.kind !== "path" && (info()?.error ?? "") !== ""
+    const unchecked = () => packageLike() && (info()?.official === "failed" || info()?.official === "unknown")
     /**
      * 概述先取快照里的本地 package.json，registry 检查回来后用它的结果覆盖。
      * 只用 registry 会让整列描述在断网或检查未完成时集体变空——包明明就在磁盘上。
      */
     const summary = () => info()?.description || entry.description || ""
-    const license = () => info()?.license || entry.license || ""
     const publisher = () => info()?.publisher || ""
     const runtimeInfo = () => runtime().get(entry.spec)
     const runtimeStatus = () => runtimeState(entry)
+    /** 运行时 ID 与包名不一致时单独列出来：暂停/恢复用的就是这个 ID。 */
+    const runtimeId = () => runtimeInfo()?.id || ""
     const runtimeLabel = () =>
       runtimeStatus() === "loaded"
         ? "运行中"
         : runtimeStatus() === "failed"
           ? "加载失败"
-          : runtimeStatus() === "control"
-            ? "禁用规则"
-            : runtimeStatus() === "pending"
-              ? "待加载"
-              : "未验证"
+          : runtimeStatus() === "paused"
+            ? "已暂停"
+            : runtimeStatus() === "control"
+              ? "禁用规则"
+              : runtimeStatus() === "rule"
+                ? "启用规则"
+                : runtimeStatus() === "pending"
+                  ? "待加载"
+                  : "未验证"
     const runtimeHint = () => {
       const status = runtimeStatus()
       if (status === "loaded") {
         const loaded = runtimeInfo()?.runtimeVersion
-        return loaded ? `已加载 v${loaded}` : "宿主已报告加载成功"
+        return loaded ? `已加载 v${loaded}${runtimeId() ? `（ID ${runtimeId()}）` : ""}` : "宿主已报告加载成功"
       }
       if (status === "failed") return runtimeInfo()?.error || "宿主报告加载失败"
+      if (status === "paused") {
+        const rule = runtimeInfo()?.rule
+        return rule ? `配置规则 ${rule} 禁用了它；插件未被卸载，移除该规则即可恢复` : "配置规则禁用了它"
+      }
       if (status === "control") return "配置里的禁用/通配规则，不是已安装的插件包"
+      if (status === "rule") return "插件中心追加的启用规则（裸 ID），不是插件包"
       if (status === "pending") return "配置已写入，等待宿主重新加载（自动重载，或点「重载配置」）"
       return "没有取得宿主的加载证据，不当作已生效"
     }
+    /** 无法暂停：运行时不报 ID 的待加载/未验证项，规则也就无从写起。 */
+    const canPause = () =>
+      !control() && !rule() && runtimeStatus() !== "paused" && runtimeStatus() !== "pending" && runtimeStatus() !== "unknown"
     return (
-      <article class="ph-card" data-stale={stale() ? "true" : undefined} data-busy={busy() ? "true" : undefined}>
+      <article
+        class="ph-card"
+        data-stale={stale() ? "true" : undefined}
+        data-busy={busy() ? "true" : undefined}
+        data-paused={runtimeStatus() === "paused" ? "true" : undefined}
+      >
         <div class="ph-card-main">
           <div class="ph-card-head">
             <div class="ph-tile" data-runtime={runtimeStatus()}>
@@ -1787,15 +1899,15 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
                 </span>
               </div>
               <div class="ph-installed-meta" title={entry.spec}>
-                <Show when={!control()} fallback={<span>禁用/通配规则</span>}>
+                <Show when={!control() && !rule()} fallback={<span>禁用/通配规则</span>}>
                   <span>{current() ? `v${current()}` : "版本未知"}</span>
                 </Show>
                 <Show when={stale()}>
                   <span class="ph-version-arrow">→ v{info()!.latest}</span>
                 </Show>
-                <Show when={license()}>
+                <Show when={runtimeId() && runtimeId() !== entry.name}>
                   <span class="ph-dot" />
-                  <span>{license()}</span>
+                  <span data-ellipsis title="宿主实际加载的插件 ID，暂停/恢复用的就是它">ID {runtimeId()}</span>
                 </Show>
                 <Show when={publisher()}>
                   <span class="ph-dot" />
@@ -1824,22 +1936,35 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
               {runtimeLabel()}
             </span>
             <Show when={entry.kind === "path"}>
-              <span class="ph-badge">本地目录</span>
+              <span class="ph-badge" title="本地目录插件由外部维护：目录里可能有你的改动，插件中心不会覆盖它">
+                本地目录 · 外部维护
+              </span>
             </Show>
             <Show when={stale()}>
               <span class="ph-badge" data-tone="accent">
-                可更新
+                可更新 → v{info()!.latest}
               </span>
             </Show>
             <Show when={unchecked()}>
-              <span class="ph-badge" data-tone="warning" title={info()!.error}>
+              <span class="ph-badge" data-tone="warning" title={info()!.reason || info()!.error}>
                 未能检查
+              </span>
+            </Show>
+            {/* 目录插件的「跳过更新」已由上面那条徽章说清，规则条目更谈不上更新，不重复。 */}
+            <Show when={packageLike() && info()?.official === "skipped" && !stale()}>
+              <span class="ph-badge" data-tone="warning" title={info()!.reason}>
+                跳过更新
+              </span>
+            </Show>
+            <Show when={packageLike() && info()?.pinned && !stale()}>
+              <span class="ph-badge" title="配置写的是精确版本，官方更新会跳过它">
+                精确锁定
               </span>
             </Show>
           </div>
         </div>
         <div class="ph-actions">
-          <Show when={!control() && entry.kind !== "path" && NPM_LIKE.test(entry.name)}>
+          <Show when={packageLike() && NPM_LIKE.test(entry.name)}>
             <ui.Button
               variant="ghost"
               size="small"
@@ -1855,9 +1980,31 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
               size="small"
               icon="download"
               busy={busy()}
-              onClick={() => void install(info()!.name, info()!.latest)}
+              onClick={() => void updatePlugin(entry.spec, entry.name)}
             >
               更新
+            </ui.Button>
+          </Show>
+          <Show when={canPause()}>
+            <ui.Button
+              variant="ghost-muted"
+              size="small"
+              icon="circle-ban-sign"
+              busy={busy()}
+              onClick={() => void pausePlugin(entry)}
+            >
+              暂停
+            </ui.Button>
+          </Show>
+          <Show when={runtimeStatus() === "paused"}>
+            <ui.Button
+              variant="ghost"
+              size="small"
+              icon="check"
+              busy={busy()}
+              onClick={() => void resumePlugin(entry)}
+            >
+              恢复
             </ui.Button>
           </Show>
           <Show when={entry.removable}>
@@ -2069,21 +2216,42 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
               <Show
                 when={visible().length > 0}
                 fallback={
-                  <div class="ph-empty">
-                    <ui.Icon name="magnifying-glass" size="large" />
-                    <strong>没有匹配的插件</strong>
-                    <span>试试别的关键词，或者清除筛选条件。</span>
-                    <ui.Button
-                      variant="ghost"
-                      size="small"
-                      onClick={() => {
-                        setFilter("")
-                        setTypeFilter("all")
-                      }}
-                    >
-                      清除筛选
-                    </ui.Button>
-                  </div>
+                  /* 目录整个没拿到时不能报成「没有匹配」：那不是筛选的结果，是失败。
+                     只有拿到内置快照（列表非空）时才退回关键词空态。 */
+                  <Show
+                    when={meta()?.error && catalog().length === 0}
+                    fallback={
+                      <div class="ph-empty">
+                        <ui.Icon name="magnifying-glass" size="large" />
+                        <strong>没有匹配的插件</strong>
+                        <span>试试别的关键词，或者清除筛选条件。</span>
+                        <ui.Button
+                          variant="ghost"
+                          size="small"
+                          onClick={() => {
+                            setFilter("")
+                            setTypeFilter("all")
+                          }}
+                        >
+                          清除筛选
+                        </ui.Button>
+                      </div>
+                    }
+                  >
+                    <div class="ph-empty">
+                      <ui.Icon name="circle-exclamation" size="large" />
+                      <strong>插件目录没能加载</strong>
+                      <span>{meta()!.error}</span>
+                      <ui.Button
+                        variant="ghost"
+                        size="small"
+                        busy={isBusy("catalog")}
+                        onClick={() => void loadCatalog(true)}
+                      >
+                        重新加载
+                      </ui.Button>
+                    </div>
+                  </Show>
                 }
               >
                 <div class="ph-list">
@@ -2216,6 +2384,7 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
               <div class="ph-chips">
                 {installedFilterButton("all", "全部")}
                 {installedFilterButton("update", "可更新")}
+                {installedFilterButton("paused", "已暂停")}
                 {installedFilterButton("failed", "加载失败")}
                 {installedFilterButton("pending", "待加载")}
                 {installedFilterButton("unknown", "未验证")}
@@ -2274,6 +2443,18 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
                 <div class="ph-list">
                   <For each={visiblePlugins()}>{(entry) => installedRow(entry)}</For>
                 </div>
+                {/* 运行时里存在、但全局配置没列出的插件：来自发现目录或项目配置，只做告知。 */}
+                <Show when={discovered().length > 0}>
+                  <div class="ph-meta" title={discovered().map((item) => `${item.id || "(无 ID)"} ${item.version || ""} ${item.source}`).join("\n")}>
+                    <ui.Icon name="info" size="small" />
+                    运行时还报告了 {discovered().length} 个不在全局配置里的插件（发现目录或项目配置）：
+                    {discovered()
+                      .slice(0, 4)
+                      .map((item) => item.id || item.source)
+                      .join("、")}
+                    {discovered().length > 4 ? " …" : ""}。它们不在这里管理。
+                  </div>
+                </Show>
               </Show>
             </Show>
           </section>
@@ -2282,7 +2463,7 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
 
       <footer class="ph-footer">
         <div class="ph-footer-note">
-          安装、更新和移除只写全局配置，生效由 OpenCode 负责：受监控的配置会自动重新加载，需要确认时点工具栏「重载配置」（opencode reload）；未被监听的本地依赖变化，可能仍需重启 OpenCode 服务。插件中心不重启宿主。
+          安装、更新、移除都走官方 CLI（<code>opencode plugin add/update/remove</code>），暂停与恢复只改全局配置里的规则：暂停写入 <code>-&lt;插件ID&gt;</code>，恢复删掉这条精确规则、必要时追加裸 ID 启用规则。生效由 OpenCode 负责（受监控的配置会自动重载，也可点「重载配置」）。插件中心不重启宿主、不删除本地目录、不把「配置写入成功」当作「已经加载」。
         </div>
       </footer>
     </div>
