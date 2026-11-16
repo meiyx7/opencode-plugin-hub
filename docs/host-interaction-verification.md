@@ -37,6 +37,40 @@ Escape / 外部点击拦截，以及详情 Dialog 关闭后清理进度状态。
 6. 操作完成后可以正常关闭。
 7. 关闭详情后再次打开同一插件详情，不残留上一次进度/结果。
 
-> 特别说明：当前实现用 window 捕获阶段监听拦截 Escape（keydown）与外部点击（pointerdown），
-> 仅在 `running` 阶段生效。`ui.Dialog` 的关闭实现由宿主注入，若宿主在更高优先级或不同阶段
-> 处理这些事件，拦截可能失效。上述 7 项必须在真实客户端复验后才能判定通过。
+> 特别说明：当前实现用 window 捕获阶段监听拦截 Escape（keydown）与外部点击（pointerdown/click），
+> 仅在 `running` 阶段生效，且只对「落在 Dialog 内容之外」的指针事件拦截（内容元素识别见下）。
+> `ui.Dialog` 的关闭实现由宿主注入，若宿主在更高优先级或不同阶段处理这些事件，拦截可能失效。
+> 上述 7 项必须在真实客户端复验后才能判定通过。
+
+## 宿主 Dialog 事件模型核查（基于本机 OpenCode.app 的 app.asar，v2.3.0 / CLI 2.0.27）
+
+为避免“凭猜测加 DOM 选择器或假定宿主结构”，直接从已安装客户端的
+`app.asar` 源码映射（`main-*.js.map`）提取并核对了真实实现：
+
+- `ui/src/runtime/plugin/ui.tsx`：插件的 `ui.Dialog` 只把 `closable===false` 映射为
+  `DialogHeader hideClose`（仅隐藏标题栏 X），**不透传** `ref` / `class` /
+  `preventBackdropDismiss`。因此插件无法用 props 选择退出关闭，也拿不到 Dialog DOM 句柄。
+- `ui/src/overlays/dialog/dialog.tsx`：Dialog 内容元素是 Kobalte `Content`，
+  带 `data-slot="dialog-content"`；Kobalte `DialogContent` 还带 `role="dialog"`。
+  覆盖层 `data-component="dialog-overlay"` 的 `onClick` 触发 `backdrop.click` dismiss。
+- `ui/src/context/dialog.tsx`：Escape 由**捕获阶段**的 `window keydown` 处理 → `dispatch(dismiss)`；
+  外部点击最终也走同一 dismiss 状态机。
+- `@kobalte/core` 的 `create-interact-outside`：`document` 捕获阶段监听 `pointerdown`，
+  用 `content.contains(target)` 判断内外；外部事件发 cancelable CustomEvent，
+  Dialog 据此 `onDismiss`。`role="dialog"` / `data-slot="dialog-content"` / `contains` 均为真实实现。
+
+结论：把 window 捕获监听改成「仅拦 Escape 键 + 仅拦 target 不在 Dialog 内容元素内的 pointerdown/click」
+是有据可依的收窄；内容元素由进度体根节点 `closest('[data-slot="dialog-content"], [role="dialog"]')` 取得，
+找不到时退回进度体自身（范围仍严格小于整窗，绝不无差别锁窗口），且判定集中在纯函数 `dialog-lock.ts` 单测。
+
+### 本轮已用「真实事件派发」验证（本地预览 + mock 宿主组件，非真实客户端）
+
+在预览页用 `dispatchEvent` 派发真实 KeyboardEvent / PointerEvent，核对 `defaultPrevented`：
+
+| 阶段 | 内部 pointerdown/click | 外部 pointerdown/click | Escape | Tab |
+|---|---|---|---|---|
+| running | 放行(false) | 拦截(true) | 拦截(true) | 放行(false) |
+| done | 放行 | 放行 | 放行 | 放行 |
+
+> 这验证的是收窄后的**判定逻辑**，不是宿主是否真的据此关闭。真实客户端里
+> Escape/外部点击是否被宿主更高优先级的监听抢先处理，仍需按上面 7 项人工复验。

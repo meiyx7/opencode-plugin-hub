@@ -25,6 +25,7 @@ const entries = [
   "progress-view.test.ts",
   "install-progress.test.ts",
   "detail-close.test.ts",
+  "dialog-lock.test.ts",
   "status-view.test.ts",
   "error-view.test.ts",
   "release-guard.test.ts",

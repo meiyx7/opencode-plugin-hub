@@ -50,11 +50,18 @@ test("03. 所有 install/updatePlugin 入口都统一（无遗漏的直接 admin
   assert.ok(entryCalls.length >= 6, `安装/更新入口应至少 6 处，实际 ${entryCalls.length}`)
 })
 
-test("04. 执行期间锁住所有关闭路径：closable 与 window 捕获监听", () => {
+test("04. 执行期关闭锁：containment 判定 + window 捕获监听 + closable", () => {
+  const LOCK = readFileSync(join(process.cwd(), "src/gui", "dialog-lock.ts"), "utf8")
   assert.match(PAGE, /useLockDialogWhileRunning/, "缺少执行期关闭锁")
-  assert.match(PAGE, /window\.addEventListener\("keydown", onKey, true\)/, "未拦截 Escape")
-  assert.match(PAGE, /window\.addEventListener\("pointerdown", onPointer, true\)/, "未拦截外部点击")
-  assert.match(PAGE, /event\.key === "Escape"/, "未识别 Escape 键")
+  assert.match(PAGE, /shouldLockEvent/, "锁未使用纯判定函数")
+  // 三类事件都在 window 捕获阶段监听；是否拦截由 shouldLockEvent 决定，不再无差别拦 pointerdown。
+  for (const type of ["keydown", "pointerdown", "click"]) {
+    assert.match(PAGE, new RegExp(`window\\.addEventListener\\("${type}", handler, true\\)`), `未监听 ${type}(捕获)`)
+    assert.match(PAGE, new RegExp(`window\\.removeEventListener\\("${type}", handler, true\\)`), `${type} 监听未在清理时移除`)
+  }
+  assert.match(LOCK, /event\.key === "Escape"/, "纯判定未识别 Escape 键")
+  assert.match(LOCK, /isOutside === true/, "纯判定未在“外部”时才拦指针/点击事件")
+  assert.match(LOCK, /closest|content/, "缺少内容元素识别（containment）")
   assert.match(PAGE, /closable=\{!running\(\)\}/, "独立 Dialog 执行期未隐藏关闭按钮")
   assert.match(PAGE, /closable=\{!progressRunning\(\)\}/, "详情 Dialog 执行期未隐藏关闭按钮")
 })

@@ -5,6 +5,7 @@ import { countTitle, countWithUnit, formatCount } from "./download-format"
 import { explainMutation, type Tone } from "./feedback"
 import { buildAttentionItems, type InstalledFilter } from "./attention"
 import { classifyState, severityOf, type RowState } from "./status-view"
+import { shouldLockEvent } from "./dialog-lock"
 import { readableErrorText } from "./error-view"
 import {
   buildProgressReport,
@@ -148,7 +149,7 @@ function StepIcon(props: { state: StepState }) {
  * 进度 Dialog 的共享内容体：详情页就地切换与独立进度 Dialog 复用同一套呈现，
  * 保证所有入口的进度外观与状态语义完全一致。
  */
-function ProgressBody(props: { state: ProgressState }) {
+function ProgressBody(props: { state: ProgressState; rootRef?: (el: HTMLDivElement) => void }) {
   // 把联合类型收敛成一个对象，避免在 JSX 里对 props.state 反复取值导致 TS 无法收窄。
   const view = createMemo(() => {
     const s = props.state
@@ -168,7 +169,7 @@ function ProgressBody(props: { state: ProgressState }) {
       : report()!.summary
 
   return (
-    <div class="ph-progress">
+    <div class="ph-progress" ref={props.rootRef}>
       <div class="ph-progress-id">
         <span class="ph-tile ph-progress-tile">{initial(op().name)}</span>
         <div class="ph-progress-titles">
@@ -234,32 +235,50 @@ function progressTone(state: ProgressState): "success" | "failed" | "attention" 
 }
 
 /**
- * 操作执行期间锁住 Dialog，禁用一切关闭路径。
+ * 操作执行期间阻止 Dialog 被关闭，但只拦截“可能导致关闭”的事件：
+ * - keydown 只拦 Escape（宿主 window 捕获阶段据此 dismiss）；
+ * - pointerdown / click 只拦“落在 Dialog 内容之外”的（宿主据此触发 backdrop.click /
+ *   Kobalte 的 pointerdown-outside → onDismiss）；
+ * - Dialog 内部交互一律放行，绝不无差别锁住整个 OpenCode 窗口。
  *
- * 宿主的 `ui.Dialog` 只提供 `closable`（仅隐藏标题栏的 X），Escape 与外部点击仍会关闭它；
- * 这里用捕获阶段的 window 监听把 Escape 与外部指针事件拦下——只在 running 时生效，
- * 任务结束（phase=done）或组件卸载即移除，不残留监听、不引入全局状态管理。
- * 这是在不改宿主 Dialog 实现、不自研进程机制的前提下，能满足“执行期间不可关闭”的最小做法。
+ * 现实约束：宿主的 `ui.Dialog` 只透传 closable（隐藏标题栏 X），不透传 ref/class/
+ * preventBackdropDismiss，插件拿不到 Dialog 的 DOM 句柄。因此 hook 接收一个由进度内容
+ * 根节点设置的 ref，向上找到宿主的内容元素（role="dialog" / data-slot="dialog-content"，
+ * 二者均来自宿主真实实现）；找不到时退回该 ref 节点本身——判定范围仍严格小于整窗。
+ * 是否拦截由纯函数 shouldLockEvent 决定，便于事件行为单测。
  */
-function useLockDialogWhileRunning(running: () => boolean): void {
+function useLockDialogWhileRunning(running: () => boolean, contentRef: { current: HTMLElement | undefined }): void {
   onMount(() => {
-    const onKey = (event: KeyboardEvent) => {
-      if (running() && event.key === "Escape") {
+    const dialogNode = (): HTMLElement | undefined => {
+      const root = contentRef.current
+      if (!root) return undefined
+      const hostContent = root.closest<HTMLElement>('[data-slot="dialog-content"], [role="dialog"]')
+      return hostContent ?? root
+    }
+    const isOutside = (event: Event): boolean | undefined => {
+      const node = dialogNode()
+      if (!node) return undefined
+      const target = event.target
+      return target instanceof Node ? !node.contains(target) : undefined
+    }
+    const handler = (event: Event) => {
+      const decision = shouldLockEvent(
+        { type: event.type, key: event instanceof KeyboardEvent ? event.key : undefined },
+        { running: running(), isOutside: event.type === "keydown" ? undefined : isOutside(event) },
+      )
+      if (decision) {
         event.preventDefault()
         event.stopImmediatePropagation()
       }
     }
-    const onPointer = (event: PointerEvent) => {
-      if (running()) {
-        event.preventDefault()
-        event.stopImmediatePropagation()
-      }
-    }
-    window.addEventListener("keydown", onKey, true)
-    window.addEventListener("pointerdown", onPointer, true)
+    // 捕获阶段：先于宿主的 document 捕获 pointerdown 与 window 捕获 keydown。
+    window.addEventListener("keydown", handler, true)
+    window.addEventListener("pointerdown", handler, true)
+    window.addEventListener("click", handler, true)
     onCleanup(() => {
-      window.removeEventListener("keydown", onKey, true)
-      window.removeEventListener("pointerdown", onPointer, true)
+      window.removeEventListener("keydown", handler, true)
+      window.removeEventListener("pointerdown", handler, true)
+      window.removeEventListener("click", handler, true)
     })
   })
 }
@@ -273,7 +292,8 @@ function ProgressDialog(props: {
   const ui = props.ctx.ui
   const running = () => props.state.phase === "running"
   const done = () => props.state.phase === "done"
-  useLockDialogWhileRunning(running)
+  const contentRef: { current: HTMLElement | undefined } = { current: undefined }
+  useLockDialogWhileRunning(running, contentRef)
   const title = () => {
     const verb = props.state.op.kind === "install" ? "安装" : "更新"
     if (props.state.phase === "running") return `正在${verb}插件`
@@ -299,7 +319,7 @@ function ProgressDialog(props: {
         </div>
       }
     >
-      <ProgressBody state={props.state} />
+      <ProgressBody state={props.state} rootRef={(el) => (contentRef.current = el)} />
     </ui.Dialog>
   )
 }
@@ -364,9 +384,10 @@ function DetailDialog(props: DetailDialogProps) {
   const canInstall = () => !loading() && data() !== undefined && !failure() && (data()?.version ?? "") !== ""
   const update = () => data()?.hasUpdate === true
   const installed = () => data()?.installed === true
-  // 有本包的进度状态时，详情就地切换成进度视图；执行期间锁住所有关闭路径。
+  // 有本包的进度状态时，详情就地切换成进度视图；执行期间只拦截可能导致关闭的事件。
   const progressRunning = () => props.progress?.phase === "running"
-  useLockDialogWhileRunning(progressRunning)
+  const contentRef: { current: HTMLElement | undefined } = { current: undefined }
+  useLockDialogWhileRunning(progressRunning, contentRef)
 
   return (
     <ui.Dialog
@@ -627,7 +648,7 @@ function DetailDialog(props: DetailDialogProps) {
         </Show>
       </div>
       }>
-        {(state) => <ProgressBody state={state()} />}
+        {(state) => <ProgressBody state={state()} rootRef={(el) => (contentRef.current = el)} />}
       </Show>
     </ui.Dialog>
   )
