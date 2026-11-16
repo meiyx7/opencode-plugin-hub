@@ -357,10 +357,7 @@ export const CSS = `
   align-items: center;
   gap: 6px;
   flex-wrap: wrap;
-  padding: 7px 9px;
-  border: 1px solid var(--ph-border);
-  border-radius: 8px;
-  background: var(--ph-layer);
+  min-height: 24px;
 }
 .ph-attention-lead {
   display: inline-flex;
@@ -391,6 +388,11 @@ export const CSS = `
 .ph-attention-chip[data-tone="danger"] { color: var(--ph-danger); }
 .ph-attention-chip[data-tone="warning"] { color: var(--ph-warning); }
 .ph-attention-chip[data-tone="accent"] { color: var(--ph-accent); }
+/* 当前选中的筛选：摘要项与列表筛选项套同一套 active 反馈，剪/切语义一致。 */
+.ph-attention-chip[data-active="true"] {
+  border-color: color-mix(in srgb, currentColor 40%, transparent);
+  background: color-mix(in srgb, currentColor 14%, transparent);
+}
 .ph-attention-hint { margin-left: auto; font-size: 10px; color: var(--ph-faint); }
 
 /* ---------- 卡片 ---------- */

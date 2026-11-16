@@ -3,6 +3,7 @@ import type { Context, IconName, IpcClient } from "@opencode/plugin/gui"
 import type { Admin } from "../contract"
 import { countTitle, countWithUnit, formatCount } from "./download-format"
 import { explainMutation, type Tone } from "./feedback"
+import { buildAttentionItems, type InstalledFilter } from "./attention"
 import { CSS } from "./styles"
 
 type AdminClient = IpcClient<typeof Admin.spec>
@@ -18,8 +19,6 @@ type RuntimeInfo = Awaited<ReturnType<AdminClient["runtime"]>>["items"][number]
 type DiscoveredPlugin = NonNullable<Awaited<ReturnType<AdminClient["runtime"]>>["discovered"]>[number]
 
 type Tab = "catalog" | "search" | "installed"
-/** 已安装页的状态筛选；管理页先看问题项，而不是按配置顺序翻。 */
-type InstalledFilter = "all" | "update" | "paused" | "failed" | "pending" | "unknown"
 type Note = { text: string; tone: Tone; scope?: Tab }
 
 const PAGE = 24
@@ -860,15 +859,16 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
     pending: pendingRuntimeCount(),
     unknown: unknownCount(),
   }))
-  /** 只有确实存在问题项时才显示摘要；顺序与列表严重程度一致。 */
-  const attentionItems = createMemo(() => {
-    const items: { id: InstalledFilter; label: string; count: number; tone: "danger" | "accent" | "warning" }[] = []
-    if (failedCount() > 0) items.push({ id: "failed", label: "加载失败", count: failedCount(), tone: "danger" })
-    if (pendingRuntimeCount() > 0)
-      items.push({ id: "pending", label: "待加载", count: pendingRuntimeCount(), tone: "accent" })
-    if (outdated() > 0) items.push({ id: "update", label: "可更新", count: outdated(), tone: "warning" })
-    return items
-  })
+  /** 各状态计数；全部来自已存在的派生值，统计口径唯一、不被搜索/筛选污染。 */
+  const attentionItems = createMemo(() =>
+    buildAttentionItems({
+      failed: failedCount(),
+      pending: pendingRuntimeCount(),
+      update: outdated(),
+      paused: pausedCount(),
+      unknown: unknownCount(),
+    }),
+  )
   /** 问题项排前面：加载失败 → 待加载 → 可更新 → 未验证 → 已暂停 → 正常 → 配置规则，同级保持配置顺序。 */
   const severity = (entry: PluginEntry): number => {
     const status = runtimeState(entry)
@@ -1889,9 +1889,10 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
                       <button
                         class="ph-attention-chip"
                         data-tone={item.tone}
+                        data-active={installedFilter() === item.id}
                         onClick={() => setInstalledFilter(item.id)}
                       >
-                        {item.count} {item.label}
+                        {item.label} {item.count}
                       </button>
                     )}
                   </For>

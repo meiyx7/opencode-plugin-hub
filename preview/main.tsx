@@ -656,8 +656,9 @@ const ctx = {
     runtime: async () => ({
       items: fakeState.plugins.map((entry) => {
         const control = entry.kind === "control"
-        const failed = entry.name === "magpie-workbuddy-growth"
-        const paused = entry.name === "opencode-timeline-gui"
+        // ?clean 预览分支：让运行状态全部正常，用来核对「无事不显示摘要」。
+        const failed = !params.has("clean") && entry.name === "magpie-workbuddy-growth"
+        const paused = !params.has("clean") && entry.name === "opencode-timeline-gui"
         return {
           spec: entry.spec,
           name: entry.name,
