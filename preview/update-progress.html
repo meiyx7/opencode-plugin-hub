@@ -1,0 +1,876 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="light">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>插件更新流程可视化 · 交互原型</title>
+<style>
+  /* ============================================================
+     设计令牌：严格复用插件中心 styles.ts / preview/index.html
+     浅色/深色两套，跟随 data-theme 切换。
+     ============================================================ */
+  :root {
+    --strong: #161616;
+    --text: #262626;
+    --muted: #5c5c5c;
+    --faint: #8f8f8f;
+    --border: rgba(0, 0, 0, 0.10);
+    --border-strong: rgba(0, 0, 0, 0.22);
+    --base: #ffffff;
+    --layer: #fafafa;
+    --layer-2: #f0f0f0;
+    --layer-3: #e8e8e8;
+    --accent: #5a5fe0;
+    --success: #1f7a44;
+    --danger: #c23b34;
+    --warning: #a86e10;
+    --hover: rgba(0, 0, 0, 0.06);
+    --page-bg: #f4f5f7;
+    --shadow-card: 0 1px 2px rgba(0, 0, 0, 0.06);
+    --shadow-dialog: 0 24px 80px rgba(15, 23, 42, 0.30);
+    --r-sm: 6px;
+    --r-md: 9px;
+    --r-lg: 12px;
+    --mono: ui-monospace, SFMono-Regular, Menlo, monospace;
+    --sans: -apple-system, BlinkMacSystemFont, "PingFang SC", "Segoe UI", sans-serif;
+  }
+  html[data-theme="dark"] {
+    --strong: #f5f7fa;
+    --text: #e6e9ef;
+    --muted: #a4abba;
+    --faint: #6f7787;
+    --border: rgba(255, 255, 255, 0.12);
+    --border-strong: rgba(255, 255, 255, 0.26);
+    --base: #15171a;
+    --layer: #1a1c20;
+    --layer-2: #212429;
+    --layer-3: #2a2e34;
+    --accent: #9aa0ff;
+    --success: #6bbf8b;
+    --danger: #ef7f78;
+    --warning: #e0b15a;
+    --hover: rgba(255, 255, 255, 0.08);
+    --page-bg: #0f1012;
+    --shadow-card: 0 1px 2px rgba(0, 0, 0, 0.4);
+    --shadow-dialog: 0 24px 80px rgba(0, 0, 0, 0.6);
+  }
+
+  * { box-sizing: border-box; }
+  html, body { margin: 0; min-height: 100%; }
+  body {
+    font-family: var(--sans);
+    font-size: 12px;
+    line-height: 1.5;
+    color: var(--text);
+    background: var(--page-bg);
+    -webkit-font-smoothing: antialiased;
+  }
+  button { font-family: inherit; }
+
+  /* ---------------- 工作台：左侧场景控制 + 右侧插件中心画面 ---------------- */
+  .workbench {
+    display: grid;
+    grid-template-columns: 288px minmax(0, 1fr);
+    gap: 16px;
+    padding: 16px;
+    min-height: 100vh;
+    align-items: start;
+  }
+  @media (max-width: 900px) {
+    .workbench { grid-template-columns: 1fr; }
+  }
+
+  .controls {
+    position: sticky;
+    top: 16px;
+    background: var(--base);
+    border: 1px solid var(--border);
+    border-radius: var(--r-lg);
+    box-shadow: var(--shadow-card);
+    padding: 14px;
+  }
+  .controls-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 8px; }
+  .controls-title { margin: 0; font-size: 13px; font-weight: 650; color: var(--strong); letter-spacing: -0.01em; }
+  .controls-sub { margin: 4px 0 0; font-size: 10.5px; line-height: 1.55; color: var(--muted); }
+  .theme-btn {
+    flex: 0 0 auto; height: 26px; padding: 0 9px; border: 1px solid var(--border);
+    border-radius: var(--r-sm); background: var(--layer); color: var(--muted);
+    font-size: 10.5px; cursor: pointer;
+  }
+  .theme-btn:hover { background: var(--layer-2); color: var(--strong); }
+
+  .group-label {
+    margin: 14px 0 6px; font-size: 9.5px; font-weight: 700; letter-spacing: 0.09em;
+    text-transform: uppercase; color: var(--faint);
+  }
+  .scenarios { display: flex; flex-direction: column; gap: 4px; }
+  .scenario {
+    display: flex; align-items: center; gap: 8px; width: 100%; text-align: left;
+    padding: 7px 9px; border: 1px solid var(--border); border-radius: var(--r-sm);
+    background: var(--layer); color: var(--text); font-size: 11px; cursor: pointer;
+    transition: border-color .15s, background .15s;
+  }
+  .scenario:hover { border-color: var(--border-strong); background: var(--layer-2); }
+  .scenario[data-active="true"] {
+    border-color: color-mix(in srgb, var(--accent) 40%, transparent);
+    background: color-mix(in srgb, var(--accent) 8%, var(--base));
+    color: var(--strong);
+  }
+  .scenario-dot { flex: 0 0 auto; width: 7px; height: 7px; border-radius: 50%; }
+  .scenario-dot[data-t="success"] { background: var(--success); }
+  .scenario-dot[data-t="failed"] { background: var(--danger); }
+  .scenario-dot[data-t="attention"] { background: var(--warning); }
+  .scenario-name { flex: 1; min-width: 0; }
+  .scenario-flow { font-size: 9.5px; color: var(--faint); }
+
+  .legend {
+    margin-top: 16px; padding-top: 12px; border-top: 1px solid var(--border);
+    display: grid; grid-template-columns: 1fr 1fr; gap: 7px 10px;
+  }
+  .legend-item { display: flex; align-items: center; gap: 6px; font-size: 10px; color: var(--muted); }
+  .legend-ico {
+    flex: 0 0 auto; width: 15px; height: 15px; border-radius: 50%; display: grid; place-items: center;
+    font-size: 9px; font-weight: 700; line-height: 1;
+  }
+  .legend-ico[data-s="pending"] { border: 1.5px solid var(--border-strong); color: transparent; }
+  .legend-ico[data-s="running"] { border: 2px solid color-mix(in srgb, var(--accent) 30%, transparent); border-top-color: var(--accent); animation: spin .8s linear infinite; }
+  .legend-ico[data-s="done"] { background: var(--success); color: #fff; }
+  .legend-ico[data-s="failed"] { background: var(--danger); color: #fff; }
+  .legend-ico[data-s="skipped"] { border: 1.5px dashed var(--border-strong); color: var(--faint); }
+  .legend-ico[data-s="unknown"] { background: var(--warning); color: #fff; }
+
+  .proto-note {
+    margin-top: 14px; padding: 9px 10px; border: 1px dashed var(--border-strong);
+    border-radius: var(--r-sm); font-size: 10px; line-height: 1.6; color: var(--muted);
+  }
+  .proto-note b { color: var(--text); font-weight: 600; }
+
+  /* ---------------- 插件中心画面（Dialog 背景） ---------------- */
+  .stage {
+    position: relative; min-height: 760px; background: var(--page-bg);
+    border: 1px solid var(--border); border-radius: var(--r-lg); overflow: hidden;
+  }
+  .hub { padding: 18px 22px 28px; }
+  .hub-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+  .hub-title { margin: 0; font-size: 17px; font-weight: 650; color: var(--strong); }
+  .hub-sub { margin: 3px 0 0; font-size: 11px; color: var(--muted); }
+  .hub-path { font-size: 10px; color: var(--faint); font-family: var(--mono); }
+  .hub-tabs { display: flex; gap: 2px; margin: 14px 0 12px; border: 1px solid var(--border); border-radius: var(--r-md); background: var(--layer); padding: 2px; width: max-content; }
+  .hub-tab { padding: 5px 12px; border: 0; border-radius: var(--r-sm); background: transparent; color: var(--muted); font-size: 11px; }
+  .hub-tab[data-active="true"] { background: var(--layer-3); color: var(--strong); box-shadow: var(--shadow-card); }
+  .hub-search { display: flex; gap: 8px; margin-bottom: 12px; }
+  .hub-search-box { flex: 1; height: 30px; border: 1px solid var(--border); border-radius: var(--r-sm); background: var(--base); display: flex; align-items: center; padding: 0 10px; color: var(--faint); font-size: 11px; }
+  .hub-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 280px), 1fr)); gap: 10px; }
+  .hub-card { border: 1px solid var(--border); border-radius: var(--r-lg); background: var(--layer); padding: 12px; box-shadow: var(--shadow-card); }
+  .hub-card[data-target="true"] { border-color: color-mix(in srgb, var(--accent) 30%, var(--border)); }
+  .hub-card-head { display: flex; align-items: center; gap: 9px; }
+  .hub-tile { width: 32px; height: 32px; flex: 0 0 auto; border: 1px solid color-mix(in srgb, var(--accent) 18%, transparent); border-radius: var(--r-md); background: color-mix(in srgb, var(--accent) 8%, transparent); color: var(--accent); display: grid; place-items: center; font-weight: 700; }
+  .hub-name { font-size: 13px; font-weight: 650; color: var(--strong); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .hub-meta { margin-top: 2px; font-size: 10px; color: var(--faint); font-family: var(--mono); }
+  .hub-desc { margin: 10px 0 12px; min-height: 34px; font-size: 11px; line-height: 1.55; color: var(--muted); }
+  .hub-actions { display: flex; align-items: center; justify-content: space-between; gap: 6px; padding-top: 8px; border-top: 1px solid var(--border); }
+  .hub-btn {
+    height: 26px; padding: 0 11px; border: 1px solid var(--border); border-radius: var(--r-sm);
+    background: var(--base); color: var(--text); font-size: 11px; font-weight: 560; cursor: pointer;
+  }
+  .hub-btn[data-variant="neutral"] { border-color: var(--border-strong); background: var(--layer-2); }
+  .hub-btn:hover:not(:disabled) { background: var(--layer-2); }
+  .hub-btn:disabled { opacity: .55; cursor: default; }
+  .hub-ghost { border-color: transparent; background: transparent; color: var(--muted); height: 26px; padding: 0 7px; font-size: 11px; cursor: pointer; border-radius: var(--r-sm); }
+  .hub-ghost:hover { background: var(--hover); color: var(--strong); }
+  .hub-inline-hint { font-size: 10px; color: var(--accent); }
+
+  /* ---------------- 更新进度 Dialog ---------------- */
+  .dialog-layer { position: absolute; inset: 0; z-index: 40; display: grid; place-items: center; padding: 22px; }
+  .dialog-layer[hidden] { display: none; }
+  .dialog-backdrop { position: absolute; inset: 0; background: color-mix(in srgb, var(--page-bg) 72%, transparent); backdrop-filter: blur(2px); }
+  .dialog {
+    position: relative; width: min(100%, 500px); max-height: calc(100% - 16px); min-height: 0;
+    display: flex; flex-direction: column; background: var(--base);
+    border: 1px solid var(--border); border-radius: var(--r-lg); box-shadow: var(--shadow-dialog); overflow: hidden;
+  }
+  .dialog-head {
+    display: flex; align-items: flex-start; justify-content: space-between; gap: 12px;
+    padding: 15px 18px; border-bottom: 1px solid var(--border);
+  }
+  .dialog-kicker { display: block; font-size: 10px; font-weight: 600; letter-spacing: 0.04em; color: var(--muted); text-transform: uppercase; }
+  .dialog-title { margin: 3px 0 0; font-size: 15px; font-weight: 650; color: var(--strong); overflow-wrap: anywhere; }
+  .status-pill {
+    flex: 0 0 auto; display: inline-flex; align-items: center; gap: 5px; height: 24px; padding: 0 10px;
+    border: 1px solid var(--border); border-radius: 99px; font-size: 10.5px; font-weight: 650;
+    background: var(--layer); color: var(--muted); white-space: nowrap;
+  }
+  .status-pill::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+  .status-pill[data-s="running"] { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 26%, transparent); background: color-mix(in srgb, var(--accent) 6%, transparent); }
+  .status-pill[data-s="running"]::before { animation: pulse 1s ease-in-out infinite; }
+  .status-pill[data-s="success"] { color: var(--success); border-color: color-mix(in srgb, var(--success) 26%, transparent); background: color-mix(in srgb, var(--success) 6%, transparent); }
+  .status-pill[data-s="failed"] { color: var(--danger); border-color: color-mix(in srgb, var(--danger) 26%, transparent); background: color-mix(in srgb, var(--danger) 6%, transparent); }
+  .status-pill[data-s="attention"] { color: var(--warning); border-color: color-mix(in srgb, var(--warning) 26%, transparent); background: color-mix(in srgb, var(--warning) 6%, transparent); }
+
+  .dialog-body { padding: 16px 18px; overflow: auto; }
+  .identity { display: flex; align-items: center; gap: 10px; padding-bottom: 14px; border-bottom: 1px solid var(--border); }
+  .id-tile { flex: 0 0 auto; width: 36px; height: 36px; border: 1px solid color-mix(in srgb, var(--accent) 18%, transparent); border-radius: var(--r-md); background: color-mix(in srgb, var(--accent) 8%, transparent); color: var(--accent); display: grid; place-items: center; font-weight: 700; font-size: 14px; }
+  .id-copy { min-width: 0; flex: 1; }
+  .id-name { font-size: 13px; font-weight: 650; color: var(--strong); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .id-versions { display: flex; align-items: center; gap: 7px; margin-top: 4px; flex-wrap: wrap; }
+  .ver-chip { display: inline-flex; align-items: baseline; gap: 4px; padding: 2px 7px; border: 1px solid var(--border); border-radius: var(--r-sm); background: var(--layer); font-size: 10px; color: var(--muted); }
+  .ver-chip b { font-family: var(--mono); font-size: 11px; color: var(--text); font-weight: 600; }
+  .ver-arrow { color: var(--faint); font-size: 12px; }
+  .id-flow { font-size: 9.5px; color: var(--faint); }
+
+  .timeline { list-style: none; margin: 14px 0 0; padding: 0; }
+  .step { position: relative; display: flex; gap: 11px; padding: 0 0 11px; }
+  .step:last-child { padding-bottom: 0; }
+  .step::before {
+    content: ""; position: absolute; left: 8px; top: 18px; bottom: 0; width: 1.5px; background: var(--border);
+  }
+  .step:last-child::before { display: none; }
+  .step[data-state="done"]::before, .step[data-state="success"]::before { background: color-mix(in srgb, var(--success) 45%, transparent); }
+  .step-ico {
+    position: relative; z-index: 1; flex: 0 0 auto; width: 17px; height: 17px; margin-top: 1px;
+    border-radius: 50%; display: grid; place-items: center; font-size: 9px; font-weight: 700; line-height: 1;
+    background: var(--base); color: transparent;
+  }
+  .step[data-state="pending"] .step-ico { border: 1.5px solid var(--border-strong); }
+  .step[data-state="running"] .step-ico { border: 2px solid color-mix(in srgb, var(--accent) 30%, transparent); border-top-color: var(--accent); animation: spin .8s linear infinite; }
+  .step[data-state="done"] .step-ico { background: var(--success); border-color: var(--success); color: #fff; }
+  .step[data-state="failed"] .step-ico { background: var(--danger); border-color: var(--danger); color: #fff; }
+  .step[data-state="skipped"] .step-ico { border: 1.5px dashed var(--border-strong); color: var(--faint); }
+  .step[data-state="unknown"] .step-ico { background: var(--warning); border-color: var(--warning); color: #fff; }
+  .step-copy { min-width: 0; flex: 1; }
+  .step-title { font-size: 12px; font-weight: 600; color: var(--text); }
+  .step[data-state="pending"] .step-title { color: var(--faint); }
+  .step-desc { margin-top: 2px; font-size: 10.5px; line-height: 1.55; color: var(--muted); }
+  .step[data-state="failed"] .step-desc { color: var(--danger); }
+  .step[data-state="unknown"] .step-desc { color: var(--warning); }
+  .step[data-state="running"] .step-desc { color: var(--accent); }
+
+  .result {
+    margin-top: 14px; padding: 11px 12px; border: 1px solid var(--border); border-left-width: 3px;
+    border-radius: var(--r-sm); background: var(--layer);
+  }
+  .result[hidden] { display: none; }
+  .result[data-s="success"] { border-left-color: var(--success); background: color-mix(in srgb, var(--success) 5%, var(--layer)); }
+  .result[data-s="failed"] { border-left-color: var(--danger); background: color-mix(in srgb, var(--danger) 5%, var(--layer)); }
+  .result[data-s="attention"] { border-left-color: var(--warning); background: color-mix(in srgb, var(--warning) 5%, var(--layer)); }
+  .result-head { display: flex; align-items: center; gap: 7px; }
+  .result-headline { font-size: 12.5px; font-weight: 650; }
+  .result[data-s="success"] .result-headline { color: var(--success); }
+  .result[data-s="failed"] .result-headline { color: var(--danger); }
+  .result[data-s="attention"] .result-headline { color: var(--warning); }
+  .result-summary { margin: 5px 0 0; font-size: 10.5px; line-height: 1.6; color: var(--text); }
+  .result-rows { margin: 10px 0 0; border-top: 1px solid var(--border); padding-top: 8px; display: grid; gap: 5px; }
+  .result-row { display: grid; grid-template-columns: 84px 1fr; gap: 8px; font-size: 10.5px; }
+  .result-key { color: var(--faint); }
+  .result-val { color: var(--text); overflow-wrap: anywhere; }
+  .result-val[data-tone="ok"] { color: var(--success); }
+  .result-val[data-tone="bad"] { color: var(--danger); }
+  .result-val[data-tone="warn"] { color: var(--warning); }
+  .result-val code { font-family: var(--mono); font-size: 10px; }
+
+  .dialog-foot {
+    display: flex; align-items: center; justify-content: space-between; gap: 10px;
+    padding: 11px 18px; border-top: 1px solid var(--border); background: var(--layer);
+  }
+  .foot-note { font-size: 10.5px; color: var(--muted); min-width: 0; overflow-wrap: anywhere; }
+  .foot-note[data-s="failed"] { color: var(--danger); }
+  .foot-note[data-s="attention"] { color: var(--warning); }
+  .btn {
+    flex: 0 0 auto; height: 28px; padding: 0 14px; border: 1px solid var(--border-strong);
+    border-radius: var(--r-sm); background: var(--base); color: var(--text); font-size: 11px; font-weight: 560; cursor: pointer;
+  }
+  .btn:hover { background: var(--layer-2); }
+
+  /* 关闭 Dialog 后保留的浮动入口：证明后台任务没有被取消 */
+  .resume-chip {
+    position: absolute; right: 18px; bottom: 18px; z-index: 30; display: flex; align-items: center; gap: 8px;
+    height: 34px; padding: 0 13px; border: 1px solid var(--border-strong); border-radius: 99px;
+    background: var(--base); color: var(--text); box-shadow: var(--shadow-dialog); font-size: 11px; cursor: pointer;
+  }
+  .resume-chip[hidden] { display: none; }
+  .resume-chip:hover { background: var(--layer-2); }
+  .resume-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--accent); animation: pulse 1s ease-in-out infinite; }
+  .resume-chip[data-s="success"] .resume-dot { background: var(--success); animation: none; }
+  .resume-chip[data-s="failed"] .resume-dot { background: var(--danger); animation: none; }
+  .resume-chip[data-s="attention"] .resume-dot { background: var(--warning); animation: none; }
+
+  @keyframes spin { to { transform: rotate(360deg); } }
+  @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: .35; } }
+  @media (prefers-reduced-motion: reduce) {
+    .step-ico, .legend-ico[data-s="running"], .resume-dot, .status-pill[data-s="running"]::before { animation: none; }
+  }
+</style>
+</head>
+<body>
+<div class="workbench">
+  <!-- ============ 左侧：场景控制 ============ -->
+  <aside class="controls">
+    <div class="controls-head">
+      <div>
+        <h1 class="controls-title">更新流程可视化 · 原型</h1>
+        <p class="controls-sub">点击场景自动播放。阶段状态由脚本模拟后端结果驱动，真实实现中每个状态只在后端确认后改变。</p>
+      </div>
+      <button class="theme-btn" id="themeBtn" type="button">深色</button>
+    </div>
+
+    <div class="group-label">普通插件 · 3 阶段</div>
+    <div class="scenarios" id="normalScenarios"></div>
+
+    <div class="group-label">插件中心自身 · 6 阶段</div>
+    <div class="scenarios" id="selfScenarios"></div>
+
+    <div class="group-label">阶段状态图例</div>
+    <div class="legend">
+      <div class="legend-item"><span class="legend-ico" data-s="pending">○</span>待执行</div>
+      <div class="legend-item"><span class="legend-ico" data-s="running"></span>执行中</div>
+      <div class="legend-item"><span class="legend-ico" data-s="done">✓</span>已完成</div>
+      <div class="legend-item"><span class="legend-ico" data-s="failed">✕</span>失败</div>
+      <div class="legend-item"><span class="legend-ico" data-s="skipped">—</span>已跳过</div>
+      <div class="legend-item"><span class="legend-ico" data-s="unknown">?</span>未确认</div>
+    </div>
+
+    <div class="proto-note">
+      <b>刻意不做：</b>不显示百分比/倒计时，不把下载解包伪装成可观测步骤，不新增取消逻辑。
+      关闭 Dialog 只关闭展示，<b>后台任务继续</b>，右下浮标可重新打开进度。
+    </div>
+  </aside>
+
+  <!-- ============ 右侧：插件中心画面 + Dialog ============ -->
+  <main class="stage" id="stage">
+    <section class="hub" data-screen-label="已安装插件页">
+      <div class="hub-head">
+        <div>
+          <h2 class="hub-title">插件中心</h2>
+          <p class="hub-sub">浏览 awesome-opencode 社区目录与 npm 上的 OpenCode 插件。</p>
+        </div>
+        <span class="hub-path">~/.config/opencode/opencode.json · plugins[]</span>
+      </div>
+      <div class="hub-tabs">
+        <span class="hub-tab">精选目录</span>
+        <span class="hub-tab">npm 搜索</span>
+        <span class="hub-tab" data-active="true">已安装</span>
+      </div>
+      <div class="hub-search"><div class="hub-search-box">搜索已安装插件</div></div>
+      <div class="hub-grid" id="hubGrid"></div>
+    </section>
+
+    <!-- 更新进度 Dialog -->
+    <div class="dialog-layer" id="dialogLayer" hidden>
+      <div class="dialog-backdrop"></div>
+      <div class="dialog" role="dialog" aria-modal="true" aria-labelledby="dlgTitle" data-screen-label="更新进度对话框">
+        <header class="dialog-head">
+          <div>
+            <span class="dialog-kicker" id="dlgKicker">正在更新插件</span>
+            <h3 class="dialog-title" id="dlgTitle">插件名称</h3>
+          </div>
+          <span class="status-pill" id="dlgPill" data-s="running">执行中</span>
+        </header>
+        <div class="dialog-body">
+          <div class="identity">
+            <div class="id-tile" id="idTile">P</div>
+            <div class="id-copy">
+              <div class="id-name" id="idName">plugin-name</div>
+              <div class="id-versions">
+                <span class="ver-chip">当前 <b id="verFrom">0.0.0</b></span>
+                <span class="ver-arrow">→</span>
+                <span class="ver-chip">目标 <b id="verTo">0.0.0</b></span>
+                <span class="id-flow" id="idFlow">npm 官方命令</span>
+              </div>
+            </div>
+          </div>
+          <ol class="timeline" id="timeline"></ol>
+          <section class="result" id="result" hidden aria-live="polite"></section>
+        </div>
+        <footer class="dialog-foot">
+          <span class="foot-note" id="footNote">正在更新，请稍候。</span>
+          <button class="btn" id="closeBtn" type="button">关闭</button>
+        </footer>
+      </div>
+    </div>
+
+    <button class="resume-chip" id="resumeChip" type="button" hidden>
+      <span class="resume-dot"></span><span id="resumeText">更新进行中 · 查看进度</span>
+    </button>
+  </main>
+</div>
+
+<script>
+(function () {
+  "use strict";
+
+  /* ============================================================
+     场景数据：每个 stage 的 status 代表“后端已确认的结果”，不是预测。
+     ============================================================ */
+  var SCENARIOS = [
+    // ---------- 普通插件 ----------
+    {
+      key: "normal-success", group: "normal", label: "更新成功",
+      name: "opencode-usage-center", from: "0.3.1", to: "0.3.2", flow: "npm 官方命令",
+      stages: [
+        { key: "cmd", title: "执行更新命令", hint: "正在执行官方更新命令…", status: "done", text: "官方更新命令执行成功" },
+        { key: "config", title: "配置核验", hint: "正在检查插件配置是否正确…", status: "done", text: "配置读取和校验完成" },
+        { key: "runtime", title: "运行状态核验", hint: "正在确认插件运行状态…", status: "done", text: "插件已正常加载" }
+      ],
+      result: {
+        status: "success", headline: "更新完成",
+        summary: "更新完成，配置核验通过，插件运行状态正常。",
+        rows: [
+          ["更新前版本", "0.3.1", ""],
+          ["更新后版本", "0.3.2", "ok"],
+          ["更新命令", "成功", "ok"],
+          ["配置核验", "通过", "ok"],
+          ["运行状态", "已加载", "ok"]
+        ],
+        foot: "更新完成，配置核验通过，插件运行状态正常。"
+      }
+    },
+    {
+      key: "normal-cmd-failed", group: "normal", label: "命令失败",
+      name: "opencode-usage-center", from: "0.3.1", to: "0.3.2", flow: "npm 官方命令",
+      stages: [
+        { key: "cmd", title: "执行更新命令", hint: "正在执行官方更新命令…", status: "failed", text: "命令失败：无法连接 npm registry（网络错误）" },
+        { key: "config", title: "配置核验", hint: "等待执行", status: "skipped", text: "已跳过：命令未成功，无需核验配置" },
+        { key: "runtime", title: "运行状态核验", hint: "等待执行", status: "skipped", text: "已跳过：配置未改动" }
+      ],
+      result: {
+        status: "failed", headline: "更新失败",
+        summary: "失败发生在「执行更新命令」：官方命令无法连接 registry，未对配置做任何改动。",
+        rows: [
+          ["更新前版本", "0.3.1", ""],
+          ["更新后版本", "未变更（仍为 0.3.1）", ""],
+          ["更新命令", "失败 · 网络错误", "bad"],
+          ["配置核验", "未执行（已跳过）", ""],
+          ["运行状态", "保持原版本", ""]
+        ],
+        foot: "失败阶段：执行更新命令。配置保持不变，可检查网络后重试。"
+      }
+    },
+    {
+      key: "normal-attention-failed", group: "normal", label: "更新完成·运行异常",
+      name: "opencode-usage-center", from: "0.3.1", to: "0.3.2", flow: "npm 官方命令",
+      stages: [
+        { key: "cmd", title: "执行更新命令", hint: "正在执行官方更新命令…", status: "done", text: "官方更新命令执行成功" },
+        { key: "config", title: "配置核验", hint: "正在检查插件配置是否正确…", status: "done", text: "配置读取和校验完成，已指向 0.3.2" },
+        { key: "runtime", title: "运行状态核验", hint: "正在确认插件运行状态…", status: "failed", text: "宿主报告加载失败（failed）" }
+      ],
+      result: {
+        status: "attention", headline: "需关注",
+        summary: "更新命令与配置核验都已完成，但插件运行状态为 failed。更新结果 ≠ 运行状态，请按需回滚。",
+        rows: [
+          ["更新前版本", "0.3.1", ""],
+          ["更新后版本", "0.3.2（配置已切换）", "warn"],
+          ["更新命令", "成功", "ok"],
+          ["配置核验", "通过", "ok"],
+          ["运行状态", "加载失败（failed）", "bad"],
+          ["说明", "配置已更新，但插件未成功加载", "warn"]
+        ],
+        foot: "需关注：更新已完成但运行异常，请检查插件本身或考虑回退版本。"
+      }
+    },
+    {
+      key: "normal-runtime-unknown", group: "normal", label: "更新完成·运行未确认",
+      name: "opencode-usage-center", from: "0.3.1", to: "0.3.2", flow: "npm 官方命令",
+      stages: [
+        { key: "cmd", title: "执行更新命令", hint: "正在执行官方更新命令…", status: "done", text: "官方更新命令执行成功" },
+        { key: "config", title: "配置核验", hint: "正在检查插件配置是否正确…", status: "done", text: "配置读取和校验完成，已指向 0.3.2" },
+        { key: "runtime", title: "运行状态核验", hint: "正在确认插件运行状态…", status: "unknown", text: "宿主尚未报告加载结果（unknown）" }
+      ],
+      result: {
+        status: "attention", headline: "需关注",
+        summary: "更新命令与配置核验都已完成，但运行状态为 unknown。不能据此判定更新成功。",
+        rows: [
+          ["更新前版本", "0.3.1", ""],
+          ["更新后版本", "0.3.2（配置已切换）", "warn"],
+          ["更新命令", "成功", "ok"],
+          ["配置核验", "通过", "ok"],
+          ["运行状态", "未确认（unknown）", "warn"],
+          ["说明", "宿主重新加载后才会生效", "warn"]
+        ],
+        foot: "需关注：宿主未确认运行状态，不判定为成功，稍后可重新查看。"
+      }
+    },
+
+    // ---------- 插件中心自身 ----------
+    {
+      key: "self-success", group: "self", label: "自升级成功",
+      name: "opencode-plugin-hub", from: "0.6.0", to: "0.6.1", flow: "npm Registry · 安全自升级",
+      stages: [
+        { key: "lookup", title: "版本查询", hint: "正在查询 npm Registry 的目标版本…", status: "done", text: "查询到稳定版 0.6.1" },
+        { key: "prepare", title: "隔离安装", hint: "正在隔离目录准备新版本…", status: "done", text: "新版本已在隔离目录准备完成" },
+        { key: "validate", title: "安全校验", hint: "正在校验新版本包与 manifest…", status: "done", text: "包清单、入口与 manifest 校验通过" },
+        { key: "switch", title: "配置切换", hint: "正在一次性切换配置…", status: "done", text: "配置已从 0.6.0 切换到 0.6.1" },
+        { key: "load", title: "加载确认", hint: "正在等待宿主确认新版本加载…", status: "done", text: "宿主已报告加载 0.6.1" }
+      ],
+      result: {
+        status: "success", headline: "升级完成",
+        summary: "新版本已在隔离目录校验、一次性切换配置，宿主已确认加载 0.6.1。当前窗口仍是旧构建，重新打开即可用新界面。",
+        rows: [
+          ["更新前版本", "0.6.0（精确锁定）", ""],
+          ["更新后版本", "0.6.1", "ok"],
+          ["目标来源", "npm Registry", ""],
+          ["隔离校验", "通过", "ok"],
+          ["配置切换", "完成", "ok"],
+          ["运行状态", "已加载 0.6.1", "ok"]
+        ],
+        foot: "升级完成，宿主已确认新版本加载。"
+      }
+    },
+    {
+      key: "self-fail-rollback-ok", group: "self", label: "加载失败·已回滚",
+      name: "opencode-plugin-hub", from: "0.6.0", to: "0.6.1", flow: "npm Registry · 安全自升级",
+      stages: [
+        { key: "lookup", title: "版本查询", hint: "正在查询 npm Registry 的目标版本…", status: "done", text: "查询到稳定版 0.6.1" },
+        { key: "prepare", title: "隔离安装", hint: "正在隔离目录准备新版本…", status: "done", text: "新版本已在隔离目录准备完成" },
+        { key: "validate", title: "安全校验", hint: "正在校验新版本包与 manifest…", status: "done", text: "包清单、入口与 manifest 校验通过" },
+        { key: "switch", title: "配置切换", hint: "正在一次性切换配置…", status: "done", text: "配置已切换到 0.6.1" },
+        { key: "load", title: "加载确认", hint: "正在等待宿主确认新版本加载…", status: "failed", text: "宿主报告新版本加载失败（failed）" },
+        { key: "rollback", title: "回滚处理", hint: "旧包仍在缓存，正在回滚…", status: "done", text: "已回滚到 0.6.0，宿主确认旧版本加载" }
+      ],
+      result: {
+        status: "failed", headline: "升级失败 · 已回滚",
+        summary: "新版本加载失败，按安全条件验证旧包仍在缓存后已回滚到 0.6.0。更新结果判定为失败，但当前插件中心可用。",
+        rows: [
+          ["更新前版本", "0.6.0", ""],
+          ["更新后版本", "已回滚到 0.6.0", ""],
+          ["目标来源", "npm Registry", ""],
+          ["隔离校验", "通过", "ok"],
+          ["配置切换", "曾切换到 0.6.1", "warn"],
+          ["运行状态", "旧版本 0.6.0 已加载", "ok"],
+          ["回滚", "成功", "ok"]
+        ],
+        foot: "失败阶段：加载确认。已安全回滚到 0.6.0，插件中心仍可用。"
+      }
+    },
+    {
+      key: "self-unknown", group: "self", label: "配置已切换·未确认",
+      name: "opencode-plugin-hub", from: "0.6.0", to: "0.6.1", flow: "npm Registry · 安全自升级",
+      stages: [
+        { key: "lookup", title: "版本查询", hint: "正在查询 npm Registry 的目标版本…", status: "done", text: "查询到稳定版 0.6.1" },
+        { key: "prepare", title: "隔离安装", hint: "正在隔离目录准备新版本…", status: "done", text: "新版本已在隔离目录准备完成" },
+        { key: "validate", title: "安全校验", hint: "正在校验新版本包与 manifest…", status: "done", text: "包清单、入口与 manifest 校验通过" },
+        { key: "switch", title: "配置切换", hint: "正在一次性切换配置…", status: "done", text: "配置已切换到 0.6.1" },
+        { key: "load", title: "加载确认", hint: "正在等待宿主确认新版本加载…", status: "unknown", text: "配置已切换，但宿主未确认加载 0.6.1" }
+      ],
+      result: {
+        status: "attention", headline: "需关注",
+        summary: "配置已切到 0.6.1，但宿主没有确认加载。这不等于升级成功，也不触发回滚；宿主重新加载后才会生效。",
+        rows: [
+          ["更新前版本", "0.6.0", ""],
+          ["更新后版本", "配置已切到 0.6.1", "warn"],
+          ["目标来源", "npm Registry", ""],
+          ["隔离校验", "通过", "ok"],
+          ["配置切换", "完成", "ok"],
+          ["运行状态", "未确认（unknown）", "warn"],
+          ["回滚", "未触发（宿主未报告失败）", ""]
+        ],
+        foot: "需关注：配置已切换但运行未确认，不判定为成功。"
+      }
+    },
+    {
+      key: "self-fail-rollback-fail", group: "self", label: "加载失败·旧包缺失",
+      name: "opencode-plugin-hub", from: "0.6.0", to: "0.6.1", flow: "npm Registry · 安全自升级",
+      stages: [
+        { key: "lookup", title: "版本查询", hint: "正在查询 npm Registry 的目标版本…", status: "done", text: "查询到稳定版 0.6.1" },
+        { key: "prepare", title: "隔离安装", hint: "正在隔离目录准备新版本…", status: "done", text: "新版本已在隔离目录准备完成" },
+        { key: "validate", title: "安全校验", hint: "正在校验新版本包与 manifest…", status: "done", text: "包清单、入口与 manifest 校验通过" },
+        { key: "switch", title: "配置切换", hint: "正在一次性切换配置…", status: "done", text: "配置已切换到 0.6.1" },
+        { key: "load", title: "加载确认", hint: "正在等待宿主确认新版本加载…", status: "failed", text: "宿主报告新版本加载失败（failed）" },
+        { key: "rollback", title: "回滚处理", hint: "正在检查旧版本包是否仍在缓存…", status: "failed", text: "旧版本 0.6.0 的包文件已不在缓存，不执行盲目回滚" }
+      ],
+      result: {
+        status: "failed", headline: "升级失败 · 回滚未完成",
+        summary: "新版本加载失败，且旧版本包已不在缓存，自动回滚不安全。配置停在 0.6.1，需手动改回 0.6.0 并重新安装。",
+        rows: [
+          ["更新前版本", "0.6.0", ""],
+          ["更新后版本", "配置停在 0.6.1", "bad"],
+          ["目标来源", "npm Registry", ""],
+          ["隔离校验", "通过", "ok"],
+          ["配置切换", "完成", "ok"],
+          ["运行状态", "新版本加载失败", "bad"],
+          ["回滚", "未执行 · 旧包缺失", "bad"]
+        ],
+        foot: "失败阶段：加载确认 / 回滚处理。请手动改回 0.6.0 并重新安装。"
+      }
+    }
+  ];
+
+  var byKey = {};
+  SCENARIOS.forEach(function (s) { byKey[s.key] = s; });
+
+  /* ============================================================
+     状态与渲染
+     ============================================================ */
+  var state = {
+    scenarioKey: "normal-success",
+    run: null,        // { sc, statuses:[], index:-1, finished:false, result:null }
+    timer: null,
+    dialogOpen: false
+  };
+
+  var el = function (id) { return document.getElementById(id); };
+
+  function esc(s) {
+    return String(s).replace(/[&<>"']/g, function (c) {
+      return ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c];
+    });
+  }
+
+  function buildControls() {
+    ["normal", "self"].forEach(function (group) {
+      var host = el(group + "Scenarios");
+      host.innerHTML = "";
+      SCENARIOS.filter(function (s) { return s.group === group; }).forEach(function (s) {
+        var btn = document.createElement("button");
+        btn.type = "button";
+        btn.className = "scenario";
+        btn.dataset.key = s.key;
+        var tone = s.result.status;
+        btn.innerHTML =
+          '<span class="scenario-dot" data-t="' + tone + '"></span>' +
+          '<span class="scenario-name">' + esc(s.label) + '</span>' +
+          '<span class="scenario-flow">' + (s.stages.length) + ' 阶段</span>';
+        btn.addEventListener("click", function () { start(s.key); });
+        host.appendChild(btn);
+      });
+    });
+    syncScenarioActive();
+  }
+
+  function syncScenarioActive() {
+    document.querySelectorAll(".scenario").forEach(function (b) {
+      b.dataset.active = String(b.dataset.key === state.scenarioKey);
+    });
+  }
+
+  function buildHub() {
+    var grid = el("hubGrid");
+    grid.innerHTML = "";
+    var cards = [
+      { name: "opencode-notify-callback", initial: "N", desc: "把 OpenCode 会话通知发送到手机，支持自定义回调与重试。", version: "0.1.2" },
+      { name: "opencode-plugin-hub", initial: "P", desc: "插件中心：浏览社区插件、搜索 npm、安全升级自身与安装管理。", version: "0.6.0", target: true },
+      { name: "opencode-schedule-center", initial: "S", desc: "在 OpenCode 内安排定时提示与周期性的 agent 任务。", version: "0.1.11" }
+    ];
+    cards.forEach(function (c) {
+      var card = document.createElement("article");
+      card.className = "hub-card";
+      if (c.target) card.dataset.target = "true";
+      var action = c.target
+        ? '<button class="hub-btn" data-variant="neutral" id="targetUpdateBtn" type="button">更新</button>'
+        : '<button class="hub-ghost" type="button">详情</button>';
+      card.innerHTML =
+        '<div class="hub-card-head"><div class="hub-tile">' + c.initial + '</div>' +
+        '<div style="min-width:0"><div class="hub-name">' + esc(c.name) + '</div>' +
+        '<div class="hub-meta">v' + esc(c.version) + ' · package</div></div></div>' +
+        '<p class="hub-desc">' + esc(c.desc) + '</p>' +
+        '<div class="hub-actions"><button class="hub-ghost" type="button">详情</button>' + action + '</div>';
+      grid.appendChild(card);
+    });
+    el("targetUpdateBtn").addEventListener("click", onBackgroundUpdate);
+  }
+
+  function onBackgroundUpdate() {
+    if (state.run && !state.run.finished) {
+      // 执行期间重复点击：禁止重复提交，只给出提示，不新起任务。
+      var hint = el("hubGrid").querySelector(".hub-inline-hint");
+      if (!hint) {
+        hint = document.createElement("span");
+        hint.className = "hub-inline-hint";
+        hint.textContent = "更新正在进行，请勿重复提交";
+        el("targetUpdateBtn").parentNode.insertBefore(hint, el("targetUpdateBtn"));
+        setTimeout(function () { if (hint.parentNode) hint.parentNode.removeChild(hint); }, 1800);
+      }
+      return;
+    }
+    openDialog();
+  }
+
+  function stageText(stage) {
+    var s = stage._state;
+    if (s === "pending") return "等待执行";
+    if (s === "running") return stage.hint;
+    return stage.text;
+  }
+
+  function renderDialog() {
+    var r = state.run;
+    if (!r) return;
+    var sc = r.sc;
+    var anyFailed = r.statuses.indexOf("failed") >= 0;
+    var anyUnknown = r.statuses.indexOf("unknown") >= 0;
+    var allDone = r.statuses.every(function (s) { return s === "done" || s === "skipped"; });
+    var finished = r.finished;
+
+    el("dlgKicker").textContent = sc.group === "self" ? "正在升级插件中心" : "正在更新插件";
+    el("dlgTitle").textContent = sc.name;
+    el("idTile").textContent = (sc.name.replace(/^opencode-/, "").charAt(0) || "P").toUpperCase();
+    el("idName").textContent = sc.name;
+    el("verFrom").textContent = sc.from;
+    el("verTo").textContent = sc.to;
+    el("idFlow").textContent = sc.flow;
+
+    // 顶部状态胶囊
+    var pill = el("dlgPill");
+    if (!finished) {
+      pill.dataset.s = "running";
+      pill.textContent = "执行中";
+    } else {
+      pill.dataset.s = r.result.status;
+      pill.textContent = r.result.headline;
+    }
+
+    // 阶段时间线
+    var tl = el("timeline");
+    tl.innerHTML = "";
+    sc.stages.forEach(function (stage, i) {
+      var s = finished ? stage.status : r.statuses[i];
+      var li = document.createElement("li");
+      li.className = "step";
+      li.dataset.state = s;
+      var glyph = s === "done" ? "✓" : s === "failed" ? "✕" : s === "skipped" ? "—" : s === "unknown" ? "?" : "";
+      var desc = finished ? stage.text : (s === "running" ? stage.hint : s === "pending" ? "等待执行" : stage.text);
+      li.innerHTML =
+        '<span class="step-ico">' + glyph + '</span>' +
+        '<div class="step-copy"><div class="step-title">' + esc(stage.title) + '</div>' +
+        '<div class="step-desc">' + esc(desc) + '</div></div>';
+      tl.appendChild(li);
+    });
+
+    // 结果面板
+    var box = el("result");
+    if (finished) {
+      box.hidden = false;
+      box.dataset.s = r.result.status;
+      var rows = r.result.rows.map(function (row) {
+        return '<div class="result-row"><span class="result-key">' + esc(row[0]) + '</span>' +
+          '<span class="result-val"' + (row[2] ? ' data-tone="' + row[2] + '"' : "") + '>' + esc(row[1]) + '</span></div>';
+      }).join("");
+      box.innerHTML =
+        '<div class="result-head"><span class="result-headline">' + esc(r.result.headline) + '</span></div>' +
+        '<p class="result-summary">' + esc(r.result.summary) + '</p>' +
+        '<div class="result-rows">' + rows + '</div>';
+    } else {
+      box.hidden = true;
+      box.innerHTML = "";
+    }
+
+    // 底部说明
+    var foot = el("footNote");
+    if (finished) {
+      foot.dataset.s = r.result.status;
+      foot.textContent = r.result.foot;
+    } else {
+      foot.dataset.s = "running";
+      var active = sc.stages[r.index];
+      foot.textContent = active ? active.hint : "正在更新，请稍候。";
+    }
+
+    // 背景卡片上的按钮：执行期间禁重复
+    var btn = el("targetUpdateBtn");
+    if (btn) {
+      btn.disabled = !finished;
+      btn.textContent = finished ? "更新" : "更新中…";
+    }
+  }
+
+  function renderResume() {
+    var chip = el("resumeChip");
+    var r = state.run;
+    if (!r || (state.dialogOpen) || (!r.finished && state.dialogOpen)) {
+      chip.hidden = true;
+      return;
+    }
+    // dialog 关闭但任务存在时显示
+    if (!state.dialogOpen && r) {
+      chip.hidden = false;
+      chip.dataset.s = r.finished ? r.result.status : "running";
+      el("resumeText").textContent = r.finished
+        ? "更新" + (r.result.status === "success" ? "完成" : r.result.status === "failed" ? "失败" : "需关注") + " · 查看结果"
+        : "更新进行中 · 查看进度";
+    } else {
+      chip.hidden = true;
+    }
+  }
+
+  function openDialog() {
+    state.dialogOpen = true;
+    el("dialogLayer").hidden = false;
+    el("resumeChip").hidden = true;
+    renderDialog();
+  }
+  function closeDialog() {
+    // 只关闭展示，不触碰 state.run / timer —— 后台任务继续。
+    state.dialogOpen = false;
+    el("dialogLayer").hidden = true;
+    renderResume();
+  }
+
+  function playNext() {
+    var r = state.run;
+    if (!r || r.finished) return;
+    var next = r.index + 1;
+    if (next >= r.sc.stages.length) { finish(); return; }
+    r.index = next;
+    r.statuses[next] = "running";
+    renderDialog();
+    var stage = r.sc.stages[next];
+    state.timer = setTimeout(function () {
+      if (!state.run || state.run !== r) return;
+      r.statuses[next] = stage.status;
+      renderDialog();
+      renderResume();
+      // 失败/未确认且后面没有“回滚处理”阶段时到此为止。
+      var hasRollbackNext = r.sc.stages[next + 1] && r.sc.stages[next + 1].key === "rollback";
+      if (stage.status !== "done" && !hasRollbackNext) { finish(); return; }
+      state.timer = setTimeout(playNext, 480);
+    }, 900);
+  }
+
+  function finish() {
+    var r = state.run;
+    if (!r || r.finished) return;
+    r.finished = true;
+    r.result = r.sc.result;
+    renderDialog();
+    renderResume();
+  }
+
+  function start(key) {
+    if (state.timer) { clearTimeout(state.timer); state.timer = null; }
+    state.scenarioKey = key;
+    var sc = byKey[key];
+    state.run = {
+      sc: sc,
+      statuses: sc.stages.map(function () { return "pending"; }),
+      index: -1,
+      finished: false,
+      result: null
+    };
+    syncScenarioActive();
+    openDialog();
+    state.timer = setTimeout(playNext, 420);
+  }
+
+  /* ============================================================
+     启动
+     ============================================================ */
+  buildControls();
+  buildHub();
+
+  el("closeBtn").addEventListener("click", closeDialog);
+  el("resumeChip").addEventListener("click", openDialog);
+  el("themeBtn").addEventListener("click", function () {
+    var theme = document.documentElement.getAttribute("data-theme");
+    var next = theme === "dark" ? "light" : "dark";
+    document.documentElement.setAttribute("data-theme", next);
+    el("themeBtn").textContent = next === "dark" ? "浅色" : "深色";
+  });
+  document.addEventListener("keydown", function (e) {
+    if (e.key === "Escape" && state.dialogOpen) closeDialog();
+  });
+
+  // 默认播放第一个场景
+  start("normal-success");
+})();
+</script>
+</body>
+</html>
