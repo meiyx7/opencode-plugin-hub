@@ -60,6 +60,27 @@ function listOutput(rows: string[]): string {
   return ["ID  VERSION  SOURCE", ...rows].join("\n")
 }
 
+/**
+ * Registry mock for the plugin-center's own version lookup. `npmLatest` asks
+ * `${OPENCODE_PLUGIN_HUB_REGISTRY}/opencode-plugin-hub/latest`; anything else stays 404.
+ * Pass a version to answer with that manifest, "" for a definite 404 (no published version),
+ * "throw" to simulate an unreachable registry, or null to leave the default 404 in place.
+ */
+function mockSelfRegistry(version: string | null | "throw", extra?: Record<string, unknown>): void {
+  globalThis.fetch = (async (input: string | URL | Request) => {
+    const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url
+    if (url.includes("/opencode-plugin-hub/latest")) {
+      if (version === "throw") throw new Error("registry unreachable")
+      if (version === null || version === "") return new Response("", { status: 404 })
+      return new Response(
+        JSON.stringify({ name: "opencode-plugin-hub", version, description: "hub", ...extra }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      )
+    }
+    return new Response("", { status: 404 })
+  }) as typeof fetch
+}
+
 beforeEach(async () => {
   temp = await mkdtemp(join(tmpdir(), "plugin-hub-lifecycle-"))
   await mkdir(join(temp, "config", "opencode"), { recursive: true })
@@ -117,9 +138,9 @@ test("3. 安装插件中心自身触发 selfUpdated", async () => {
   assert.deepEqual(await readPlugins(), [`opencode-plugin-hub@${LATER_VERSION}`])
 })
 
-test("4. 更新插件中心自身走自升级流程：目标版本取自官方检查，且不改用 plugin update", async () => {
+test("4. 更新插件中心自身走自升级流程：目标版本取自 npm registry，且不改用 plugin update", async () => {
   await writeConfig([`opencode-plugin-hub@${SELF_VERSION}`])
-  process.env.FAKE_CLI_CHECK = `Server\n  plugin-hub ${SELF_VERSION} \u2192 ${LATER_VERSION}\n`
+  mockSelfRegistry(LATER_VERSION)
   process.env.FAKE_CLI_LIST = listOutput([`plugin-hub  ${LATER_VERSION}  opencode-plugin-hub@${LATER_VERSION}`])
   const result = await admin.update(`opencode-plugin-hub@${SELF_VERSION}`)
   assert.equal(result.ok, true, result.message)

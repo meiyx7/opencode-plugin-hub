@@ -127,6 +127,8 @@ export const UpdateInfo = Schema.Struct({
   managed: Schema.Boolean,
   /** True when the config pins an exact version, which the CLI deliberately leaves alone. */
   pinned: Schema.optional(Schema.Boolean),
+  /** True for the plugin-center row: its update target comes from the registry, not `plugin check`. */
+  selfUpdate: Schema.optional(Schema.Boolean),
   /** One-line summary from the package manifest; empty when it cannot be read. */
   description: Schema.optional(Schema.String),
   /** SPDX license from the package manifest; empty when unknown. */

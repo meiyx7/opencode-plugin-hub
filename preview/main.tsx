@@ -51,10 +51,14 @@ const fakeStateWithSummary = {
   }),
 }
 
+/** ?selfupdate 预览开关：让插件中心自身显示可更新，核对自升级提示与按钮。 */
+const selfUpdateDemo = new URLSearchParams(window.location.search).has("selfupdate")
+
 /** 真实的官方检查结果：每条都带 official 与 reason，界面据此决定按钮与徽章。 */
 const fakeUpdates = fakeState.plugins.map((entry) => {
   const summary = summaries[entry.name] ?? { description: "", license: "", publisher: "" }
-  const outdated = entry.name === "opencode-usage-center"
+  const selfOutdated = selfUpdateDemo && entry.name === "opencode-plugin-hub"
+  const outdated = entry.name === "opencode-usage-center" || selfOutdated
   const failed = entry.name === "magpie-workbuddy-growth"
   const control = entry.kind === "control"
   const path = entry.kind === "path"
@@ -65,8 +69,9 @@ const fakeUpdates = fakeState.plugins.map((entry) => {
     id: entry.name === "opencode-mobile-notifications" ? "opencode-notify-callback" : entry.name.replace(/^opencode-/, ""),
     kind: entry.kind,
     current: entry.version,
-    latest: outdated ? "0.3.2" : "",
-    hasUpdate: outdated && !pinned,
+    latest: outdated ? (selfOutdated ? "0.7.0" : "0.3.2") : "",
+    // 自身可更新即使精确锁定也显示（registry 决定，不受 pinned 限制）。
+    hasUpdate: outdated && (!pinned || selfOutdated),
     official: control ? "skipped" : path ? "skipped" : failed ? "failed" : outdated ? "outdated" : "current",
     reason: control
       ? "配置规则，不是插件包"
@@ -74,9 +79,12 @@ const fakeUpdates = fakeState.plugins.map((entry) => {
         ? "本地目录插件由外部维护，官方更新流程会跳过它（目录里的改动不会被覆盖）"
         : failed
           ? "官方检查这个插件时出错"
-          : "",
+          : selfOutdated
+            ? "插件中心以精确版本运行；升级会进入安全自升级流程，把这个精确版本切换到目标版本"
+            : "",
     managed: !control && !path,
     pinned,
+    selfUpdate: entry.name === "opencode-plugin-hub" ? true : undefined,
     description: path ? "本地 directory 插件，直接加载工作区里的实现。" : summary.description,
     license: summary.license,
     homepage: "",

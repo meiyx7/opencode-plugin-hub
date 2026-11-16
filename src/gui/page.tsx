@@ -1377,6 +1377,13 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
               </div>
             </Show>
           </div>
+          {/* 插件中心自升级：说明只针对自己、且会把精确锁定版本切到目标版本，
+              不让用户误以为其它插件的精确锁定也会被解除。 */}
+          <Show when={info()?.selfUpdate && stale()}>
+            <div class="ph-self-update-hint" title="其它插件的精确锁定行为不变，只有插件中心自己的这一条会切换">
+              升级将把插件中心配置版本从当前精确锁定版本切换到 v{info()!.latest}，并经过安全自升级校验。
+            </div>
+          </Show>
         </div>
         <div class="ph-actions">
           <div class="ph-actions-left">

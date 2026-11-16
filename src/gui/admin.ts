@@ -155,6 +155,8 @@ export interface UpdateInfoValue {
   managed: boolean
   /** True when the config pins an exact version, which the CLI deliberately leaves alone. */
   pinned: boolean
+  /** True for the plugin-center row: its update target comes from the registry, not `plugin check`. */
+  selfUpdate?: boolean
   description?: string
   license?: string
   homepage?: string
@@ -323,6 +325,25 @@ function isNewer(candidate: string, current: string): boolean {
     if (left !== right) return left > right
   }
   return false
+}
+
+/**
+ * A stable, comparable version: `x.y.z` (optionally with a 4th numeric segment), no prerelease
+ * (`-beta.1`) and no build metadata (`+sha`). The registry's `dist-tag latest` normally points at
+ * a stable release, but a publisher can move it to a prerelease; treating that as the supported
+ * upgrade target would push users onto an unstable build. Callers use this to decide whether a
+ * registry version is a valid *stable* update target.
+ */
+function stableVersion(raw: string): string {
+  const version = literalVersion(raw)
+  if (!version) return ""
+  return /^\d+(\.\d+){1,3}$/.test(version) ? version : ""
+}
+
+/** True when the candidate is a usable stable upgrade over the current version. */
+function isStableUpgrade(candidate: string, current: string): boolean {
+  const stable = stableVersion(candidate)
+  return stable !== "" && isNewer(stable, current)
 }
 
 interface VersionLookup {
@@ -782,8 +803,12 @@ export async function updates(): Promise<UpdatesResultValue> {
       const row = byKey.get(rowKeyFor(entry))
       const id = row?.id ?? ""
       const official = id ? byId.get(id.toLowerCase()) : undefined
-      // Registry metadata is display-only: it never decides that an update exists.
-      const lookup = isPackageName(entry.name) ? await npmLatest(entry.name) : emptyLookup(false)
+      // Registry metadata is display-only for other plugins: it never decides that an update
+      // exists. The hub itself is the exception — its update decision comes from the registry,
+      // so force a fresh lookup rather than serving a cached "latest" for its own release.
+      const lookup = isPackageName(entry.name)
+        ? await npmLatest(entry.name, entry.name === SELF_PACKAGE)
+        : emptyLookup(false)
       const shared = {
         ...base,
         id,
@@ -792,6 +817,49 @@ export async function updates(): Promise<UpdatesResultValue> {
         license: base.license || lookup.license,
         homepage: base.homepage || lookup.homepage,
         repo: base.repo || lookup.repo,
+      }
+      // Plugin center itself is special: `opencode plugin check` deliberately skips exact
+      // versions, so a pinned hub would never see its own new release. Its update decision comes
+      // from the npm registry instead — the same source the safe self-upgrade reads. Other
+      // plugins keep the official-check semantics below, untouched.
+      if (entry.name === SELF_PACKAGE) {
+        const current = base.current || official?.version || ""
+        const registryVersion = stableVersion(lookup.version)
+        if (!lookup.ok) {
+          return {
+            ...shared,
+            selfUpdate: true,
+            official: "failed",
+            current,
+            reason: "无法连接 npm registry，未能确认插件中心是否有新版本（不把「查不到」当作「已是最新」）",
+            error: "registry lookup failed",
+          }
+        }
+        if (!registryVersion) {
+          return {
+            ...shared,
+            selfUpdate: true,
+            official: "failed",
+            current,
+            reason: `npm registry 返回的插件中心版本「${lookup.version}」不是有效稳定版本，不允许升级`,
+            error: "invalid registry version",
+          }
+        }
+        if (isStableUpgrade(registryVersion, current)) {
+          return {
+            ...shared,
+            selfUpdate: true,
+            official: "outdated",
+            latest: registryVersion,
+            current,
+            // Registry decides, so an exact pin does not hide the hub's own update.
+            hasUpdate: true,
+            reason: base.pinned
+              ? "插件中心以精确版本运行；升级会进入安全自升级流程，把这个精确版本切换到上面的目标版本"
+              : "",
+          }
+        }
+        return { ...shared, selfUpdate: true, official: "current", current }
       }
       if (entry.kind === "path") {
         return {
@@ -1636,7 +1704,7 @@ async function updateLocked(spec: string, options: MutationOptions): Promise<Mut
     if (!target.version) {
       return {
         ok: false,
-        message: `无法从官方检查里确定插件中心的目标版本${target.note ? `（${target.note}）` : ""}。自升级需要明确版本，未做任何改动。`,
+        message: `无法从 npm registry 确定插件中心的目标版本${target.note ? `（${target.note}）` : ""}。自升级需要明确版本，未做任何改动。`,
         state: await snapshot(),
         stages: { command: "skipped", config: "unchanged", runtime: "skipped" },
       }
@@ -1694,17 +1762,29 @@ async function updateLocked(spec: string, options: MutationOptions): Promise<Mut
   }
 }
 
-/** The version `opencode plugin check` wants for this plugin, or an empty version plus the reason. */
+/**
+ * The concrete version the safe self-upgrade should move to.
+ *
+ * This deliberately does not use `opencode plugin check`: the official check skips exact-version
+ * pins, so a pinned plugin center would get no target and the upgrade could never start. The npm
+ * registry is the authority for the hub's own release, so the target is read from there with
+ * `force = true` — a self-upgrade must not act on a stale, cached "latest".
+ *
+ * Returns an empty version plus the reason on any failure: registry unreachable, malformed or
+ * prerelease version, or a registry version not newer than what is installed. The caller refuses
+ * to touch the config when the version is empty.
+ */
 async function latestForSelf(entry: ResolvedEntry): Promise<{ version: string; note: string }> {
-  if (!hasCli()) return { version: "", note: "找不到 opencode CLI" }
-  const check = await pluginCheck(entry.spec)
-  const rows = parsePluginCheck(`${check.stdout}\n${check.stderr}`)
-  const row = rows.find((item) => item.status === "outdated" && item.latest)
-  if (!row) {
-    const failed = rows.find((item) => item.status === "failed")
-    return { version: "", note: failed?.note || "官方检查没有报告可更新的版本" }
+  const lookup = await npmLatest(SELF_PACKAGE, true)
+  if (!lookup.ok) return { version: "", note: "无法连接 npm registry，未能确认插件中心的目标版本" }
+  const target = stableVersion(lookup.version)
+  if (!target) {
+    return { version: "", note: `npm registry 返回的版本「${lookup.version}」不是有效稳定版本` }
   }
-  return { version: literalVersion(row.latest), note: "" }
+  if (!isStableUpgrade(target, entry.version)) {
+    return { version: "", note: `npm registry 的最新稳定版 ${target} 不高于当前版本 ${entry.version || "未知"}` }
+  }
+  return { version: target, note: "" }
 }
 
 // ---------------------------------------------------------------------------

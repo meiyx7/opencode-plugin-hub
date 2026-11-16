@@ -538,6 +538,14 @@ export const CSS = `
   line-height: 1.45;
   overflow-wrap: anywhere;
 }
+/* 插件中心自升级说明：轻量提示，不抢状态徽章的注意力。 */
+.ph-self-update-hint {
+  margin-top: 2px;
+  font-size: 10px;
+  line-height: 1.4;
+  color: var(--ph-accent);
+  overflow-wrap: anywhere;
+}
 .ph-type {
   font-size: 9.5px;
   font-weight: 650;

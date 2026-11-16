@@ -21,6 +21,7 @@ const entries = [
   "config-safety.test.ts",
   "feedback.test.ts",
   "attention.test.ts",
+  "self-update-detection.test.ts",
   "release-guard.test.ts",
 ]
 
