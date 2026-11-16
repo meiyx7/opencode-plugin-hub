@@ -7,8 +7,21 @@
  */
 import test, { afterEach, beforeEach } from "node:test"
 import assert from "node:assert/strict"
-import { writeFileSync } from "node:fs"
-import { chmod, lstat, mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, unlink, writeFile } from "node:fs/promises"
+import { chmodSync, writeFileSync } from "node:fs"
+import {
+  chmod,
+  lstat,
+  mkdir,
+  mkdtemp,
+  readFile,
+  readdir,
+  rename,
+  rm,
+  stat,
+  symlink,
+  unlink,
+  writeFile,
+} from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import {
@@ -187,13 +200,19 @@ test("11. 整个文件被替换成内容不同的一份：拒绝", async () => {
   assert.equal(await readFile(jsonPath(), "utf8"), external)
 })
 
-test("12. 文件被删掉再重建（内容恰好相同）：靠 inode 识别，仍然拒绝", async () => {
+test("12. 文件被替换成内容完全相同的一份：靠 inode 识别，仍然拒绝", async () => {
   await writeConfig(["keep-me"], 0o600)
   const file = await readConfig()
   const staged = await stageWrite(file, `${file.text.trimEnd()}${"\n"}`)
-  // 同一份内容，但是另一个文件：inode 变了。
-  await unlink(jsonPath())
-  await writeConfig(["keep-me"], 0o600)
+  const before = await stat(jsonPath())
+  // 让替换用的文件先「活着」写好，再 rename 顶上去：两个同时存在的文件不可能共用一个 inode，
+  // 所以这里一定是「另一个文件」。不能写成 unlink 之后再创建——Linux 会立刻复用刚释放的
+  // inode 号，那样复现出来的其实是「同一个文件」，在 CI 上必然把这条用例误判成没检测到。
+  const replacement = join(configDir(), "replacement.json")
+  await writeFile(replacement, await readFile(jsonPath(), "utf8"), "utf8")
+  await chmod(replacement, 0o600)
+  await rename(replacement, jsonPath())
+  assert.notEqual((await stat(jsonPath())).ino, before.ino, "替换用的文件复用了原 inode，用例前提不成立")
 
   await assert.rejects(() => commitWrite(staged), (error: unknown) => {
     assert.ok(error instanceof ConcurrentEditError)
@@ -274,4 +293,109 @@ test("18. 权限保持和并发检查同时生效：并发拒绝时也不改动�
   const staged = await stageThenEditExternally(external, 0o640)
   await assert.rejects(() => commitWrite(staged), ConcurrentEditError)
   assert.equal(await modeOf(jsonPath()), 0o640)
+})
+
+// ---------------------------------------------------------------------------
+// TASK-01: 权限变化也是并发改动
+//
+// 前面几条覆盖「内容变了」。这里覆盖另一种外部改动：内容、inode 一动不动，
+// 只有权限被改了。rename 会把临时文件的权限盖到原文件上，所以照样必须拒绝。
+// ---------------------------------------------------------------------------
+
+/** 读 → 算计划 → 已落临时文件；此时外部只 chmod，内容与 inode 都没动。 */
+async function stageThenChmodExternally(mode: number) {
+  const file = await readConfig()
+  const staged = await stageWrite(file, `${JSON.stringify({ plugins: [...file.raw, "from-hub"] }, null, 2)}\n`)
+  const before = await stat(jsonPath())
+  await chmod(jsonPath(), mode)
+  const after = await stat(jsonPath())
+  assert.equal(after.ino, before.ino, "chmod 不该换 inode")
+  assert.equal(after.dev, before.dev, "chmod 不该换设备号")
+  return staged
+}
+
+test("19. 原文件 0600，临时文件生成后外部改成 0640：提交必须拒绝", async () => {
+  await writeConfig(["keep-me"], 0o600)
+  const staged = await stageThenChmodExternally(0o640)
+
+  await assert.rejects(() => commitWrite(staged), (error: unknown) => {
+    assert.ok(error instanceof ConcurrentEditError, `期望并发错误，实际 ${String(error)}`)
+    assert.match((error as Error).message, /配置权限在操作期间发生变化/)
+    assert.match((error as Error).message, /0600/)
+    assert.match((error as Error).message, /0640/)
+    return true
+  })
+  // 外部把权限放宽了，那是外部的意思：内容不动，权限也不帮他改回去。
+  assert.equal(await modeOf(jsonPath()), 0o640, "外部设置的权限被改回去了")
+  const parsed = JSON.parse(await readFile(jsonPath(), "utf8")) as { plugins: string[] }
+  assert.deepEqual(parsed.plugins, ["keep-me"], "外部内容被覆盖了")
+  assert.deepEqual(await leftovers(), [], "临时文件残留")
+})
+
+test("20. 原文件 0640，临时文件生成后外部改成 0600：提交必须拒绝", async () => {
+  await writeConfig(["keep-me"], 0o640)
+  const staged = await stageThenChmodExternally(0o600)
+
+  await assert.rejects(() => commitWrite(staged), (error: unknown) => {
+    assert.ok(error instanceof ConcurrentEditError)
+    assert.match((error as Error).message, /配置权限在操作期间发生变化/)
+    return true
+  })
+  // 收窄方向的改动同样不许被覆盖：写回去等于把一个人的安全加固又放宽了。
+  assert.equal(await modeOf(jsonPath()), 0o600, "外部收紧的权限被放宽回去了")
+  assert.deepEqual(await leftovers(), [], "临时文件残留")
+})
+
+test("21. 外部只改权限、内容与 inode 都不变，仍然必须识别", async () => {
+  await writeConfig(["keep-me"], 0o600)
+  const before = await stat(jsonPath())
+  const textBefore = await readFile(jsonPath(), "utf8")
+  const staged = await stageThenChmodExternally(0o640)
+  const after = await stat(jsonPath())
+
+  // 用例前提：除了 mode，别的什么都没变。所以判定只能落在权限上。
+  assert.equal(await readFile(jsonPath(), "utf8"), textBefore, "内容被动过了，用例前提不成立")
+  assert.equal(after.ino, before.ino)
+  assert.equal(after.size, before.size)
+  assert.equal(await modeOf(jsonPath()), 0o640)
+
+  await assert.rejects(() => commitWrite(staged), (error: unknown) => {
+    assert.ok(error instanceof ConcurrentEditError)
+    assert.match((error as Error).message, /配置权限在操作期间发生变化/)
+    assert.doesNotMatch((error as Error).message, /被外部修改|被另一个文件替换/)
+    return true
+  })
+  assert.equal(await modeOf(jsonPath()), 0o640)
+  assert.equal(await readFile(jsonPath(), "utf8"), textBefore)
+  assert.deepEqual(await leftovers(), [], "临时文件残留")
+})
+
+test("22. 权限被外部改动时的用户可见提示：说明权限变了，并要求刷新后重新操作", async () => {
+  await writeConfig(["keep-me"], 0o600)
+  // plan 在队列内、读之后被调用：这里同步 chmod，等于「读完 → 落临时文件」之间被人改了权限。
+  const outcome = await editConfig((file) => {
+    chmodSync(jsonPath(), 0o640)
+    return [{ path: [file.key, file.raw.length], value: "from-hub" }]
+  })
+
+  assert.equal(outcome.ok, false)
+  assert.match(outcome.error, /权限在操作期间发生变化/)
+  assert.match(outcome.error, /请刷新后重新操作/)
+  // 不自动合并、不自动重试旧计划：磁盘上还是外部权限 + 原内容。
+  assert.equal(await modeOf(jsonPath()), 0o640, "拒绝时把外部权限改掉了")
+  const parsed = JSON.parse(await readFile(jsonPath(), "utf8")) as { plugins: string[] }
+  assert.deepEqual(parsed.plugins, ["keep-me"], "拒绝时仍然写入了")
+  assert.deepEqual(await leftovers(), [], "临时文件残留")
+})
+
+test("23. 权限并发拒绝之后，刷新再操作可以正常完成，权限沿用刷新后看到的那一份", async () => {
+  await writeConfig(["keep-me"], 0o600)
+  const staged = await stageThenChmodExternally(0o640)
+  await assert.rejects(() => commitWrite(staged), ConcurrentEditError)
+
+  const retry = await editConfig(append("after-refresh"))
+  assert.equal(retry.ok, true, retry.error)
+  const parsed = JSON.parse(await readFile(jsonPath(), "utf8")) as { plugins: string[] }
+  assert.deepEqual(parsed.plugins, ["keep-me", "after-refresh"])
+  assert.equal(await modeOf(jsonPath()), 0o640, "刷新后应沿用外部那一次的权限")
 })

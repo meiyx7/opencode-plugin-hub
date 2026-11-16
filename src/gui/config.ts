@@ -300,6 +300,12 @@ function compareBaseline(expected: FileBaseline | null, now: FileBaseline | null
   if (now.dev !== expected.dev || now.ino !== expected.ino) {
     return "配置在操作期间被另一个文件替换，未覆盖"
   }
+  // Same file, same bytes, different permission. It is a change to the thing we are about to
+  // replace: `rename` would carry the *temp* file's mode over it, so writing here would silently
+  // undo whoever just widened or tightened it. Refuse and let the caller re-read.
+  if (now.mode !== expected.mode) {
+    return `配置权限在操作期间发生变化（${oct(expected.mode)} → ${oct(now.mode)}），未覆盖`
+  }
   return ""
 }
 
