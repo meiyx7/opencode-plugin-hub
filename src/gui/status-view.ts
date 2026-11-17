@@ -14,6 +14,9 @@
 
 export type RowState = "loaded" | "failed" | "paused" | "pending" | "unknown" | "control" | "rule"
 
+/** 已安装页的状态筛选（管理页先看问题项，而不是按配置顺序翻）。 */
+export type InstalledFilter = "all" | "update" | "paused" | "failed" | "pending" | "unknown"
+
 /** 只需要这些字段；与 page.tsx 的 PluginEntry / RuntimeInfo 结构兼容。 */
 export interface StatusEntry {
   kind: string

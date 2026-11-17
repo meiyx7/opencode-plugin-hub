@@ -2,7 +2,18 @@ import { spawn } from "node:child_process"
 import { access, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises"
 import { homedir, tmpdir } from "node:os"
 import { isAbsolute, join, resolve } from "node:path"
-import { downloadsFor, registryFetch, type Downloads } from "./registry"
+import {
+  RegistryUnavailable,
+  downloadsFor,
+  effectiveMode,
+  forcedBase,
+  registryCacheScope,
+  registryFetch,
+  registryFetchDetailed,
+  resetRegistryCache,
+  type Downloads,
+  type RegistryResolution,
+} from "./registry"
 import {
   classify,
   cliCommand,
@@ -31,7 +42,15 @@ import {
 } from "./config"
 import { isPathSource, packageNameOf, parsePluginCheck, parsePluginList, type CheckRow, type PluginListRow } from "./official-parse"
 import { disableRule, enableRule, evaluateRules, exactRulesFor, isControlSpec, parseControl } from "./rules"
-import { forgetRule, lookupId, readStore, rememberId, rememberRule } from "./store"
+import {
+  forgetRule,
+  lookupId,
+  readStore,
+  registryMode as storedRegistryMode,
+  rememberId,
+  rememberRule,
+  setRegistryMode,
+} from "./store"
 
 export { isControlSpec } from "./rules"
 export { configDir } from "./config"
@@ -157,11 +176,28 @@ export interface UpdateInfoValue {
   pinned: boolean
   /** True for the plugin-center row: its update target comes from the registry, not `plugin check`. */
   selfUpdate?: boolean
+  /**
+   * True when this row's update target was found by the registry because the config pins an exact
+   * version (which `plugin check` skips). Such a row still `pinned: true` and needs confirmation.
+   */
+  pinnedRegistryUpdate?: boolean
+  /** Short note on where the registry answer came from, shown for self / pinned rows. */
+  registryMessage?: string
   description?: string
   license?: string
   homepage?: string
   repo?: string
   publisher?: string
+  error: string
+}
+
+/** Registry state for the whole check, so the UI can name the source and any automatic switch. */
+export interface UpdateRegistryValue {
+  mode: RegistryResolution["mode"]
+  /** Source that answered the self-update lookup. Empty when no lookup succeeded. */
+  registryUsed: string
+  fallbackUsed: boolean
+  message: string
   error: string
 }
 
@@ -173,6 +209,37 @@ export interface UpdatesResultValue {
   raw?: string
   /** False when the check never ran because no CLI is reachable. */
   checked: boolean
+  /** Registry provenance of the version lookups; always present so the UI can explain the source. */
+  registry: UpdateRegistryValue
+  /** Status of the official-CLI half (no CLI / timeout / failed). Empty when it ran cleanly. */
+  cliError?: string
+  /**
+   * True on the registry-only phase: the official CLI was never consulted, so rows whose authority
+   * is `plugin check` are placeholders to be replaced by `officialUpdates()`.
+   */
+  registryOnly?: boolean
+}
+
+/** The official-CLI half of an update check, delivered separately from the registry half. */
+export interface OfficialUpdatesResultValue {
+  /** Rows decided by `plugin check`, keyed by config spec in the UI. */
+  items: UpdateInfoValue[]
+  /** CLI failure / timeout / no CLI; empty when it ran cleanly. */
+  error: string
+}
+
+/** Registry preference shown in the settings area of the installed page. */
+export interface RegistryStatusValue {
+  /** Effective mode after env override and stored preference. */
+  mode: RegistryResolution["mode"]
+  /** What the user picked in the UI (auto / official / mirror); equals mode unless env overrides. */
+  preference: "auto" | "official" | "mirror"
+  /** True when OPENCODE_PLUGIN_HUB_REGISTRY currently forces a custom source. */
+  envOverridden: boolean
+  /** The forced URL, when env is set. */
+  envUrl: string
+  /** Human explanation of the current mode. */
+  message: string
 }
 
 export interface MutationValue {
@@ -357,10 +424,12 @@ interface VersionLookup {
   homepage: string
   repo: string
   publisher: string
+  /** Where this answer came from; present even on failure so the UI can explain it. */
+  registry: RegistryResolution
 }
 
-function emptyLookup(ok: boolean): VersionLookup {
-  return { version: "", ok, description: "", license: "", homepage: "", repo: "", publisher: "" }
+function emptyLookup(ok: boolean, registry: RegistryResolution): VersionLookup {
+  return { version: "", ok, description: "", license: "", homepage: "", repo: "", publisher: "", registry }
 }
 
 const versionCache = new Map<string, { at: number; value: VersionLookup }>()
@@ -370,30 +439,51 @@ const versionCache = new Map<string, { at: number; value: VersionLookup }>()
  * `ok` separates "the registry says there is nothing newer" from "the registry was never
  * reached" — showing the second as "up to date" would be a lie.
  *
- * This is display data only: whether an update may be applied is decided by `opencode plugin check`.
+ * Cache keys are scoped to the effective registry mode and the source that answered, so switching
+ * source never serves another source's value as current. Failed lookups are never cached, so a
+ * transient failure cannot overwrite a previously good value or masquerade as a fresh check.
+ * `force` bypasses the cache for a real, user-requested re-check.
  *
  * `/latest` is a single small manifest: the full packument can be megabytes and is only
  * needed by the detail dialog. A 404 means no published version (removed or placeholder).
  */
 export async function npmLatest(name: string, force = false): Promise<VersionLookup> {
-  const cached = versionCache.get(name)
+  const key = `${registryCacheScope()}\u0000${name}`
+  const cached = versionCache.get(key)
   if (!force && cached && Date.now() - cached.at < VERSION_TTL) return cached.value
   const url = `/${encodeURIComponent(name)}/latest`
-  let response: Response
+  let result: Awaited<ReturnType<typeof registryFetchDetailed>>
   try {
-    response = await registryFetch(url, { timeoutMs: 10_000 })
-  } catch {
-    return emptyLookup(false)
+    result = await registryFetchDetailed(url, { timeoutMs: 10_000 })
+  } catch (error) {
+    // RegistryUnavailable carries the real mode + tried sources; keep it so the UI can say which
+    // source failed instead of inventing "auto".
+    const failed: RegistryResolution =
+      error instanceof RegistryUnavailable && error.resolution
+        ? error.resolution
+        : {
+            mode: effectiveMode(),
+            registryUsed: "",
+            fallbackUsed: false,
+            registryMessage: "",
+            registryError: describe(error),
+          }
+    return emptyLookup(false, failed)
   }
-  // 404 is a definite answer: no published version to update to.
-  if (response.status === 404) return emptyLookup(true)
-  if (!response.ok) return emptyLookup(false)
+  const { response, resolution } = result
+  // 404 is a definite "not published here" answer. Do NOT cache it: a mirror's 404 must never
+  // overwrite a previously successful version lookup (mirrors sync asynchronously).
+  if (response.status === 404) return emptyLookup(true, resolution)
+  if (!response.ok) return emptyLookup(false, resolution)
   try {
     const manifest = (await response.json()) as RegistryManifest & {
       maintainers?: { name?: string; username?: string }[]
       _npmUser?: { name?: string }
     }
-    if (!manifest?.version) return emptyLookup(true)
+    if (!manifest?.version) {
+      // Invalid data is never "the latest": record the source but do not claim a version.
+      return emptyLookup(false, resolution)
+    }
     const repo = repository(manifest.repository)
     const maintainer = manifest.maintainers?.[0]
     const value: VersionLookup = {
@@ -404,11 +494,12 @@ export async function npmLatest(name: string, force = false): Promise<VersionLoo
       homepage: cleanUrl(manifest.homepage) || repo.url,
       repo: repo.url,
       publisher: maintainer?.name || maintainer?.username || manifest._npmUser?.name || "",
+      registry: resolution,
     }
-    versionCache.set(name, { at: Date.now(), value })
+    versionCache.set(key, { at: Date.now(), value })
     return value
   } catch {
-    return emptyLookup(false)
+    return emptyLookup(false, resolution)
   }
 }
 
@@ -748,173 +839,382 @@ async function readSidecar(endpoint: { url: string; headers: Readonly<Record<str
 // Update check: `opencode plugin check` decides, the registry only explains
 // ---------------------------------------------------------------------------
 
-/** Compares every configured plugin against the official update check. */
-export async function updates(): Promise<UpdatesResultValue> {
-  if (!hasCli()) {
-    return { items: [], error: "找不到 opencode CLI，无法执行官方更新检查", checked: false }
-  }
-  let file: ConfigFile
-  let resolved: ResolvedEntry[]
+/** The official-CLI half of an update check: runtime IDs, `plugin check` rows, and any error. */
+interface CliCheck {
+  byKey: Map<string, PluginListRow>
+  byId: Map<string, CheckRow>
+  error: string
+}
+
+/** Reads the CLI independently; any failure stays inside this object and cannot block registry rows. */
+async function cliCheckFor(resolved: readonly ResolvedEntry[]): Promise<CliCheck> {
+  const empty: CliCheck = { byKey: new Map(), byId: new Map(), error: "" }
+  if (!hasCli()) return { ...empty, error: "找不到 opencode CLI，普通插件的官方检查未执行" }
+
   try {
-    file = await readConfig()
-    if (file.parseError) {
-      // A broken file is an error to report, not an empty plugin list to check.
-      return { items: [], error: `配置文件无法解析：${file.parseError}`, checked: false }
+    // list and check are independent CLI reads; run them together so one slow command does not
+    // add its deadline on top of the other inside the CLI half.
+    const [list, check] = await Promise.all([
+      readRuntimeRows(resolved.length > 0),
+      pluginCheck(),
+    ])
+    // Exit code 1 is normal: `plugin check` also exits non-zero when one plugin failed while the
+    // rest succeeded. Only a total failure (no parsable rows, no CLI) is fatal to the CLI half.
+    const checkRows = parsePluginCheck(`${check.stdout}\n${check.stderr}`)
+    const byId = new Map<string, CheckRow>()
+    for (const row of checkRows) byId.set(row.id.toLowerCase(), row)
+    const totalFailure = checkRows.length === 0 && !check.ok
+    // A failed/timed-out `plugin list` means IDs are missing; report it so callers know the CLI
+    // half is incomplete, without affecting the registry half.
+    const notes: string[] = []
+    if (totalFailure) notes.push("官方更新检查没有返回可解析的结果")
+    else if (!list.ok && list.message) notes.push(`官方插件列表读取失败：${list.message}`)
+    return {
+      byKey: indexRows(list.rows),
+      byId,
+      error: notes.join("；"),
     }
-    resolved = await resolveAll(file)
   } catch (error) {
-    return { items: [], error: describe(error), checked: false }
+    // A plugin list/check timeout or crash is a CLI failure, not a reason to lose registry rows.
+    return { ...empty, error: `官方更新检查失败：${describe(error)}` }
+  }
+}
+
+/** Registry state summary taken from the most informative lookup of the check. */
+function registrySummary(lookups: readonly VersionLookup[]): UpdateRegistryValue {
+  const withSource = lookups.filter((entry) => entry.registry.registryUsed !== "")
+  const first = withSource[0] ?? lookups[0]
+  const failed = lookups.find((entry) => !entry.ok && entry.registry.registryError !== "")
+  const sample = failed ?? first
+  return {
+    mode: sample?.registry.mode ?? "auto",
+    registryUsed: first?.registry.registryUsed ?? "",
+    fallbackUsed: withSource.some((entry) => entry.registry.fallbackUsed),
+    message: first?.registry.registryMessage ?? "",
+    error: failed?.registry.registryError ?? "",
+  }
+}
+
+/**
+ * One row's authority decision, shared by all three update-check entry points so their results
+ * can never drift apart. `cli` and `lookup` are the two independent phases; passing an empty CLI
+ * view yields registry-phase placeholders for ordinary plugins, and passing no lookup keeps
+ * registry-decided rows out of the official phase (the UI filters those by authority anyway).
+ */
+function decideUpdateRow(
+  entry: ResolvedEntry,
+  cli: Pick<CliCheck, "byKey" | "byId">,
+  lookup: VersionLookup | undefined,
+): UpdateInfoValue {
+  const pinned = literalVersion(splitSpec(entry.spec).range) !== ""
+  const base: UpdateInfoValue = {
+    spec: entry.spec,
+    name: entry.name,
+    id: "",
+    kind: entry.kind,
+    current: entry.version,
+    latest: "",
+    hasUpdate: false,
+    official: "unknown",
+    reason: "",
+    managed: entry.kind !== "path" && entry.kind !== "control" && entry.kind !== "enable-rule",
+    pinned,
+    description: entry.description,
+    license: entry.license,
+    homepage: entry.homepage,
+    repo: entry.repo,
+    publisher: "",
+    error: "",
+  }
+  if (entry.kind === "control" || entry.kind === "enable-rule") {
+    return { ...base, official: "skipped", reason: "配置规则，不是插件包", managed: false }
+  }
+  const row = cli.byKey.get(rowKeyFor(entry))
+  const id = row?.id ?? ""
+  const official = id ? cli.byId.get(id.toLowerCase()) : undefined
+
+  // ---- Registry-decided rows: plugin center itself ----
+  if (entry.name === SELF_PACKAGE) {
+    const current = base.current || official?.version || ""
+    const l = lookup ?? emptyLookup(false, {
+      mode: "auto", registryUsed: "", fallbackUsed: false, registryMessage: "", registryError: "未查询",
+    })
+    const shared = {
+      ...base,
+      id,
+      current,
+      publisher: l.publisher,
+      description: base.description || l.description,
+      license: base.license || l.license,
+      homepage: base.homepage || l.homepage,
+      repo: base.repo || l.repo,
+      registryMessage: l.registry.registryMessage || undefined,
+    }
+    const registryVersion = stableVersion(l.version)
+    if (!l.ok) {
+      return {
+        ...shared,
+        selfUpdate: true,
+        official: "failed",
+        reason: l.registry.registryError
+          ? `未能确认插件中心是否有新版本：${l.registry.registryError}`
+          : "无法连接 npm registry，未能确认插件中心是否有新版本（不把「查不到」当作「已是最新」）",
+        error: "registry lookup failed",
+      }
+    }
+    if (!registryVersion) {
+      return {
+        ...shared,
+        selfUpdate: true,
+        official: "failed",
+        reason: `npm registry 返回的插件中心版本「${l.version}」不是有效稳定版本，不允许升级`,
+        error: "invalid registry version",
+      }
+    }
+    if (isStableUpgrade(registryVersion, current)) {
+      return {
+        ...shared,
+        selfUpdate: true,
+        official: "outdated",
+        latest: registryVersion,
+        hasUpdate: true,
+        reason: base.pinned
+          ? "插件中心以精确版本运行；升级会进入安全自升级流程，把这个精确版本切换到上面的目标版本"
+          : "",
+      }
+    }
+    return { ...shared, selfUpdate: true, official: "current" }
   }
 
-  const list = await readRuntimeRows(resolved.length > 0)
-  const byKey = indexRows(list.rows)
+  const shared = {
+    ...base,
+    id,
+    publisher: lookup?.publisher ?? "",
+    description: base.description || lookup?.description || "",
+    license: base.license || lookup?.license || "",
+    homepage: base.homepage || lookup?.homepage || "",
+    repo: base.repo || lookup?.repo || "",
+  }
 
-  const check = await pluginCheck()
-  // Exit code 1 is normal here: `plugin check` also exits non-zero when one plugin could not be
-  // checked while the rest succeeded. Only a total failure (no parsable rows, no CLI) is fatal.
-  const checkRows = parsePluginCheck(`${check.stdout}\n${check.stderr}`)
-  const byId = new Map<string, CheckRow>()
-  for (const row of checkRows) byId.set(row.id.toLowerCase(), row)
+  if (entry.kind === "path") {
+    return {
+      ...shared,
+      official: "skipped",
+      managed: false,
+      reason: "本地目录插件由外部维护，官方更新流程会跳过它（目录里的改动不会被覆盖）",
+    }
+  }
 
-  const items = await Promise.all(
-    resolved.map(async (entry): Promise<UpdateInfoValue> => {
-      const base: UpdateInfoValue = {
-        spec: entry.spec,
-        name: entry.name,
-        id: "",
-        kind: entry.kind,
-        current: entry.version,
-        latest: "",
-        hasUpdate: false,
-        official: "unknown",
-        reason: "",
-        managed: entry.kind !== "path" && entry.kind !== "control" && entry.kind !== "enable-rule",
-        pinned: literalVersion(splitSpec(entry.spec).range) !== "",
-        description: entry.description,
-        license: entry.license,
-        homepage: entry.homepage,
-        repo: entry.repo,
-        publisher: "",
-        error: "",
+  // ---- Pinned npm package: registry discovers a stable target, user must confirm ----
+  if (pinned && lookup && entry.kind === "package") {
+    const registryVersion = stableVersion(lookup.version)
+    const withSource = { ...shared, registryMessage: lookup.registry.registryMessage || undefined }
+    if (!lookup.ok) {
+      return {
+        ...withSource,
+        official: official?.status ?? "unknown",
+        reason: `精确锁定 ${base.current}，registry 查询失败，无法确认是否有新版本（不把查不到当作已是最新）`,
       }
-      if (entry.kind === "control" || entry.kind === "enable-rule") {
-        return { ...base, official: "skipped", reason: "配置规则，不是插件包", managed: false }
+    }
+    if (!registryVersion) {
+      return {
+        ...withSource,
+        official: official?.status ?? "unknown",
+        reason: `精确锁定 ${base.current}，registry 返回的版本「${lookup.version}」不是有效稳定版本`,
       }
-      const row = byKey.get(rowKeyFor(entry))
-      const id = row?.id ?? ""
-      const official = id ? byId.get(id.toLowerCase()) : undefined
-      // Registry metadata is display-only for other plugins: it never decides that an update
-      // exists. The hub itself is the exception — its update decision comes from the registry,
-      // so force a fresh lookup rather than serving a cached "latest" for its own release.
-      const lookup = isPackageName(entry.name)
-        ? await npmLatest(entry.name, entry.name === SELF_PACKAGE)
-        : emptyLookup(false)
-      const shared = {
-        ...base,
-        id,
-        publisher: lookup.publisher,
-        description: base.description || lookup.description,
-        license: base.license || lookup.license,
-        homepage: base.homepage || lookup.homepage,
-        repo: base.repo || lookup.repo,
+    }
+    if (isStableUpgrade(registryVersion, base.current)) {
+      return {
+        ...withSource,
+        official: "outdated",
+        latest: registryVersion,
+        hasUpdate: true,
+        pinnedRegistryUpdate: true,
+        reason: `精确锁定 ${base.current}；registry 发现稳定版 ${registryVersion}，升级需要你确认后才会切换版本`,
       }
-      // Plugin center itself is special: `opencode plugin check` deliberately skips exact
-      // versions, so a pinned hub would never see its own new release. Its update decision comes
-      // from the npm registry instead — the same source the safe self-upgrade reads. Other
-      // plugins keep the official-check semantics below, untouched.
-      if (entry.name === SELF_PACKAGE) {
-        const current = base.current || official?.version || ""
-        const registryVersion = stableVersion(lookup.version)
-        if (!lookup.ok) {
-          return {
-            ...shared,
-            selfUpdate: true,
-            official: "failed",
-            current,
-            reason: "无法连接 npm registry，未能确认插件中心是否有新版本（不把「查不到」当作「已是最新」）",
-            error: "registry lookup failed",
-          }
-        }
-        if (!registryVersion) {
-          return {
-            ...shared,
-            selfUpdate: true,
-            official: "failed",
-            current,
-            reason: `npm registry 返回的插件中心版本「${lookup.version}」不是有效稳定版本，不允许升级`,
-            error: "invalid registry version",
-          }
-        }
-        if (isStableUpgrade(registryVersion, current)) {
-          return {
-            ...shared,
-            selfUpdate: true,
-            official: "outdated",
-            latest: registryVersion,
-            current,
-            // Registry decides, so an exact pin does not hide the hub's own update.
-            hasUpdate: true,
-            reason: base.pinned
-              ? "插件中心以精确版本运行；升级会进入安全自升级流程，把这个精确版本切换到上面的目标版本"
-              : "",
-          }
-        }
-        return { ...shared, selfUpdate: true, official: "current", current }
-      }
-      if (entry.kind === "path") {
-        return {
-          ...shared,
-          official: "skipped",
-          managed: false,
-          reason: "本地目录插件由外部维护，官方更新流程会跳过它（目录里的改动不会被覆盖）",
-        }
-      }
-      if (!official) {
-        if (base.pinned) {
-          return { ...shared, official: "skipped", reason: `配置精确锁定 ${base.current}，官方更新会跳过精确版本` }
-        }
-        return {
-          ...shared,
-          official: "unknown",
-          reason: id
-            ? "官方检查结果里没有这个插件"
-            : "宿主尚未加载这个插件，官方检查拿不到它的 ID（安装后需要先加载一次）",
-        }
-      }
-      if (official.status === "outdated") {
-        return {
-          ...shared,
-          official: "outdated",
-          latest: official.latest,
-          current: official.version || base.current,
-          // A pinned version is never offered as a one-click update: `plugin update` skips exact
-          // revisions, so the button would only ever produce "nothing to update".
-          hasUpdate: official.latest !== "" && !base.pinned,
-          reason: base.pinned
-            ? `配置精确锁定 ${base.current || official.version}，官方更新会跳过精确版本；要换版本请用「npm 搜索」安装指定版本`
-            : "",
-        }
-      }
-      if (official.status === "failed") {
-        return { ...shared, official: "failed", reason: official.note || "官方检查这个插件时出错", error: official.note }
-      }
-      if (official.status === "current") {
-        return { ...shared, official: "current", current: official.version || base.current }
-      }
-      if (official.status === "skipped") {
-        return { ...shared, official: "skipped", reason: official.note || "官方更新会跳过这个插件" }
-      }
-      return { ...shared, official: "unknown", reason: official.note ? `官方输出无法识别：${official.note}` : "官方输出无法识别" }
-    }),
+    }
+  }
+
+  // ---- Official-CLI-decided rows: everything else ----
+  if (!official) {
+    if (pinned) {
+      return { ...shared, official: "skipped", reason: `配置精确锁定 ${base.current}，官方更新会跳过精确版本` }
+    }
+    return {
+      ...shared,
+      official: "unknown",
+      reason: id
+        ? "官方检查结果里没有这个插件"
+        : "宿主尚未加载这个插件，官方检查拿不到它的 ID（安装后需要先加载一次）",
+    }
+  }
+  if (official.status === "outdated") {
+    return {
+      ...shared,
+      latest: official.latest,
+      current: official.version || base.current,
+      official: pinned ? "skipped" : "outdated",
+      hasUpdate: official.latest !== "" && !pinned,
+      reason: pinned
+        ? `配置精确锁定 ${base.current || official.version}；官方更新跳过精确版本，如需升级请在 registry 发现新版本后确认`
+        : "",
+    }
+  }
+  if (official.status === "failed") {
+    return { ...shared, official: "failed", reason: official.note || "官方检查这个插件时出错", error: official.note }
+  }
+  if (official.status === "current") {
+    return { ...shared, official: "current", current: official.version || base.current }
+  }
+  if (official.status === "skipped") {
+    return { ...shared, official: "skipped", reason: official.note || "官方更新会跳过这个插件" }
+  }
+  return { ...shared, official: "unknown", reason: official.note ? `官方输出无法识别：${official.note}` : "官方输出无法识别" }
+}
+
+/** An empty CLI view: registry-only phase uses it so no row claims an official answer. */
+const EMPTY_CLI: Pick<CliCheck, "byKey" | "byId"> = { byKey: new Map(), byId: new Map() }
+
+/** True when a row's authority is `plugin check` (as opposed to the registry or local config). */
+function isOfficialAuthority(entry: ResolvedEntry, registryTarget: Set<ResolvedEntry>): boolean {
+  if (entry.kind === "control" || entry.kind === "enable-rule" || entry.kind === "path") return false
+  if (entry.name === SELF_PACKAGE || registryTarget.has(entry)) return false
+  return true
+}
+
+/** Reads and resolves config; a broken/unreadable file is a real error, not an empty plugin list. */
+async function loadUpdateConfig(): Promise<{ resolved: ResolvedEntry[]; error: string }> {
+  try {
+    const file = await readConfig()
+    if (file.parseError) return { resolved: [], error: `配置文件无法解析：${file.parseError}` }
+    return { resolved: await resolveAll(file), error: "" }
+  } catch (error) {
+    return { resolved: [], error: describe(error) }
+  }
+}
+
+/** Resolves just the registry-authority targets (hub itself + exact-pinned npm packages). */
+function registryTargetsOf(resolved: readonly ResolvedEntry[]): ResolvedEntry[] {
+  return resolved.filter(
+    (entry) =>
+      entry.name === SELF_PACKAGE ||
+      (isPackageName(entry.name) &&
+        entry.kind === "package" &&
+        literalVersion(splitSpec(entry.spec).range) !== "" &&
+        entry.version !== ""),
   )
+}
 
-  const totalFailure = checkRows.length === 0 && !check.ok
+/**
+ * Registry-only phase. Runs no CLI at all: the hub's own update and pinned npm packages are fully
+ * decided here, and ordinary plugins get honest "unknown" placeholders to be replaced later.
+ */
+export async function registryUpdates(): Promise<UpdatesResultValue> {
+  const { resolved, error } = await loadUpdateConfig()
+  if (error) return { items: [], error, checked: false, registry: registrySummary([]), registryOnly: true }
+
+  const targets = registryTargetsOf(resolved)
+  const lookups = await Promise.all(
+    targets.map(async (entry) => ({ name: entry.name, lookup: await npmLatest(entry.name, true) })),
+  )
+  const lookupByName = new Map(lookups.map((item) => [item.name, item.lookup]))
+  const items = resolved.map((entry) => decideUpdateRow(entry, EMPTY_CLI, lookupByName.get(entry.name)))
   return {
     items,
-    error: totalFailure ? "官方更新检查没有返回可解析的结果" : "",
-    raw: totalFailure ? check.message : undefined,
-    checked: !totalFailure,
+    error: "",
+    checked: true,
+    registry: registrySummary(lookups.map((item) => item.lookup)),
+    registryOnly: true,
   }
+}
+
+/**
+ * Official-CLI phase. Runs no registry lookup: only rows whose authority is `plugin check` are
+ * returned, so merging them by spec can never overwrite a registry-decided row. A CLI failure is
+ * reported in `error` and leaves `items` empty — the registry half keeps its results either way.
+ */
+export async function officialUpdates(): Promise<OfficialUpdatesResultValue> {
+  const { resolved, error } = await loadUpdateConfig()
+  if (error) return { items: [], error }
+
+  const registryTarget = new Set(registryTargetsOf(resolved))
+  const cli = await cliCheckFor(resolved)
+  const items = resolved
+    .filter((entry) => isOfficialAuthority(entry, registryTarget))
+    .map((entry) => decideUpdateRow(entry, cli, undefined))
+  return { items, error: cli.error }
+}
+
+/**
+ * Compares every configured plugin against its proper authority in one call. Both phases run
+ * concurrently; this is the backwards-compatible aggregate used by tests and one-shot callers.
+ * The UI uses `registryUpdates()` + `officialUpdates()` instead so the registry result arrives
+ * without waiting for the CLI.
+ */
+export async function updates(): Promise<UpdatesResultValue> {
+  const { resolved, error } = await loadUpdateConfig()
+  if (error) return { items: [], error, checked: false, registry: registrySummary([]) }
+
+  // Force fresh registry values: a user-requested check must not be served a cached "latest".
+  const registryTargets = registryTargetsOf(resolved)
+  const lookupsTask = Promise.all(
+    registryTargets.map(async (entry) => ({ name: entry.name, lookup: await npmLatest(entry.name, true) })),
+  )
+  const cliTask = cliCheckFor(resolved)
+  const [lookups, cli] = await Promise.all([lookupsTask, cliTask])
+  const lookupByName = new Map(lookups.map((item) => [item.name, item.lookup]))
+
+  // Every row goes through the same decision function the split phases use, so the aggregate can
+  // never disagree with the independently-delivered registry / official results.
+  const items = resolved.map((entry) => decideUpdateRow(entry, cli, lookupByName.get(entry.name)))
+
+  // A CLI-side failure is reported separately: it never hides the registry rows. `checked` stays
+  // true because the registry half did run; per-row states say which half was answered.
+  return {
+    items,
+    error: "",
+    checked: true,
+    registry: registrySummary(lookups.map((item) => item.lookup)),
+    cliError: cli.error || undefined,
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Registry preference (settings area)
+// ---------------------------------------------------------------------------
+
+/** Current registry preference plus the environment override, for the settings area. */
+export function registryStatus(): RegistryStatusValue {
+  const preference = storedRegistryMode()
+  const forced = forcedBase()
+  const mode = effectiveMode()
+  const message = forced
+    ? `当前使用自定义 Registry（环境变量 OPENCODE_PLUGIN_HUB_REGISTRY），UI 中的选择暂不生效`
+    : mode === "auto"
+      ? "自动选择：优先官方 npm，不可用时切换到 npmmirror"
+      : mode === "official"
+        ? "官方 npm：只访问 registry.npmjs.org，不可用时不会自动切换"
+        : "npmmirror：只访问镜像，可能比官方源滞后"
+  return {
+    mode,
+    preference,
+    envOverridden: Boolean(forced),
+    envUrl: forced?.registry ?? "",
+    message,
+  }
+}
+
+/**
+ * Persists the user's registry choice and invalidates cached lookups so the next request uses the
+ * new mode immediately. An environment override still wins; the UI keeps the stored preference.
+ */
+export async function changeRegistryMode(mode: unknown): Promise<RegistryStatusValue> {
+  await setRegistryMode(mode)
+  // Switching source must not serve the old source's cached version, and the old probe result
+  // must be re-checked. Clear both; the next request repopulates them under the new mode.
+  versionCache.clear()
+  resetRegistryCache()
+  return registryStatus()
 }
 
 // ---------------------------------------------------------------------------

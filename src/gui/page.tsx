@@ -3,8 +3,7 @@ import type { Context, IconName, IpcClient } from "@opencode/plugin/gui"
 import type { Admin } from "../contract"
 import { countTitle, countWithUnit, formatCount } from "./download-format"
 import { explainMutation, type Tone } from "./feedback"
-import { buildAttentionItems, type InstalledFilter } from "./attention"
-import { classifyState, severityOf, type RowState } from "./status-view"
+import { classifyState, severityOf, type InstalledFilter, type RowState } from "./status-view"
 import { shouldLockEvent } from "./dialog-lock"
 import { readableErrorText } from "./error-view"
 import {
@@ -54,6 +53,13 @@ const PAGE = 24
 
 const CATALOG_SOURCE_FALLBACK = "https://github.com/awesome-opencode/awesome-opencode"
 const CATALOG_SOURCE_TITLE = "精选目录来自 awesome-opencode 社区维护的 registry.json，不是 OpenCode 官方推荐"
+
+function registryModeLabel(mode: string): string {
+  if (mode === "official") return "官方 npm"
+  if (mode === "mirror") return "npmmirror"
+  if (mode === "custom") return "自定义"
+  return "自动选择"
+}
 
 const TYPE_LABEL: Record<string, string> = {
   plugins: "插件",
@@ -690,6 +696,32 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
 
   const [updates, setUpdates] = createSignal<Map<string, UpdateInfo>>(new Map())
   const [checked, setChecked] = createSignal(false)
+  /** Registry provenance from the last update check, shown below the filter bar. */
+  const [updateRegistry, setUpdateRegistry] = createSignal<Awaited<ReturnType<AdminClient["updates"]>>["registry"]>()
+  /** Last manual check summary: counts + source, so the result is explicit rather than "done". */
+  const [checkSummary, setCheckSummary] = createSignal<string>("")
+  /** Persisted registry preference + env override, shown in the installed-page settings row. */
+  const [registryStatus, setRegistryStatus] = createSignal<Awaited<ReturnType<AdminClient["registryStatus"]>>>()
+
+  const loadRegistryStatus = async () => {
+    try {
+      setRegistryStatus(await props.admin.registryStatus())
+    } catch {
+      // Older service builds have no registry methods: keep the row hidden rather than guessing.
+    }
+  }
+
+  const chooseRegistryMode = async (mode: "auto" | "official" | "mirror") => {
+    try {
+      const status = await props.admin.setRegistryMode({ mode })
+      setRegistryStatus(status)
+      // 切换源后旧检查结果作废，立即按新模式重新检查（手动，给出反馈）。
+      setCheckSummary("")
+      void checkUpdates(false)
+    } catch (error) {
+      notify(readableError(error), "error")
+    }
+  }
   const [installedQuery, setInstalledQuery] = createSignal("")
   const [installedFilter, setInstalledFilter] = createSignal<InstalledFilter>("all")
   // 运行事实（服务端已加载/失败/未知），与“已在配置中”分开表达。
@@ -786,36 +818,88 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
     }
   }
 
-  /** Fills the update map: keyed by config spec, so directory plugins match their own row. */
+  /**
+   * 更新检查分两阶段、分别交付，互不等待：
+   * 1) registry 阶段只查 npm registry，自身与精确锁定行的更新在这里定案，拿到后立即显示；
+   * 2) official 阶段跑 plugin list/check，完成后只回填 CLI 权威的普通插件行。
+   * CLI 慢、超时、失败都不影响已经显示的 registry 结果，也不把它伪装成“全部最新”。
+   */
   const checkUpdates = async (silent = false) => {
+    // ---- 阶段 1：registry ----
     await track("updates", async () => {
+      if (!silent) notify("检查中……", "info")
       try {
-        const result = await props.admin.updates()
+        const result = await props.admin.registryUpdates()
         const map = new Map<string, UpdateInfo>()
         for (const item of result.items) map.set(item.spec, item)
         setUpdates(map)
-        // 整体失败时 items 为空：这不是“检查完成、全部最新”，不能标记为已检查。
-        setChecked(result.error === "" && result.items.length > 0)
-        if (silent) return
+        setUpdateRegistry(result.registry)
         const stale = result.items.filter((item) => item.hasUpdate).length
         const failed = result.items.filter((item) => item.official === "failed").length
-        const skipped = result.items.filter((item) => item.official === "skipped").length
-        // 官方命令跳过本地插件和精确锁定版本：这是设计行为，要说明原因而不是报错。
-        const message = result.error
-          ? `${result.error}${result.raw ? `（${result.raw}）` : ""}`
-          : failed > 0
-            ? `${failed} 个插件官方检查失败${stale > 0 ? `，${stale} 个可更新` : ""}`
-            : stale > 0
-              ? `官方检查发现 ${stale} 个可更新的插件${skipped > 0 ? `（${skipped} 个按规则跳过）` : ""}`
-              : skipped > 0
-                ? `官方检查：没有可更新的插件（${skipped} 个被跳过，见每行原因）`
-                : "官方检查：已检查的插件均为最新版本"
-        notify(
-          message,
-          result.error ? "error" : failed > 0 ? "warning" : stale > 0 ? "info" : "success",
+        const reg = result.registry
+        const source = reg?.registryUsed
+          ? `${reg.mode === "custom" ? "自定义源" : reg.mode === "mirror" ? "npmmirror" : reg.mode === "official" ? "官方 npm" : reg.mode}（${reg.registryUsed}）`
+          : "无可用源"
+        const switchNote = reg?.fallbackUsed ? `，已自动切换：${reg.message}` : ""
+        setChecked(result.error === "" && result.items.length > 0)
+        setCheckSummary(
+          `检查中：${stale} 个可更新，${failed} 个版本查询失败，官方检查进行中，来源 ${source}${switchNote}`,
         )
+        if (silent) return
+        // 自身一有结果就告知用户，不等官方 CLI。
+        if (result.error || reg?.error) {
+          notify(`版本查询失败：${result.error || reg?.error}`, "error")
+        } else {
+          notify(
+            `Registry 检查完成：${stale} 个可更新，来源 ${source}${switchNote}；官方检查进行中`,
+            stale > 0 ? "info" : "success",
+          )
+        }
       } catch (error) {
         if (!silent) notify(readableError(error), "error")
+      }
+    })
+
+    // ---- 阶段 2：官方 CLI（独立，慢或失败都不动阶段 1 的结果）----
+    await track("updates:official", async () => {
+      try {
+        const result = await props.admin.officialUpdates()
+        if (result.items.length > 0) {
+          setUpdates((prev) => {
+            const merged = new Map(prev)
+            for (const item of result.items) {
+              const existing = merged.get(item.spec)
+              // Registry 已定案的自身 / 精确锁定行，官方结果不得覆盖。
+              if (existing?.selfUpdate || existing?.pinnedRegistryUpdate) continue
+              merged.set(item.spec, item)
+            }
+            return merged
+          })
+        }
+        const items = [...updates().values()]
+        const stale = items.filter((item) => item.hasUpdate).length
+        const failed = items.filter((item) => item.official === "failed").length
+        const unknown = items.filter((item) => item.official === "unknown").length
+        const current = items.filter((item) => item.official === "current").length
+        const reg = updateRegistry()
+        const source = reg?.registryUsed
+          ? `${reg.mode === "custom" ? "自定义源" : reg.mode === "mirror" ? "npmmirror" : reg.mode === "official" ? "官方 npm" : reg.mode}（${reg.registryUsed}）`
+          : "无可用源"
+        const switchNote = reg?.fallbackUsed ? `，已自动切换：${reg.message}` : ""
+        const summary = `检查完成：${stale} 个可更新，${current} 个已是最新，${failed + unknown} 个检查失败，来源 ${source}${switchNote}`
+        setCheckSummary(summary)
+        if (silent) return
+        notify(
+          result.error
+            ? `官方检查未完成：${result.error}（registry 结果仍有效）`
+            : failed + unknown > 0
+              ? `${summary}`
+              : summary,
+          result.error ? "warning" : failed + unknown > 0 ? "warning" : stale > 0 ? "info" : "success",
+        )
+      } catch (error) {
+        // CLI 阶段异常绝不撤销已显示的 registry 结果；静默检查时不打扰用户。
+        if (!silent) notify(`官方检查失败：${readableError(error)}（registry 结果仍有效）`, "warning")
       }
     })
   }
@@ -969,6 +1053,13 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
       }
     })
   }
+
+  /**
+   * 精确锁定插件的升级复用 install(name, version)：官方 `plugin update` 会跳过精确版本，
+   * 而 installLocked 对已配置条目走 preparePackage（隔离目录装好并校验）→ switchEntry（一次性
+   * 改配置、保留 options）→ reload → 重新读取运行事实，正是需要的安全流程。按钮写明目标
+   * 版本即确认，progress 语义为“安装指定版本”，不绕过任何现有机制。
+   */
 
   /** 更新走官方 `opencode plugin update <target>`，不走“再装一次”。 */
   const updatePlugin = async (spec: string, name: string) => {
@@ -1159,10 +1250,6 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
 
   const registryUrl = () => meta()?.registry || CATALOG_SOURCE_FALLBACK
   const outdated = createMemo(() => [...updates().values()].filter((item) => item.hasUpdate).length)
-  // 未能检查的条目数：官方检查失败或结果无法识别，都不能被总结成“已是最新”。
-  const uncheckedCount = createMemo(
-    () => [...updates().values()].filter((item) => item.official === "failed" || item.official === "unknown").length,
-  )
 
   /** 运行事实：已加载 / 加载失败 / 已暂停 / 待加载 / 未验证 / 配置规则。判定逻辑见 status-view 纯函数。 */
   const runtimeState = (entry: PluginEntry): RowState =>
@@ -1187,16 +1274,6 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
     pending: pendingRuntimeCount(),
     unknown: unknownCount(),
   }))
-  /** 各状态计数；全部来自已存在的派生值，统计口径唯一、不被搜索/筛选污染。 */
-  const attentionItems = createMemo(() =>
-    buildAttentionItems({
-      failed: failedCount(),
-      pending: pendingRuntimeCount(),
-      update: outdated(),
-      paused: pausedCount(),
-      unknown: unknownCount(),
-    }),
-  )
   /** 问题项排前面：加载失败 → 待加载 → 可更新 → 未验证 → 已暂停 → 正常 → 配置规则，同级保持配置顺序。 */
   const severity = (entry: PluginEntry): number =>
     severityOf(runtimeState(entry), updates().get(entry.spec)?.hasUpdate === true)
@@ -1244,6 +1321,7 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
     void loadCatalog(false)
     void checkUpdates(true)
     void loadRuntime()
+    void loadRegistryStatus()
   })
 
   const tabButton = (id: Tab, label: string, icon: IconName, count?: number | string, alert?: number) => (
@@ -1675,8 +1753,8 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
                 跳过更新
               </span>
             </Show>
-            <Show when={packageLike() && info()?.pinned && !stale()}>
-              <span class="ph-badge" title="配置写的是精确版本，官方更新会跳过它">
+            <Show when={packageLike() && info()?.pinned}>
+              <span class="ph-badge" title="配置写的是精确版本；升级需要你确认后才会切换，并继续保留精确锁定">
                 精确锁定
               </span>
             </Show>
@@ -1703,6 +1781,16 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
               升级将把插件中心配置版本从当前精确锁定版本切换到 v{info()!.latest}，并经过安全自升级校验。
             </div>
           </Show>
+          {/* 精确锁定普通插件：显示目标版本、来源与"升级需确认"的说明。 */}
+          <Show when={info()?.pinnedRegistryUpdate && stale()}>
+            <div
+              class="ph-self-update-hint"
+              title={info()!.registryMessage || "目标版本来自 npm registry，升级需要在隔离目录准备好并校验后才会切换配置"}
+            >
+              精确锁定 {current()}，registry 发现稳定版 v{info()!.latest}（{info()!.registryMessage || "官方源"}）。
+              点「升级到 v{info()!.latest}」后先在隔离目录装好并校验，再切换配置，仍保持精确锁定；失败则保留当前版本。
+            </div>
+          </Show>
         </div>
         <div class="ph-actions">
           <div class="ph-actions-left">
@@ -1718,7 +1806,18 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
             </Show>
           </div>
           <div class="ph-actions-right">
-            <Show when={stale()}>
+            <Show when={stale() && info()?.pinnedRegistryUpdate}>
+              <ui.Button
+                variant="neutral"
+                size="small"
+                icon="download"
+                busy={busy()}
+                onClick={() => void install(entry.name, info()!.latest)}
+              >
+                升级到 v{info()!.latest}
+              </ui.Button>
+            </Show>
+            <Show when={stale() && !info()?.pinnedRegistryUpdate}>
               <ui.Button
                 variant="neutral"
                 size="small"
@@ -1768,16 +1867,24 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
     )
   }
 
+  // 若当前选中的状态因数量归零而即将隐藏，自动回到「全部」，避免停在一个看不见的筛选上。
+  createEffect(() => {
+    const current = installedFilter()
+    if (current !== "all" && filterCounts()[current] === 0) setInstalledFilter("all")
+  })
+
   const installedFilterButton = (id: InstalledFilter, label: string) => (
-    <button
-      class="ph-chip"
-      data-active={installedFilter() === id}
-      title={`${label}：${filterCounts()[id]} 个`}
-      onClick={() => setInstalledFilter(id)}
-    >
-      {label}
-      <span class="ph-chip-count">{filterCounts()[id]}</span>
-    </button>
+    <Show when={id === "all" || filterCounts()[id] > 0}>
+      <button
+        class="ph-chip"
+        data-active={installedFilter() === id}
+        title={`${label}：${filterCounts()[id]} 个`}
+        onClick={() => setInstalledFilter(id)}
+      >
+        {label}
+        <span class="ph-chip-count">{filterCounts()[id]}</span>
+      </button>
+    </Show>
   )
 
   return (
@@ -2203,30 +2310,6 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
 
         <Match when={tab() === "installed"}>
           <section class="ph-panel" role="tabpanel" id="ph-tabpanel" aria-labelledby={`ph-tab-${tab()}`}>
-            <Show when={attentionItems().length > 0}>
-              <div class="ph-attention">
-                <span class="ph-attention-lead">
-                  <ui.Icon name="circle-exclamation" size="small" />
-                  需要关注
-                </span>
-                <div class="ph-attention-items">
-                  <For each={attentionItems()}>
-                    {(item) => (
-                      <button
-                        class="ph-attention-chip"
-                        data-tone={item.tone}
-                        data-active={installedFilter() === item.id}
-                        onClick={() => setInstalledFilter(item.id)}
-                      >
-                        {item.label} {item.count}
-                      </button>
-                    )}
-                  </For>
-                </div>
-                <span class="ph-attention-hint">点击按状态筛选</span>
-              </div>
-            </Show>
-
             <div class="ph-installed-bar">
               <div class="ph-installed-search">
                 <ui.TextInput
@@ -2258,23 +2341,74 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
               </Show>
             </div>
 
+            {/* Registry 设置：沿用现有筛选 chip 的命中区，不加独立按钮或提示层。 */}
+            <Show when={registryStatus()}>
+              {(status) => (
+                <div class="ph-registry-settings">
+                  <span class="ph-registry-settings-label">更新来源</span>
+                  <div class="ph-chips">
+                    <button
+                      class="ph-chip"
+                      data-active={status().preference === "auto"}
+                      onClick={() => void chooseRegistryMode("auto")}
+                    >
+                      自动选择
+                    </button>
+                    <button
+                      class="ph-chip"
+                      data-active={status().preference === "official"}
+                      onClick={() => void chooseRegistryMode("official")}
+                    >
+                      官方 npm
+                    </button>
+                    <button
+                      class="ph-chip"
+                      data-active={status().preference === "mirror"}
+                      onClick={() => void chooseRegistryMode("mirror")}
+                    >
+                      npmmirror
+                    </button>
+                  </div>
+                  <span
+                    class="ph-registry-settings-note"
+                    data-env={status().envOverridden ? "true" : undefined}
+                    title={status().message}
+                  >
+                    {status().envOverridden
+                      ? `当前使用自定义 Registry（${status().envUrl}）；UI 中的选择暂不生效`
+                      : `当前模式：${registryModeLabel(status().mode)}`}
+                  </span>
+                </div>
+              )}
+            </Show>
+
             <div class="ph-resultline">
               <span>
                 显示 <strong>{visiblePlugins().length}</strong> / {state()?.plugins.length ?? 0} 个
               </span>
-              <Show when={checked()}>
-                <span>
-                  ·{" "}
-                  {uncheckedCount() > 0
-                    ? `已检查 ${Math.max(0, (state()?.plugins.length ?? 0) - uncheckedCount())} 个，${uncheckedCount()} 个未能检查${outdated() > 0 ? `，${outdated()} 个可更新` : ""}`
-                    : outdated() > 0
-                      ? `检查过 npm registry，${outdated()} 个可更新`
-                      : "检查过 npm registry，已检查的插件均为最新"}
-                </span>
+              <Show when={checkSummary()}>
+                <span class="ph-check-summary" title={checkSummary()}>{checkSummary()}</span>
               </Show>
               <span class="ph-spacer" />
               <span title="同级条目保持配置里的原始顺序">按严重程度排序</span>
             </div>
+            {/* Registry 来源状态：常驻于已安装页，说明结果从哪里来、是否发生切换、失败原因。 */}
+            <Show when={checked() && updateRegistry()}>
+              <div
+                class="ph-registry-line"
+                data-fallback={updateRegistry()!.fallbackUsed ? "true" : undefined}
+                data-failed={updateRegistry()!.error ? "true" : undefined}
+                title={updateRegistry()!.error || updateRegistry()!.message}
+              >
+                <span class="ph-registry-dot" />
+                <span>
+                  Registry：{registryModeLabel(updateRegistry()!.mode)}
+                  {updateRegistry()!.registryUsed ? ` · 当前使用 ${updateRegistry()!.registryUsed}` : ""}
+                  {updateRegistry()!.fallbackUsed ? ` · ${updateRegistry()!.message}` : ""}
+                  {updateRegistry()!.error ? ` · ${updateRegistry()!.error}` : ""}
+                </span>
+              </div>
+            </Show>
 
             <Show
               when={(state()?.plugins.length ?? 0) > 0}

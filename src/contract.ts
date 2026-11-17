@@ -129,6 +129,10 @@ export const UpdateInfo = Schema.Struct({
   pinned: Schema.optional(Schema.Boolean),
   /** True for the plugin-center row: its update target comes from the registry, not `plugin check`. */
   selfUpdate: Schema.optional(Schema.Boolean),
+  /** True when a pinned npm package's update was discovered by the registry and needs confirmation. */
+  pinnedRegistryUpdate: Schema.optional(Schema.Boolean),
+  /** Short note naming the registry source of this row's version, when supplied. */
+  registryMessage: Schema.optional(Schema.String),
   /** One-line summary from the package manifest; empty when it cannot be read. */
   description: Schema.optional(Schema.String),
   /** SPDX license from the package manifest; empty when unknown. */
@@ -140,6 +144,16 @@ export const UpdateInfo = Schema.Struct({
   error: Schema.String,
 })
 
+/** Registry source and automatic-switch status for one update check. */
+export const UpdateRegistry = Schema.Struct({
+  mode: Schema.String,
+  /** Source that answered; empty when no lookup succeeded. */
+  registryUsed: Schema.String,
+  fallbackUsed: Schema.Boolean,
+  message: Schema.String,
+  error: Schema.String,
+})
+
 export const UpdatesResult = Schema.Struct({
   items: Schema.Array(UpdateInfo),
   error: Schema.String,
@@ -147,6 +161,26 @@ export const UpdatesResult = Schema.Struct({
   checked: Schema.optional(Schema.Boolean),
   /** The CLI's own words when the whole check failed. */
   raw: Schema.optional(Schema.String),
+  /** Registry provenance; optional so an older service build still decodes. */
+  registry: Schema.optional(UpdateRegistry),
+  /** Status of the official-CLI half (no CLI / timeout / failed). */
+  cliError: Schema.optional(Schema.String),
+  /**
+   * True on the registry-only phase: it never ran the official CLI, so rows whose authority is
+   * `plugin check` are placeholders. The UI keeps its own view and waits for `OfficialUpdatesResult`.
+   */
+  registryOnly: Schema.optional(Schema.Boolean),
+})
+
+/**
+ * The official-CLI half, returned independently so it can arrive after `registryUpdates()`.
+ * Rows are keyed by spec; the UI merges only the rows whose authority is the official check and
+ * never overwrites a registry-decided row.
+ */
+export const OfficialUpdatesResult = Schema.Struct({
+  items: Schema.Array(UpdateInfo),
+  /** CLI failure/timeout/no-CLI; empty when it ran cleanly. Never a reason to lose registry rows. */
+  error: Schema.String,
 })
 
 export const SearchResult = Schema.Struct({
@@ -234,6 +268,15 @@ export const Mutation = Schema.Struct({
   stages: Schema.optional(MutationStages),
 })
 
+/** Registry preference shown in the settings area. */
+export const RegistryStatus = Schema.Struct({
+  mode: Schema.String,
+  preference: Schema.String,
+  envOverridden: Schema.Boolean,
+  envUrl: Schema.String,
+  message: Schema.String,
+})
+
 /** One configured plugin's runtime truth as the running server reports it. */
 export const RuntimeInfo = Schema.Struct({
   spec: Schema.String,
@@ -301,6 +344,12 @@ export const Admin = Ipc.define({
   methods: {
     snapshot: { output: HubState },
     updates: { output: UpdatesResult },
+    /** Registry-only phase: self + pinned rows decided, no CLI involved. Delivered first by the UI. */
+    registryUpdates: { output: UpdatesResult },
+    /** Official CLI phase: ordinary plugin rows decided by `plugin check`. Delivered independently. */
+    officialUpdates: { output: OfficialUpdatesResult },
+    registryStatus: { output: RegistryStatus },
+    setRegistryMode: { input: Schema.Struct({ mode: Schema.String }), output: RegistryStatus },
     search: { input: Query, output: SearchResult },
     detail: { input: DetailQuery, output: PackageDetail },
     browse: { input: Browse, output: CatalogResult },

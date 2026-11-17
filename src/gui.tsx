@@ -62,6 +62,10 @@ export default Plugin.define({
     ctx.provide(Admin, {
       snapshot: () => admin.snapshot(),
       updates: () => admin.updates(),
+      registryUpdates: () => admin.registryUpdates(),
+      officialUpdates: () => admin.officialUpdates(),
+      registryStatus: () => admin.registryStatus(),
+      setRegistryMode: (input) => admin.changeRegistryMode(input.mode),
       search: (input) => admin.search(input.query),
       // The catalog marks entries that are already configured, so it needs the current list first.
       browse: async (input) => {

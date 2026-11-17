@@ -304,6 +304,29 @@ export const CSS = `
   color: var(--ph-faint);
 }
 .ph-resultline strong { color: var(--ph-muted); font-weight: 600; }
+.ph-check-summary { color: var(--ph-muted); }
+.ph-registry-line {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin: 4px 0 2px;
+  font-size: 10.5px;
+  color: var(--ph-faint);
+}
+.ph-registry-dot { flex: 0 0 auto; width: 6px; height: 6px; border-radius: 50%; background: var(--ph-ok, var(--ph-accent)); opacity: 0.85; }
+.ph-registry-line[data-fallback="true"] .ph-registry-dot { background: var(--ph-warning); }
+.ph-registry-line[data-failed="true"] .ph-registry-dot { background: var(--ph-danger); }
+.ph-registry-line[data-failed="true"] { color: var(--ph-danger); }
+.ph-registry-settings {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin: 0 0 6px;
+}
+.ph-registry-settings-label { font-size: 10.5px; font-weight: 600; color: var(--ph-muted); }
+.ph-registry-settings-note { font-size: 10px; color: var(--ph-faint); }
+.ph-registry-settings-note[data-env="true"] { color: var(--ph-warning); }
 .ph-clear {
   padding: 0;
   border: 0;
@@ -350,50 +373,6 @@ export const CSS = `
 .ph-installed-bar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .ph-installed-search { flex: 0 1 300px; min-width: 180px; }
 .ph-installed-bar .ph-chips { flex: 1 1 auto; }
-
-/* 需要关注的摘要：只在确有异常项时出现，点击直接筛到对应状态。 */
-.ph-attention {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  flex-wrap: wrap;
-  min-height: 24px;
-}
-.ph-attention-lead {
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
-  flex: 0 0 auto;
-  font-size: 10.5px;
-  font-weight: 600;
-  color: var(--ph-muted);
-}
-.ph-attention-items { display: flex; align-items: center; gap: 4px; flex-wrap: wrap; }
-.ph-attention-chip {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  height: 22px;
-  padding: 0 7px;
-  border: 1px solid color-mix(in srgb, currentColor 22%, transparent);
-  border-radius: 5px;
-  background: color-mix(in srgb, currentColor 7%, transparent);
-  color: var(--ph-muted);
-  font-family: inherit;
-  font-size: 10px;
-  font-weight: 600;
-  cursor: pointer;
-}
-.ph-attention-chip:hover { border-color: color-mix(in srgb, currentColor 38%, transparent); color: var(--ph-strong); }
-.ph-attention-chip[data-tone="danger"] { color: var(--ph-danger); }
-.ph-attention-chip[data-tone="warning"] { color: var(--ph-warning); }
-.ph-attention-chip[data-tone="accent"] { color: var(--ph-accent); }
-/* 当前选中的筛选：摘要项与列表筛选项套同一套 active 反馈，剪/切语义一致。 */
-.ph-attention-chip[data-active="true"] {
-  border-color: color-mix(in srgb, currentColor 40%, transparent);
-  background: color-mix(in srgb, currentColor 14%, transparent);
-}
-.ph-attention-hint { margin-left: auto; font-size: 10px; color: var(--ph-faint); }
 
 /* ---------- 卡片 ---------- */
 .ph-list {
@@ -893,7 +872,6 @@ button.ph-chip[data-active="true"] {
 .ph-tab:focus-visible,
 .ph-sort button:focus-visible,
 button.ph-chip:focus-visible,
-button.ph-attention-chip:focus-visible,
 .ph-inline-source:focus-visible,
 .ph-clear:focus-visible,
 .ph-pending .ph-link:focus-visible,
@@ -948,7 +926,6 @@ button.ph-attention-chip:focus-visible,
 @container ph-root (max-width: 700px) {
   .ph-path { max-width: none; flex-basis: 100%; }
   .ph-toolbar-action { margin-left: 0; }
-  .ph-attention-hint { display: none; }
 }
 @container ph-root (max-width: 520px) {
   .ph-list { grid-template-columns: 1fr; }

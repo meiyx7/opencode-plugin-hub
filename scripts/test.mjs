@@ -12,6 +12,7 @@ import { build } from "esbuild"
 const root = join(dirname(fileURLToPath(import.meta.url)), "..")
 const outDir = join(root, "node_modules", ".cache", "plugin-hub-tests")
 const entries = [
+  "registry.test.ts",
   "downloads.test.ts",
   "self-update.test.ts",
   "rules.test.ts",
@@ -20,8 +21,10 @@ const entries = [
   "lifecycle-safety.test.ts",
   "config-safety.test.ts",
   "feedback.test.ts",
-  "attention.test.ts",
   "self-update-detection.test.ts",
+  "update-decoupling.test.ts",
+  "update-decoupling-timing.test.ts",
+  "update-ui.test.ts",
   "progress-view.test.ts",
   "install-progress.test.ts",
   "detail-close.test.ts",
