@@ -92,33 +92,35 @@ after(() => {
   }
 })
 
-test("T1. CLI 挂起时 registry 结果先行交付：registry 阶段零 CLI 调用，且 CLI 此刻未 settle", async () => {
-  // CLI 的 list 与 check 都挂起，1500ms 后才由 hub 超时结束；不设更短超时来伪造速度。
+test("T1. registry 阶段零 CLI 调用，且自身结果先于挂起的 CLI 交付", async () => {
+  // 证据 1（串行、确定性）：单独调用 registryUpdates，此刻没有任何并发 CLI 进程，
+  // 日志必为空——这才是"registry 阶段不调用 opencode"的可靠证明。
+  // 不在并发场景下断言日志为空：officialUpdates 本身必然写日志，两者并发时断言会变成竞态。
+  const solo = await admin.registryUpdates()
+  const soloSelf = selfRow(solo.items)!
+  assert.equal(soloSelf.selfUpdate, true)
+  assert.equal(soloSelf.hasUpdate, true, "registry 发现新版本，应立即可见")
+  assert.equal(soloSelf.latest, NEWER)
+  assert.equal(solo.registryOnly, true)
+  assert.deepEqual(cliCalls(), [], "单独调用 registryUpdates 不应调用 plugin list/check")
+
+  // 证据 2（时序）：CLI 的 list 与 check 都挂起，1500ms 后才由 hub 超时结束；不设更短超时伪造速度。
+  // 并发发起时，registry 结果已交付，而 CLI 阶段此刻仍未 settle。
   process.env.FAKE_CLI_HANG = "list,check"
   process.env.OPENCODE_PLUGIN_HUB_CLI_TIMEOUT_MS = "1500"
-
   let cliSettled = false
   const cliPromise = admin.officialUpdates().then((value) => {
     cliSettled = true
     return value
   })
-
   const start = Date.now()
   const reg = await admin.registryUpdates()
   const elapsed = Date.now() - start
-
-  // 证据 1：自身更新结果已经交付，且不等挂起的 CLI。
   const self = selfRow(reg.items)!
-  assert.equal(self.selfUpdate, true)
-  assert.equal(self.hasUpdate, true, "registry 发现新版本，应立即可见")
+  assert.equal(self.hasUpdate, true)
   assert.equal(self.latest, NEWER)
-  assert.equal(reg.registryOnly, true)
   assert.ok(elapsed < 1000, `registry 应远早于 1500ms 的 CLI 超时返回，实际 ${elapsed}ms`)
-
-  // 证据 2：registry 阶段返回时，CLI 阶段尚未完成——结果确实先于 CLI 独立交付。
   assert.equal(cliSettled, false, "registry 结果返回时 CLI 阶段不应已 settle")
-  // 证据 3：registry 阶段本身没有触发任何 opencode 命令（与超时无关的解耦证明）。
-  assert.deepEqual(cliCalls(), [], "registryUpdates 不应调用 plugin list/check")
 
   // 收尾：等 CLI 超时结束，避免挂起子进程残留。
   const cli = await cliPromise
@@ -135,8 +137,9 @@ test("T2. plugin list 延迟不影响自身更新结果", async () => {
   const reg = await admin.registryUpdates()
 
   assert.equal(selfRow(reg.items)!.hasUpdate, true, "list 挂起不影响自身更新")
+  assert.equal(selfRow(reg.items)!.latest, NEWER)
   assert.equal(cliSettled, false, "registry 结果先于 list 完成")
-  assert.deepEqual(cliCalls(), [], "registry 阶段未触发 list")
+  // 日志断言放在 T1 的串行场景；此处并发着 officialUpdates（必然写日志），不检查日志。
   await cliPromise
 })
 
@@ -149,8 +152,9 @@ test("T3. plugin check 延迟不影响自身更新结果", async () => {
   const reg = await admin.registryUpdates()
 
   assert.equal(selfRow(reg.items)!.hasUpdate, true, "check 挂起不影响自身更新")
+  assert.equal(selfRow(reg.items)!.latest, NEWER)
   assert.equal(cliSettled, false, "registry 结果先于 check 完成")
-  assert.deepEqual(cliCalls(), [], "registry 阶段未触发 check")
+  // 日志断言放在 T1 的串行场景；此处并发着 officialUpdates（必然写日志），不检查日志。
   await cliPromise
 })
 
