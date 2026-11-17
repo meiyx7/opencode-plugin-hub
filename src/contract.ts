@@ -165,6 +165,22 @@ export const UpdatesResult = Schema.Struct({
   registry: Schema.optional(UpdateRegistry),
   /** Status of the official-CLI half (no CLI / timeout / failed). */
   cliError: Schema.optional(Schema.String),
+  /**
+   * True on the registry-only phase: it never ran the official CLI, so rows whose authority is
+   * `plugin check` are placeholders. The UI keeps its own view and waits for `OfficialUpdatesResult`.
+   */
+  registryOnly: Schema.optional(Schema.Boolean),
+})
+
+/**
+ * The official-CLI half, returned independently so it can arrive after `registryUpdates()`.
+ * Rows are keyed by spec; the UI merges only the rows whose authority is the official check and
+ * never overwrites a registry-decided row.
+ */
+export const OfficialUpdatesResult = Schema.Struct({
+  items: Schema.Array(UpdateInfo),
+  /** CLI failure/timeout/no-CLI; empty when it ran cleanly. Never a reason to lose registry rows. */
+  error: Schema.String,
 })
 
 export const SearchResult = Schema.Struct({
@@ -328,6 +344,10 @@ export const Admin = Ipc.define({
   methods: {
     snapshot: { output: HubState },
     updates: { output: UpdatesResult },
+    /** Registry-only phase: self + pinned rows decided, no CLI involved. Delivered first by the UI. */
+    registryUpdates: { output: UpdatesResult },
+    /** Official CLI phase: ordinary plugin rows decided by `plugin check`. Delivered independently. */
+    officialUpdates: { output: OfficialUpdatesResult },
     registryStatus: { output: RegistryStatus },
     setRegistryMode: { input: Schema.Struct({ mode: Schema.String }), output: RegistryStatus },
     search: { input: Query, output: SearchResult },

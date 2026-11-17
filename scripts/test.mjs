@@ -23,6 +23,7 @@ const entries = [
   "feedback.test.ts",
   "self-update-detection.test.ts",
   "update-decoupling.test.ts",
+  "update-decoupling-timing.test.ts",
   "update-ui.test.ts",
   "progress-view.test.ts",
   "install-progress.test.ts",

@@ -17,6 +17,18 @@ test("U1. 手动检查开始即显示「检查中」，完成后给出分类计�
   assert.match(PAGE, /检查完成：\$\{stale\} 个可更新，\$\{current\} 个已是最新，\$\{failed \+ unknown\} 个检查失败/, "结果应给出四类计数")
 })
 
+test("U10. 更新检查分两阶段独立调用，registry 先行、official 独立回填且不覆盖", () => {
+  assert.match(PAGE, /props\.admin\.registryUpdates\(\)/, "阶段 1 只调 registryUpdates，不依赖 CLI")
+  assert.match(PAGE, /props\.admin\.officialUpdates\(\)/, "阶段 2 独立调用 officialUpdates")
+  assert.match(PAGE, /await track\("updates",[\s\S]{0,400}registryUpdates\(\)/, "registry 阶段单独 track")
+  assert.match(PAGE, /await track\("updates:official",/, "official 阶段用独立 track 键，不卡住 registry 结果")
+  assert.match(
+    PAGE,
+    /if \(existing\?\.selfUpdate \|\| existing\?\.pinnedRegistryUpdate\) continue/,
+    "官方结果不得覆盖 registry 已定案的自身/精确锁定行",
+  )
+})
+
 test("U2. 结果展示 Registry 实际来源与自动切换原因", () => {
   assert.match(PAGE, /当前使用 \$\{updateRegistry\(\)!\.registryUsed\}/, "应显示实际使用源")
   assert.match(PAGE, /已自动切换：\$\{reg\.message\}/, "应显示切换原因")
@@ -24,9 +36,9 @@ test("U2. 结果展示 Registry 实际来源与自动切换原因", () => {
 })
 
 test("U3. 检查失败不伪装成无更新：失败原因单独呈现", () => {
-  assert.match(PAGE, /版本查询失败：\$\{result\.registry\.error\}/, "registry 失败应显示真实错误")
+  assert.match(PAGE, /版本查询失败：\$\{result\.error \|\| reg\?\.error\}/, "registry 失败应显示真实错误")
   assert.match(PAGE, /data-failed=\{updateRegistry\(\)!\.error/, "失败状态有可见标记")
-  assert.doesNotMatch(PAGE, /result\.registry\?\.error[\s\S]{0,40}已是最新/, "不得把失败说成最新")
+  assert.doesNotMatch(PAGE, /result\.error[\s\S]{0,40}已是最新/, "不得把失败说成最新")
 })
 
 test("U4. Registry 设置区域提供 auto/official/mirror 三选项与环境变量提示", () => {

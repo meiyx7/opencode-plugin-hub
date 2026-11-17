@@ -818,45 +818,88 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
     }
   }
 
-  /** Fills the update map: keyed by config spec, so directory plugins match their own row. */
+  /**
+   * 更新检查分两阶段、分别交付，互不等待：
+   * 1) registry 阶段只查 npm registry，自身与精确锁定行的更新在这里定案，拿到后立即显示；
+   * 2) official 阶段跑 plugin list/check，完成后只回填 CLI 权威的普通插件行。
+   * CLI 慢、超时、失败都不影响已经显示的 registry 结果，也不把它伪装成“全部最新”。
+   */
   const checkUpdates = async (silent = false) => {
+    // ---- 阶段 1：registry ----
     await track("updates", async () => {
-      // 立即反馈：手动点击时先显示“检查中”，不让用户面对一个没有反应的按钮。
       if (!silent) notify("检查中……", "info")
       try {
-        const result = await props.admin.updates()
+        const result = await props.admin.registryUpdates()
         const map = new Map<string, UpdateInfo>()
         for (const item of result.items) map.set(item.spec, item)
         setUpdates(map)
         setUpdateRegistry(result.registry)
-        // 整体失败时 items 为空：这不是“检查完成、全部最新”，不能标记为已检查。
-        setChecked(result.error === "" && result.items.length > 0)
         const stale = result.items.filter((item) => item.hasUpdate).length
         const failed = result.items.filter((item) => item.official === "failed").length
-        const unknown = result.items.filter((item) => item.official === "unknown").length
-        const current = result.items.filter((item) => item.official === "current").length
         const reg = result.registry
         const source = reg?.registryUsed
           ? `${reg.mode === "custom" ? "自定义源" : reg.mode === "mirror" ? "npmmirror" : reg.mode === "official" ? "官方 npm" : reg.mode}（${reg.registryUsed}）`
           : "无可用源"
         const switchNote = reg?.fallbackUsed ? `，已自动切换：${reg.message}` : ""
-        // 摘要给出四类计数 + 来源；失败与未知不再被压成“没有可更新”。
+        setChecked(result.error === "" && result.items.length > 0)
+        setCheckSummary(
+          `检查中：${stale} 个可更新，${failed} 个版本查询失败，官方检查进行中，来源 ${source}${switchNote}`,
+        )
+        if (silent) return
+        // 自身一有结果就告知用户，不等官方 CLI。
+        if (result.error || reg?.error) {
+          notify(`版本查询失败：${result.error || reg?.error}`, "error")
+        } else {
+          notify(
+            `Registry 检查完成：${stale} 个可更新，来源 ${source}${switchNote}；官方检查进行中`,
+            stale > 0 ? "info" : "success",
+          )
+        }
+      } catch (error) {
+        if (!silent) notify(readableError(error), "error")
+      }
+    })
+
+    // ---- 阶段 2：官方 CLI（独立，慢或失败都不动阶段 1 的结果）----
+    await track("updates:official", async () => {
+      try {
+        const result = await props.admin.officialUpdates()
+        if (result.items.length > 0) {
+          setUpdates((prev) => {
+            const merged = new Map(prev)
+            for (const item of result.items) {
+              const existing = merged.get(item.spec)
+              // Registry 已定案的自身 / 精确锁定行，官方结果不得覆盖。
+              if (existing?.selfUpdate || existing?.pinnedRegistryUpdate) continue
+              merged.set(item.spec, item)
+            }
+            return merged
+          })
+        }
+        const items = [...updates().values()]
+        const stale = items.filter((item) => item.hasUpdate).length
+        const failed = items.filter((item) => item.official === "failed").length
+        const unknown = items.filter((item) => item.official === "unknown").length
+        const current = items.filter((item) => item.official === "current").length
+        const reg = updateRegistry()
+        const source = reg?.registryUsed
+          ? `${reg.mode === "custom" ? "自定义源" : reg.mode === "mirror" ? "npmmirror" : reg.mode === "official" ? "官方 npm" : reg.mode}（${reg.registryUsed}）`
+          : "无可用源"
+        const switchNote = reg?.fallbackUsed ? `，已自动切换：${reg.message}` : ""
         const summary = `检查完成：${stale} 个可更新，${current} 个已是最新，${failed + unknown} 个检查失败，来源 ${source}${switchNote}`
         setCheckSummary(summary)
         if (silent) return
-        const message = result.error
-          ? `${result.error}${result.raw ? `（${result.raw}）` : ""}`
-          : result.registry?.error
-            ? `版本查询失败：${result.registry.error}${result.cliError ? `；${result.cliError}` : ""}`
-            : failed + unknown > 0
-              ? `${summary}${result.cliError ? `；${result.cliError}` : ""}`
-              : summary
         notify(
-          message,
-          result.error || result.registry?.error ? "error" : failed + unknown > 0 ? "warning" : stale > 0 ? "info" : "success",
+          result.error
+            ? `官方检查未完成：${result.error}（registry 结果仍有效）`
+            : failed + unknown > 0
+              ? `${summary}`
+              : summary,
+          result.error ? "warning" : failed + unknown > 0 ? "warning" : stale > 0 ? "info" : "success",
         )
       } catch (error) {
-        if (!silent) notify(readableError(error), "error")
+        // CLI 阶段异常绝不撤销已显示的 registry 结果；静默检查时不打扰用户。
+        if (!silent) notify(`官方检查失败：${readableError(error)}（registry 结果仍有效）`, "warning")
       }
     })
   }
