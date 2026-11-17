@@ -92,6 +92,24 @@ test("06. 不伪造进度：无定时器推进阶段、无百分比字段", () =
   assert.match(PAGE, /import \{[\s\S]*buildProgressReport[\s\S]*\} from "\.\/progress-view"/, "未接入纯函数映射")
 })
 
+test("06b. 时间轴是真正的可视化：独立节点 + 连续连接线 + 各状态色 + 失败就地错误", () => {
+  const styles = readFileSync(join(process.cwd(), "src/gui", "styles.ts"), "utf8")
+  // 每个步骤有独立圆形节点，节点之间由 ::before 竖向连接线相连。
+  assert.match(PAGE, /class="ph-step-ico"/, "缺少独立状态节点")
+  assert.match(styles, /\.ph-step::before[\s\S]{0,160}left:/, "缺少连续竖向连接线")
+  assert.match(styles, /\.ph-step:last-child::before\s*\{\s*display:\s*none/, "最后一步不应有下延伸线")
+  // 四种状态各有明确视觉，pending / running / done / failed / skipped 均可区分。
+  for (const state of ["pending", "running", "done", "failed", "skipped"]) {
+    assert.match(styles, new RegExp(`\\.ph-step\\[data-state="${state}"\\] \\.ph-step-ico`), `${state} 节点缺少独立样式`)
+  }
+  assert.match(styles, /ph-step-error/, "失败节点没有就地错误样式")
+  // 进行中步骤的连接线用强调色，与 pending 的灰色区分开（任务状态样式表）。
+  assert.match(styles, /\.ph-step\[data-state="running"\]::before\s*\{[^}]*--ph-accent/, "running 连接线未用强调色")
+  assert.match(PAGE, /step\.state === "failed" && step\.error/, "失败节点没有渲染真实错误")
+  // 完成后保留完整时间轴：结果区渲染在步骤列表之后，不折叠成一行。
+  assert.ok(PAGE.indexOf("<ol class=\"ph-steps\">") < PAGE.indexOf("ph-progress-result"), "时间轴应保留在结果区之前")
+})
+
 test("07. 原统一出口约束仍成立：五个入口 reportMutation、唯一 explainMutation", () => {
   for (const name of ["install", "updatePlugin", "pausePlugin", "resumePlugin", "uninstall"]) {
     assert.match(bodyOf(name), /reportMutation\(result/, `${name} 没有走统一出口`)

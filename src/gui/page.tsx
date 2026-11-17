@@ -5,7 +5,7 @@ import { countTitle, countWithUnit, formatCount } from "./download-format"
 import { explainMutation, type Tone } from "./feedback"
 import { classifyState, severityOf, type InstalledFilter, type RowState } from "./status-view"
 import { shouldLockEvent } from "./dialog-lock"
-import { readableErrorText } from "./error-view"
+import { classifyError, readableErrorText } from "./error-view"
 import {
   buildProgressReport,
   runningSteps,
@@ -217,6 +217,9 @@ function ProgressBody(props: { state: ProgressState; rootRef?: (el: HTMLDivEleme
               <div class="ph-step-copy">
                 <div class="ph-step-title">{step.title}</div>
                 <div class="ph-step-desc">{step.desc}</div>
+                <Show when={step.state === "failed" && step.error}>
+                  <div class="ph-step-error">{step.error}</div>
+                </Show>
               </div>
             </li>
           )}
@@ -899,7 +902,15 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
         )
       } catch (error) {
         // CLI 阶段异常绝不撤销已显示的 registry 结果；静默检查时不打扰用户。
-        if (!silent) notify(`官方检查失败：${readableError(error)}（registry 结果仍有效）`, "warning")
+        if (silent) return
+        const kind = classifyError(error).kind
+        if (kind === "ipc-unavailable") {
+          // 官方 IPC 方法缺失是接口事实，按真实错误展示，不归咎 registry、不推断重启。
+          // 文案本身已含恢复建议（重载插件 / 重启，仅建议），registry 结果保持有效。
+          notify(readableError(error), "warning")
+        } else {
+          notify(`官方检查失败：${readableError(error)}（registry 结果仍有效）`, "warning")
+        }
       }
     })
   }

@@ -949,17 +949,24 @@ button.ph-chip:focus-visible,
 .ph-progress-name { font-size: 14px; font-weight: 650; color: var(--ph-strong); overflow-wrap: anywhere; }
 .ph-progress-flow { font-size: 10.5px; color: var(--ph-muted); }
 .ph-progress-versions { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
-.ph-steps { list-style: none; margin: 2px 0 0; padding: 0; display: flex; flex-direction: column; }
-.ph-step { position: relative; display: flex; gap: 11px; padding: 0 0 13px; }
+.ph-steps { list-style: none; margin: 4px 0 0; padding: 0; display: flex; flex-direction: column; }
+.ph-step { position: relative; display: flex; gap: 12px; padding: 0 0 15px; }
 .ph-step:last-child { padding-bottom: 0; }
+/* 连续竖向连接线：从当前节点圆心延伸到下一个节点；状态决定线的颜色与强弱。
+   节点 20px、圆心 10px；线宽 2px，左偏移 9px 使线心正好落在圆心，不靠肉眼对。 */
 .ph-step::before {
-  content: ""; position: absolute; left: 8px; top: 18px; bottom: 0; width: 1.5px; background: var(--ph-border);
+  content: ""; position: absolute; left: 9px; top: 21px; bottom: -1px; width: 2px;
+  background: var(--ph-border); border-radius: 1px;
 }
 .ph-step:last-child::before { display: none; }
-.ph-step[data-state="done"]::before { background: color-mix(in srgb, var(--ph-success) 45%, transparent); }
+.ph-step[data-state="done"]::before { background: color-mix(in srgb, var(--ph-success) 55%, transparent); }
+.ph-step[data-state="running"]::before { background: color-mix(in srgb, var(--ph-accent) 45%, transparent); }
+.ph-step[data-state="failed"]::before { background: color-mix(in srgb, var(--ph-danger) 40%, transparent); }
+.ph-step[data-state="skipped"]::before,
+.ph-step[data-state="unknown"]::before { background: color-mix(in srgb, var(--ph-border-strong) 55%, transparent); }
 .ph-step-ico {
-  position: relative; z-index: 1; flex: 0 0 auto; width: 17px; height: 17px; margin-top: 1px;
-  border-radius: 50%; display: grid; place-items: center; font-size: 9px; font-weight: 700; line-height: 1;
+  position: relative; z-index: 1; flex: 0 0 auto; width: 20px; height: 20px; margin-top: 0;
+  border-radius: 50%; display: grid; place-items: center; font-size: 10px; font-weight: 700; line-height: 1;
   background: var(--ph-base); color: transparent;
 }
 .ph-step[data-state="pending"] .ph-step-ico { border: 1.5px solid var(--ph-border-strong); }
@@ -979,6 +986,12 @@ button.ph-chip:focus-visible,
 .ph-step[data-state="running"] .ph-step-desc { color: var(--ph-accent); }
 .ph-step[data-state="failed"] .ph-step-desc { color: var(--ph-danger); }
 .ph-step[data-state="unknown"] .ph-step-desc { color: var(--ph-warning); }
+.ph-step-error {
+  margin-top: 5px; padding: 5px 7px; border-radius: var(--ph-r-sm);
+  border: 1px solid color-mix(in srgb, var(--ph-danger) 30%, transparent);
+  background: color-mix(in srgb, var(--ph-danger) 6%, var(--ph-layer));
+  font-size: 10px; line-height: 1.5; color: var(--ph-danger); overflow-wrap: anywhere;
+}
 @keyframes ph-spin { to { transform: rotate(360deg); } }
 .ph-progress-result {
   margin-top: 2px; padding: 9px 11px; border: 1px solid var(--ph-border); border-left-width: 3px;

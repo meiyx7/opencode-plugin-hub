@@ -6,17 +6,36 @@ import test from "node:test"
 import assert from "node:assert/strict"
 import { classifyError } from "../src/gui/error-view.ts"
 
-test("01. 版本不一致：提示重载，不甩 SchemaError 原文", () => {
-  const r = classifyError(new Error("SchemaError(Missing key at plugins[0])"))
-  assert.equal(r.kind, "version-mismatch")
-  assert.match(r.text, /重新加载/)
-  assert.doesNotMatch(r.text, /SchemaError/)
+test("01. 结构不兼容：如实说明并保留原始错误，重载只作人工建议而非结论", () => {
+  const raw = "SchemaError(Missing key at plugins[0])"
+  const r = classifyError(new Error(raw))
+  assert.equal(r.kind, "schema-mismatch")
+  assert.match(r.text, /数据结构.*不一致/, "如实说明接口数据结构不兼容")
+  assert.match(r.text, /SchemaError\(Missing key at plugins\[0\]\)/, "保留原始错误，不丢诊断信息")
+  assert.match(r.text, /重新加载 OpenCode 插件/, "把重新加载作为人工排查建议")
+  assert.match(r.text, /不代表已确认版本不一致/, "不断言一定存在版本不一致")
+  assert.match(r.text, /不代表必须重载/, "不断言必须重载")
+  assert.doesNotMatch(r.text, /需要 OpenCode 重新加载/, "不再使用下结论式的旧文案")
 })
 
-test("02. 旧接口：提示后台服务版本旧", () => {
-  const r = classifyError("unknown method: plugin.foobar")
-  assert.equal(r.kind, "version-mismatch")
-  assert.match(r.text, /旧版本/)
+test("02. no method：保留真实错误、给恢复建议，但不判定必须重启、不归咎版本/registry", () => {
+  const raw = 'Ipc "plugin-hub.admin" is unavailable: no method "officialUpdates"'
+  const r = classifyError(raw)
+  assert.equal(r.kind, "ipc-unavailable")
+  assert.match(r.text, /插件接口暂不可用/, "给出明确的错误说明")
+  assert.match(r.text, /重新加载 OpenCode 插件/, "给出人工恢复建议")
+  assert.match(r.text, /重新启动 OpenCode/, "给出人工恢复建议")
+  assert.match(r.text, /不代表系统已经确认必须重启/, "仅为建议，不推断必须重启")
+  assert.match(r.text, /no method "officialUpdates"/, "保留官方 IPC 返回的真实错误")
+  assert.doesNotMatch(r.text, /旧版本|registry/i, "不归咎版本不一致或 npm Registry")
+})
+
+test("02b. Provider 不可用同样按官方 IPC 错误展示真实原因", () => {
+  const raw = 'Ipc "plugin-hub.admin" is unavailable: no provider'
+  const r = classifyError(raw)
+  assert.equal(r.kind, "ipc-unavailable")
+  assert.match(r.text, /插件接口暂不可用/)
+  assert.match(r.text, /no provider/, "保留真实错误")
 })
 
 test("03. 网络异常：提示网络/registry，并保留原始诊断", () => {
