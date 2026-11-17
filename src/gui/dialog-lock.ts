@@ -40,6 +40,21 @@ export interface LockContext {
 }
 
 /**
+ * 进度子树是否应声明 Escape 所有权（宿主 data-owns-escape）。
+ *
+ * 这是比 window 捕获监听更可靠的 Escape 防线：宿主 `onKeyDown` 在 dispatch(dismiss)
+ * 之前检查 `event.target.closest("[data-owns-escape]")`，命中即直接放行、不关闭 Dialog。
+ * 因为判定在宿主 handler 内部，完全不受“插件监听器与宿主监听器的注册先后”影响。
+ *
+ * - 仅 running 时返回 true：done 后撤销标记，Escape 恢复正常关闭。
+ * - keydown 的 event.target 是当前焦点元素；调用方须让焦点落在带该属性的子树内
+ *   （进度内容根 tabindex=-1 + autofocus + onMount focus）。
+ */
+export function ownsEscapeWhileRunning(phase: "running" | "done"): boolean {
+  return phase === "running"
+}
+
+/**
  * 是否应拦截该事件（preventDefault + stopImmediatePropagation）。
  */
 export function shouldLockEvent(event: LockEventLike, ctx: LockContext): boolean {

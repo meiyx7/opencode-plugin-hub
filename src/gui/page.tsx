@@ -5,7 +5,7 @@ import { countTitle, countWithUnit, formatCount } from "./download-format"
 import { explainMutation, type Tone } from "./feedback"
 import { buildAttentionItems, type InstalledFilter } from "./attention"
 import { classifyState, severityOf, type RowState } from "./status-view"
-import { shouldLockEvent } from "./dialog-lock"
+import { ownsEscapeWhileRunning, shouldLockEvent } from "./dialog-lock"
 import { readableErrorText } from "./error-view"
 import {
   buildProgressReport,
@@ -150,6 +150,10 @@ function StepIcon(props: { state: StepState }) {
  * 保证所有入口的进度外观与状态语义完全一致。
  */
 function ProgressBody(props: { state: ProgressState; rootRef?: (el: HTMLDivElement) => void }) {
+  let rootEl: HTMLDivElement | undefined
+  // 让焦点落在进度子树内：宿主 Escape 处理以 event.target（当前焦点元素）判断
+  // [data-owns-escape]，命中才放行；两个 Dialog 流程都据此避免被宿主 dismiss。
+  onMount(() => rootEl?.focus({ preventScroll: true }))
   // 把联合类型收敛成一个对象，避免在 JSX 里对 props.state 反复取值导致 TS 无法收窄。
   const view = createMemo(() => {
     const s = props.state
@@ -169,7 +173,21 @@ function ProgressBody(props: { state: ProgressState; rootRef?: (el: HTMLDivEleme
       : report()!.summary
 
   return (
-    <div class="ph-progress" ref={props.rootRef}>
+    // data-owns-escape：宿主 Escape 处理在 event.target 落在带此属性的子树内时直接放行、不 dismiss
+    // （来自宿主 ui/src/context/dialog.tsx 的正式约定，不是猜测的结构）。
+    // 只在 running 时挂该属性：done 后移除，Escape 即恢复正常关闭语义。
+    // tabindex + onMount focus：让焦点落在子树内，使 keydown 的 event.target 命中 data-owns-escape；
+    // 进度执行期 Dialog 内没有其它可聚焦控件，不改变内部正常交互。
+    <div
+      class="ph-progress"
+      ref={(el) => {
+        rootEl = el
+        props.rootRef?.(el)
+      }}
+      data-owns-escape={ownsEscapeWhileRunning(props.state.phase) ? "" : undefined}
+      autofocus
+      tabindex="-1"
+    >
       <div class="ph-progress-id">
         <span class="ph-tile ph-progress-tile">{initial(op().name)}</span>
         <div class="ph-progress-titles">

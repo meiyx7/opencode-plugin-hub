@@ -74,3 +74,73 @@ Escape / 外部点击拦截，以及详情 Dialog 关闭后清理进度状态。
 
 > 这验证的是收窄后的**判定逻辑**，不是宿主是否真的据此关闭。真实客户端里
 > Escape/外部点击是否被宿主更高优先级的监听抢先处理，仍需按上面 7 项人工复验。
+
+---
+
+## Escape 关闭拦截机制最终核实（本轮）
+
+针对「插件注册的 Escape 拦截器能否真正阻止宿主关闭 Dialog」的专项核实。证据来自本机
+`OpenCode.app`（v2.3.0）`app.asar` 中 `main-*.js.map` 内嵌的真实源码，非推测。
+
+### 1. 宿主实际处理 Escape 的源码位置
+
+- `ui/src/context/dialog.tsx` → `onKeyDown(event: KeyboardEvent)`：
+  ```
+  if (event.key !== "Escape") return
+  if (within && event.target instanceof Node && !within.contains(event.target)) return
+  if (event.target instanceof Element && event.target.closest("[data-owns-escape]")) return
+  dispatch({ type: "dismiss" })
+  event.preventDefault()
+  event.stopPropagation()
+  ```
+  注册处：`createEffect(() => { if (!open()) return; makeEventListener(window, "keydown", onKeyDown, { capture: true }) })`。
+- 该 `createEffect` 属于 **DialogProvider 级**（`init()` 内），在首个 Dialog 打开、`open()` 变 true 时即注册；
+  `makeEventListener` 内部直接 `target.addEventListener(type, handler, options)`（同步注册）。
+
+### 2. 宿主监听器注册时机 vs 插件 onMount 监听器
+
+- 宿主监听在 DialogProvider 初始化链路中注册；进度/详情 Dialog 的内容组件在其后才 `onMount`。
+- 尤其「打开详情 → 点安装」流程：详情 Dialog 早已打开、宿主 keydown 监听早已注册，
+  安装开始后插件才在 `useLockDialogWhileRunning` 的 `onMount` 里注册自己的 window 捕获监听。
+- 结论：**宿主先注册，插件后注册**；两者同为 `window` + `capture`。
+
+### 3. 宿主是否检查 event.defaultPrevented
+
+- **不检查。** 宿主 handler 里没有任何 `defaultPrevented` 判断；它只按 `key`、`within`、
+  `data-owns-escape` 三个条件决定是否 `dispatch(dismiss)`。
+- 因此插件调用 `event.preventDefault()` 对宿主决定是否关闭 **没有任何影响**。
+
+### 4. 宿主是否在插件拦截器执行前就触发 dismiss
+
+- 是。同一 target（window）、同一阶段（capture）的监听器按**注册顺序**执行：宿主先执行，
+  先 `dispatch({type:"dismiss"})`（同步进入 dialog 状态机、开始关闭），随后才轮到插件监听器。
+- 插件此时再 `stopImmediatePropagation()` 已经太晚：dismiss 已被派发，`defaultPrevented` 又不被宿主读取。
+- 推论：**仅靠 window 捕获阶段的 preventDefault / stopImmediatePropagation 来拦宿主 Escape，在真实宿主里不可靠**；
+  本地预览之所以测到 `escapePrevented:true`，是因为 mock Dialog 没有宿主的 keydown 监听器，
+  插件监听是唯一监听者——这不能证明真实宿主有效。
+
+### 5. 最终结论与处理
+
+- 现有 Escape 拦截机制（window 捕获 stopImmediatePropagation）**不可靠**：监听顺序和 defaultPrevented
+  两点都不利于插件。按处理原则，研究了宿主正式能力后改用 **`data-owns-escape`**：
+  - 宿主 handler 在 `dispatch(dismiss)` **之前**检查 `event.target.closest("[data-owns-escape]")`，命中即 `return`。
+  - 这是宿主**内部**的判断，与插件/宿主监听器的注册先后无关，也不依赖 defaultPrevented。
+  - 进度内容根节点 `tabindex="-1" autofocus` + `onMount` 主动 focus，确保 keydown 的 `event.target`
+    落在该子树内，从而稳定命中 `data-owns-escape`。
+  - `data-owns-escape` **仅在 running 时声明**，done 后撤销 → 完成后 Escape 恢复正常关闭。
+  - window keydown 捕获监听保留作纵深防御，但不再是主防线；pointerdown/click 的 containment 锁保持原状。
+- 不使用全局锁定窗口、不改宿主源码、不引入定时器/轮询/复杂事件代理、不影响 Dialog 内部交互。
+
+### 单元测试覆盖
+
+- `ownsEscapeWhileRunning`：running=true、done=false。
+- `shouldLockEvent`：Escape 拦截、其它键放行、内/外部指针事件、done 全放行、无法判定不拦截。
+- 源码结构断言：进度根确实绑定 `data-owns-escape={ownsEscapeWhileRunning(...)}`、含 `autofocus`+`tabindex`、
+  挂载后主动 focus，并在 dialog-lock.ts 记录了「不依赖注册顺序」的正式能力说明。
+- 预览实测：running 时进度根 `data-owns-escape=""` 且焦点落在根节点；done 后属性消失、关闭按钮出现。
+
+### 真实客户端验证
+
+- **未验证（明确标记）**：运行中的宿主加载 npm 已发布 `0.6.1`，非本分支未发布改动；且客户端未暴露 CDP。
+  上述 5 点结论为源码层面确定结论 + 事件传播规则推导 + 本地 mock 预览实测，
+  **不能替代**真实客户端按键验证。需按前面 7 项清单在测试环境人工复验。
