@@ -9,7 +9,7 @@
  */
 
 export type ErrorKind =
-  | "version-mismatch"
+  | "schema-mismatch"
   | "ipc-unavailable"
   | "network"
   | "permission"
@@ -27,9 +27,14 @@ export function classifyError(error: unknown): ClassifiedError {
   const raw = error instanceof Error ? error.message : String(error)
   const text = raw.trim()
 
-  // 窗口 bundle 与后台 service 版本不一致：说清要重载，而不是甩 SchemaError 给用户。
+  // 解码失败：返回的数据结构与插件期望的不一致。这只能证明「结构对不上」，
+  // 不能证明一定存在版本不一致，官方也没有给出「必须重载」的结论。
+  // 因此如实说明结构不兼容、保留原始错误，把重新加载作为人工排查建议。
   if (/SchemaError|Missing key at/i.test(text)) {
-    return { kind: "version-mismatch", text: "插件窗口与后台服务版本不一致，需要 OpenCode 重新加载（插件中心不重启宿主）。" }
+    return {
+      kind: "schema-mismatch",
+      text: `接口返回的数据结构与插件期望的不一致（${text}）。可尝试重新加载 OpenCode 插件；如果仍然出现，请重新启动 OpenCode。这只是人工排查建议，不代表已确认版本不一致，也不代表必须重载。`,
+    }
   }
   // 官方 IPC 契约自己返回的故障：Provider 未注册 / 方法不存在（含
   // `Ipc "..." is unavailable: no method "..."`）。只陈述官方返回的真实错误并给出
