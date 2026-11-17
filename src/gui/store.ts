@@ -8,6 +8,9 @@
  * - `rules` — the bare-ID entries this hub appended to re-enable a plugin. They look exactly like
  *   package specs in the config, so this note is what keeps them from being displayed (and
  *   queried on npm) as if they were installed packages.
+ * - `registryMode` — the registry source the user picked in the hub UI (auto / official / mirror).
+ *   Stored here, in the hub's own state file, rather than in opencode.json: it is hub preference,
+ *   not host configuration. Env var `OPENCODE_PLUGIN_HUB_REGISTRY` still overrides it at read time.
  *
  * Everything here is best effort: the file is a cache under the user's cache directory, never the
  * source of truth, and a missing or corrupt file degrades to "unknown" rather than an error.
@@ -17,16 +20,24 @@ import { mkdir, rename, rm, writeFile } from "node:fs/promises"
 import { homedir } from "node:os"
 import { dirname, join } from "node:path"
 
+/** Registry source the user selected in the hub UI. Env var still wins over this preference. */
+export type RegistryMode = "auto" | "official" | "mirror"
+
 interface StoreShape {
   version: number
   ids: Record<string, string>
   rules: string[]
+  registryMode: RegistryMode
 }
 
-const EMPTY: StoreShape = { version: 1, ids: {}, rules: [] }
+const EMPTY: StoreShape = { version: 1, ids: {}, rules: [], registryMode: "auto" }
 /** Old package entries are dropped first once the notes grow past this; the cache is disposable. */
 const MAX_IDS = 400
 const MAX_RULES = 40
+
+function validMode(value: unknown): RegistryMode {
+  return value === "official" || value === "mirror" || value === "auto" ? value : "auto"
+}
 
 let cached: StoreShape | undefined
 let cachedPath = ""
@@ -48,7 +59,7 @@ function sanitize(value: unknown): StoreShape {
   const rules = Array.isArray(record.rules)
     ? record.rules.filter((rule): rule is string => typeof rule === "string" && rule.trim().length > 0)
     : []
-  return { version: 1, ids, rules }
+  return { version: 1, ids, rules, registryMode: validMode(record.registryMode) }
 }
 
 /** Synchronous on purpose: entry resolution asks for it once per config row while building a snapshot. */
@@ -59,7 +70,7 @@ export function readStore(): StoreShape {
   try {
     value = sanitize(JSON.parse(readFileSync(path, "utf8")))
   } catch {
-    value = { version: 1, ids: {}, rules: [] }
+    value = { version: 1, ids: {}, rules: [], registryMode: "auto" }
   }
   cached = value
   cachedPath = path
@@ -74,6 +85,7 @@ async function writeStore(next: StoreShape): Promise<void> {
     version: 1,
     ids: Object.fromEntries(ids),
     rules: next.rules.slice(-MAX_RULES),
+    registryMode: next.registryMode,
   }
   cached = trimmed
   cachedPath = path
@@ -115,6 +127,23 @@ export function forgetRule(spec: string): void {
   const store = readStore()
   if (!store.rules.includes(spec)) return
   void writeStore({ ...store, rules: store.rules.filter((rule) => rule !== spec) })
+}
+
+/** The registry source persisted by the user (never the env override). Default: auto. */
+export function registryMode(): RegistryMode {
+  return readStore().registryMode
+}
+
+/**
+ * Persists the user's registry choice. Awaitable so callers can be sure it hit disk before the
+ * next request uses it. Invalid values fall back to auto.
+ */
+export async function setRegistryMode(mode: unknown): Promise<RegistryMode> {
+  const next = validMode(mode)
+  const store = readStore()
+  if (store.registryMode === next) return next
+  await writeStore({ ...store, registryMode: next })
+  return next
 }
 
 /** Test seam: drops the in-memory copy so a new temp directory is read from scratch. */
