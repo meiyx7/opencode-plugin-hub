@@ -5,7 +5,7 @@ import { countTitle, countWithUnit, formatCount } from "./download-format"
 import { explainMutation, type Tone } from "./feedback"
 import { buildAttentionItems, type InstalledFilter } from "./attention"
 import { classifyState, severityOf, type RowState } from "./status-view"
-import { ownsEscapeWhileRunning, shouldLockEvent } from "./dialog-lock"
+import { shouldLockEvent } from "./dialog-lock"
 import { readableErrorText } from "./error-view"
 import {
   buildProgressReport,
@@ -184,7 +184,7 @@ function ProgressBody(props: { state: ProgressState; rootRef?: (el: HTMLDivEleme
         rootEl = el
         props.rootRef?.(el)
       }}
-      data-owns-escape={ownsEscapeWhileRunning(props.state.phase) ? "" : undefined}
+      data-owns-escape={props.state.phase === "running" ? "" : undefined}
       autofocus
       tabindex="-1"
     >
@@ -253,11 +253,11 @@ function progressTone(state: ProgressState): "success" | "failed" | "attention" 
 }
 
 /**
- * 操作执行期间阻止 Dialog 被关闭，但只拦截“可能导致关闭”的事件：
- * - keydown 只拦 Escape（宿主 window 捕获阶段据此 dismiss）；
- * - pointerdown / click 只拦“落在 Dialog 内容之外”的（宿主据此触发 backdrop.click /
- *   Kobalte 的 pointerdown-outside → onDismiss）；
- * - Dialog 内部交互一律放行，绝不无差别锁住整个 OpenCode 窗口。
+ * 操作执行期间阻止“点击 Dialog 外部”关闭：只拦落在 Dialog 内容范围之外的
+ * pointerdown / click，Dialog 内部交互一律放行，绝不无差别锁住整个 OpenCode 窗口。
+ *
+ * Escape 不在这里处理：它由进度内容根节点的 data-owns-escape 交给宿主正式能力负责
+ * （见 docs/host-interaction-verification.md）。
  *
  * 现实约束：宿主的 `ui.Dialog` 只透传 closable（隐藏标题栏 X），不透传 ref/class/
  * preventBackdropDismiss，插件拿不到 Dialog 的 DOM 句柄。因此 hook 接收一个由进度内容
@@ -280,21 +280,16 @@ function useLockDialogWhileRunning(running: () => boolean, contentRef: { current
       return target instanceof Node ? !node.contains(target) : undefined
     }
     const handler = (event: Event) => {
-      const decision = shouldLockEvent(
-        { type: event.type, key: event instanceof KeyboardEvent ? event.key : undefined },
-        { running: running(), isOutside: event.type === "keydown" ? undefined : isOutside(event) },
-      )
+      const decision = shouldLockEvent({ type: event.type }, { running: running(), isOutside: isOutside(event) })
       if (decision) {
         event.preventDefault()
         event.stopImmediatePropagation()
       }
     }
-    // 捕获阶段：先于宿主的 document 捕获 pointerdown 与 window 捕获 keydown。
-    window.addEventListener("keydown", handler, true)
+    // 捕获阶段：先于宿主的 document 捕获 pointerdown 与覆盖层 click。
     window.addEventListener("pointerdown", handler, true)
     window.addEventListener("click", handler, true)
     onCleanup(() => {
-      window.removeEventListener("keydown", handler, true)
       window.removeEventListener("pointerdown", handler, true)
       window.removeEventListener("click", handler, true)
     })
