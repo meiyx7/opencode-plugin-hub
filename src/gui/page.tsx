@@ -1758,12 +1758,6 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
                 未能检查
               </span>
             </Show>
-            {/* 目录插件的「跳过更新」已由上面那条徽章说清，规则条目更谈不上更新，不重复。 */}
-            <Show when={packageLike() && info()?.official === "skipped" && !stale()}>
-              <span class="ph-badge" data-tone="warning" title={info()!.reason}>
-                跳过更新
-              </span>
-            </Show>
             <Show when={packageLike() && info()?.pinned}>
               <span class="ph-badge" title="配置写的是精确版本；升级需要你确认后才会切换，并继续保留精确锁定">
                 精确锁定
