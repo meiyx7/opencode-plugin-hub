@@ -10,6 +10,7 @@
 
 export type ErrorKind =
   | "version-mismatch"
+  | "ipc-unavailable"
   | "network"
   | "permission"
   | "config"
@@ -30,8 +31,14 @@ export function classifyError(error: unknown): ClassifiedError {
   if (/SchemaError|Missing key at/i.test(text)) {
     return { kind: "version-mismatch", text: "插件窗口与后台服务版本不一致，需要 OpenCode 重新加载（插件中心不重启宿主）。" }
   }
-  if (/unknown method|not implemented|no such method|method.*not.*found/i.test(text)) {
-    return { kind: "version-mismatch", text: "后台服务还在跑旧版本，没有这个接口。请让 OpenCode 重新加载插件后重试。" }
+  // 官方 IPC 契约自己返回的故障：Provider 未注册 / 方法不存在（含
+  // `Ipc "..." is unavailable: no method "..."`）。只陈述官方返回的真实错误并给出
+  // 人工恢复选项，不推断「必须重启客户端」、不归咎 npm Registry、也不自动重载。
+  if (/is unavailable|no method\b|no such method|unknown method|method.*not.*found|not implemented|no provider\b/i.test(text)) {
+    return {
+      kind: "ipc-unavailable",
+      text: `插件接口暂不可用：当前客户端未能找到插件所需的 IPC 方法（${text}）。请尝试重新加载 OpenCode 插件；如果仍然出现，请重新启动 OpenCode。这只是故障恢复建议，不代表系统已经确认必须重启。`,
+    }
   }
   // 网络 / registry 不可达。
   if (/fetch failed|ECONNRESET|ECONNREFUSED|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|socket hang up|other side closed|Unable to connect|network/i.test(text)) {

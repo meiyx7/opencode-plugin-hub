@@ -20,6 +20,8 @@ export interface ProgressStep {
   title: string
   state: StepState
   desc: string
+  /** 该步骤失败时来自官方返回的真实错误；只在节点就地展示，不伪造说明。 */
+  error?: string
 }
 
 export interface ProgressRow {
@@ -79,13 +81,14 @@ export function shouldClearProgress(
   return current.phase === "done"
 }
 
-function commandStep(command: string | undefined, install: boolean): ProgressStep {
+function commandStep(command: string | undefined, install: boolean, error: string): ProgressStep {
   const title = install ? "执行安装命令" : "执行更新命令"
   switch (command) {
     case "succeeded":
       return { title, state: "done", desc: "官方命令执行成功" }
     case "failed":
-      return { title, state: "failed", desc: "官方命令执行失败" }
+      // 失败节点就地带上统一出口给出的真实错误，不用笼统一句话代替。
+      return { title, state: "failed", desc: "官方命令执行失败", error: error || undefined }
     case "skipped":
       return { title, state: "skipped", desc: "官方命令跳过了这一步" }
     default:
@@ -113,13 +116,14 @@ function runtimeStep(runtime: string | undefined): ProgressStep {
   const title = "确认运行状态"
   switch (runtime) {
     case "loaded":
-      return { title, state: "done", desc: "插件已正常加载" }
+      // 只陈述官方 plugin list / 宿主接口报告的证据，不冒称「已完全生效」。
+      return { title, state: "done", desc: "官方运行状态报告为已加载" }
     case "failed":
       return { title, state: "failed", desc: "宿主报告插件加载失败" }
     case "unknown":
       return { title, state: "unknown", desc: "宿主未确认插件运行状态" }
     case "unchanged":
-      return { title, state: "unknown", desc: "配置已切换，但运行时仍是旧状态" }
+      return { title, state: "unknown", desc: "配置已切换，但官方运行状态仍是旧版本" }
     case "skipped":
       return { title, state: "skipped", desc: "这一步未执行" }
     default:
@@ -161,7 +165,7 @@ export function buildProgressReport(input: ProgressInput, result: ProgressMutati
       desc: stages?.command ? "目标版本已在隔离目录准备并校验" : "未取得准备结果",
     })
   } else {
-    steps.push(commandStep(stages?.command, install))
+    steps.push(commandStep(stages?.command, install, input.mutationText))
   }
   steps.push(configStep(stages?.config, result.ok))
   steps.push(runtimeStep(stages?.runtime))

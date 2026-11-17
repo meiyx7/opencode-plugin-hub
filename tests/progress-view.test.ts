@@ -63,14 +63,15 @@ test("03. 全成功：三阶段 done，结论 success", () => {
   assert.equal(report.rows.find((r) => r.key === "运行状态")!.value, "已加载")
 })
 
-test("04. 命令失败：命令阶段 failed，结论随统一语气 error→failed", () => {
+test("04. 命令失败：命令阶段 failed，结论随统一语气 error→failed，节点就地展示真实错误", () => {
   const report = buildProgressReport(
-    input({ mutationTone: "error", mutationText: "命令失败" }),
+    input({ mutationTone: "error", mutationText: "安装失败（CLI：NpmInstallFailedError）" }),
     { ok: false, message: "失败", stages: { command: "failed", config: "unchanged", runtime: "skipped" } },
   )
   assert.equal(report.tone, "failed")
   assert.equal(report.steps[0]!.state, "failed")
   assert.match(report.steps[0]!.desc, /失败/)
+  assert.equal(report.steps[0]!.error, "安装失败（CLI：NpmInstallFailedError）", "失败节点携带真实错误")
 })
 
 test("05. 配置成功但运行未确认：runtime→unknown，不冒报成功", () => {
