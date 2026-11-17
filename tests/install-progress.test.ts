@@ -92,6 +92,28 @@ test("06. 不伪造进度：无定时器推进阶段、无百分比字段", () =
   assert.match(PAGE, /import \{[\s\S]*buildProgressReport[\s\S]*\} from "\.\/progress-view"/, "未接入纯函数映射")
 })
 
+test("06c. ph 变量作用域必须覆盖每个弹框根，否则整块样式退化为纯文字", () => {
+  const styles = readFileSync(join(process.cwd(), "src/gui", "styles.ts"), "utf8")
+  // 先剥掉注释再取选择器：注释里也会出现类名，否则断言会被自己的说明文字骗过。
+  const bare = styles.replace(/\/\*[\s\S]*?\*\//g, "")
+  const scopeMatch = bare.match(/([.\w\s,:>-]+)\{\s*\n\s*--ph-strong:/)
+  assert.ok(scopeMatch, "未找到 ph 变量定义块")
+  const scope = scopeMatch[1]!
+
+  // 宿主 ui.Dialog 把 children 与 footer 渲染到彼此独立的容器里，两者都不在 .ph-root 之内，
+  // 因此每个弹框子树的根都必须自己成为变量作用域，否则该子树所有 var(--ph-*) 未定义。
+  const roots = new Set([".ph-progress", ".ph-detail"])
+  for (const m of PAGE.matchAll(/footer=\{[\s\S]{0,1500}?<div class="([^"]+)"/g)) {
+    for (const cls of m[1]!.split(/\s+/)) if (cls.startsWith("ph-")) roots.add(`.${cls}`)
+  }
+  assert.ok(roots.size >= 3, "未能从 page.tsx 识别出弹框子树根")
+  for (const root of roots) {
+    assert.ok(scope.includes(root), `${root} 是弹框子树根，却不在 ph 变量作用域内（会退化成无样式文字）`)
+  }
+  // 依赖关系成立性：这些规则确实引用了 ph 变量，漏作用域就会真的失效。
+  assert.match(styles, /\.ph-step-ico\s*\{[^}]*var\(--ph-/, "节点样式应依赖 ph 变量")
+})
+
 test("06b. 时间轴是真正的可视化：独立节点 + 连续连接线 + 各状态色 + 失败就地错误", () => {
   const styles = readFileSync(join(process.cwd(), "src/gui", "styles.ts"), "utf8")
   // 每个步骤有独立圆形节点，节点之间由 ::before 竖向连接线相连。

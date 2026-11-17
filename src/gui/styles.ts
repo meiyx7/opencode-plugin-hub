@@ -6,7 +6,11 @@
  * --ph-danger / --ph-accent，保证三个页面和详情弹窗对同一状态说同一种话。
  */
 export const CSS = `
-.ph-root, .ph-detail {
+/* 变量作用域必须覆盖每一个「弹框根」，而不只是页面根：宿主 ui.Dialog 把 children 与
+   footer 渲染到各自独立的容器，它们都不在 .ph-root 之内。独立进度弹框的根是
+   .ph-progress，footer 的根是 .ph-dialog-footer；漏掉任何一个，该子树里所有
+   var(--ph-*) 都未定义，颜色/边框/背景整体失效，视觉上退化成纯文字。 */
+.ph-root, .ph-detail, .ph-progress, .ph-dialog-footer {
   --ph-strong: var(--color-v2-text-text-contrast, var(--color-text-strong, currentColor));
   --ph-text: var(--color-v2-text-text-base, var(--color-text-base, inherit));
   --ph-muted: var(--color-v2-text-text-muted, var(--color-text-weak, color-mix(in srgb, currentColor 58%, transparent)));
