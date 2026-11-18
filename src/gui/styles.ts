@@ -225,7 +225,7 @@ export const CSS = `
 .ph-notice-close:hover { opacity: 1; background: color-mix(in srgb, currentColor 10%, transparent); }
 .ph-notice .ph-notice-action { flex: 0 0 auto; align-self: center; }
 
-/* 配置变更状态：搜索工具栏内的紧凑标签，不单独占一行。 */
+/* 配置变更状态：顶部工具栏内的紧凑标签，不单独占一行。 */
 .ph-pending {
   display: inline-flex;
   align-items: center;
@@ -985,11 +985,10 @@ button.ph-chip:focus-visible,
   .ph-actions-right { margin-left: 0; }
   .ph-tab { padding: 0 7px; }
   .ph-tab .ph-count-alert { display: none; }
-  /* 配置状态 chip 不挤压搜索框：搜索框保底宽度，状态自然换行。 */
+  /* 窄宽度下输入区独占一行；配置状态固定在顶部工具栏。 */
   .ph-filter-row > .ph-grow,
   .ph-searchbar > .ph-grow,
   .ph-installed-search { flex-basis: 100%; }
-  .ph-pending { order: 2; }
 }
 
 @media (max-width: 760px) {

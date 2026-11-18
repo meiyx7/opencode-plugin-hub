@@ -1368,7 +1368,7 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
     </button>
   )
 
-  // 配置变更状态：与搜索框同处工具栏，三个 Tab 的搜索行复用同一段 JSX。
+  // 配置变更状态：与页签同处顶部工具栏，三个 Tab 共用同一段 JSX。
   // 只读 hasPendingChanges/pendingChangesCount，重载仍走原有 reload()。
   const pendingChip = () => (
     <Show when={hasPendingChanges()}>
@@ -2006,6 +2006,7 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
             {tabButton("search", "npm 搜索", "magnifying-glass", searched() ? hits().length : undefined)}
             {tabButton("installed", "已安装", "checklist", state()?.plugins.length ?? 0, outdated())}
           </div>
+          {pendingChip()}
           <span class="ph-spacer" />
           <Show when={tab() === "catalog"}>
             <ui.Button
@@ -2087,7 +2088,6 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
                     }}
                   />
                 </div>
-                {pendingChip()}
                 <div class="ph-chips">
                   <For each={TYPE_FILTERS}>
                     {(item) => (
@@ -2224,7 +2224,6 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
               >
                 搜索
               </ui.Button>
-              {pendingChip()}
             </div>
 
             <div class="ph-meta">
@@ -2351,7 +2350,6 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
                   onInput={setInstalledQuery}
                 />
               </div>
-              {pendingChip()}
               <div class="ph-chips">
                 {installedFilterButton("all", "全部")}
                 {installedFilterButton("update", "可更新")}
