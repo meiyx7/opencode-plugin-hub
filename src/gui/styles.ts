@@ -119,22 +119,16 @@ export const CSS = `
   box-shadow: inset 0 1px rgba(255,255,255,.10);
 }
 .ph-brand-mark svg { width: 22px; height: 22px; display: block; }
-.ph-brand-words { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
-.ph-brand-name {
-  font-size: 14px;
-  font-weight: 650;
-  letter-spacing: .2px;
-  line-height: 1.3;
-}
+.ph-brand-words { display: flex; flex-direction: column; justify-content: center; min-width: 0; }
 .ph-brand-en {
-  font-size: 8.5px;
-  font-weight: 600;
-  letter-spacing: 1.4px;
-  color: #9fb9d9;
-  line-height: 1.4;
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 2.2px;
+  color: #dce9f8;
+  line-height: 1.3;
   overflow-wrap: anywhere;
 }
-.ph-hero-main { margin-top: 15px; }
+.ph-hero-main { margin-top: 13px; }
 .ph-hero-title {
   margin: 0;
   font-size: 20px;

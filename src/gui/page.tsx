@@ -1922,8 +1922,7 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
               </svg>
             </span>
             <span class="ph-brand-words">
-              <span class="ph-brand-name">插件中心</span>
-              <span class="ph-brand-en">PLUGIN HUB · OPENCODE ECOSYSTEM</span>
+              <span class="ph-brand-en">PLUGIN HUB</span>
             </span>
           </div>
           <div class="ph-hero-main">
