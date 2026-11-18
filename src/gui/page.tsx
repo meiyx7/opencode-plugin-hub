@@ -542,6 +542,7 @@ function DetailDialog(props: DetailDialogProps) {
                   {update() ? `更新到 v${version()}` : `安装 v${version()}`}
                 </ui.Button>
               </Show>
+              <span class="ph-install-hint">安装前先看 README 与来源。</span>
             </div>
           </div>
 
@@ -1367,6 +1368,27 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
     </button>
   )
 
+  // 配置变更状态：与搜索框同处工具栏，三个 Tab 的搜索行复用同一段 JSX。
+  // 只读 hasPendingChanges/pendingChangesCount，重载仍走原有 reload()。
+  const pendingChip = () => (
+    <Show when={hasPendingChanges()}>
+      <span
+        class="ph-pending"
+        title="受监控的配置由 OpenCode 自动重新加载。需要立刻确认时点「立即重载」；插件中心只写配置，不接管宿主进程。"
+      >
+        <span class="ph-pending-count">{pendingChangesCount()} 项待加载</span>
+        <button
+          type="button"
+          class="ph-link"
+          disabled={isBusy("reload")}
+          onClick={() => void reload()}
+        >
+          立即重载
+        </button>
+      </span>
+    </Show>
+  )
+
   const versionLabel = (current: string, latest: string, stale: boolean) => (
     <span class="ph-version">
       {current ? `v${current}` : ""}
@@ -1927,30 +1949,21 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
           </div>
           <div class="ph-hero-main">
             <h2 class="ph-hero-title">扩展你的 OpenCode</h2>
-            <p class="ph-hero-desc">发现、安装和管理插件，让开发环境拥有更多可能。</p>
+            <p class="ph-hero-desc">
+              浏览{" "}
+              <button
+                type="button"
+                class="ph-hero-source"
+                title={CATALOG_SOURCE_TITLE}
+                onClick={() => void openUrl(registryUrl())}
+              >
+                awesome-opencode
+              </button>{" "}
+              社区维护的精选目录与 npm 上的 OpenCode 插件。
+            </p>
           </div>
         </div>
       </section>
-
-      <div class="ph-path" title={state()?.configPath}>
-        <span class="ph-path-key">配置</span>
-        <code>{state()?.configPath ?? "读取中…"}</code>
-        <span class="ph-dot" />
-        <code>{state()?.configKey ?? "plugins"}[]</code>
-      </div>
-
-      <p class="ph-source">
-        浏览{" "}
-        <button
-          type="button"
-          class="ph-inline-source"
-          title={CATALOG_SOURCE_TITLE}
-          onClick={() => void openUrl(registryUrl())}
-        >
-          awesome-opencode
-        </button>{" "}
-        社区维护的精选目录与 npm 上的 OpenCode 插件。安装前先看 README 与来源。
-      </p>
 
       <Show when={visibleNote() || state()?.error || runtimeError()}>
         <div class="ph-notices">
@@ -1987,20 +2000,6 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
       </Show>
 
       <div class="ph-head">
-        {/* 待生效变更常驻在工具栏，不占用正文高度；点击即可重载。 */}
-        <Show when={hasPendingChanges()}>
-          <div
-            class="ph-pending"
-            title="受监控的配置由 OpenCode 自动重新加载。需要立刻确认时点「立即重载」；插件中心只写配置，不接管宿主进程。"
-          >
-            <ui.Icon name="outline-rotate-clockwise" size="small" />
-            <span>{pendingChangesCount()} 项配置变更等待宿主加载</span>
-            <button type="button" class="ph-link" onClick={() => void reload()}>
-              立即重载
-            </button>
-          </div>
-        </Show>
-
         <div class="ph-toolbar">
           <div class="ph-tabs" role="tablist">
             {tabButton("catalog", "精选目录", "extensions", meta() ? catalog().length : undefined)}
@@ -2088,6 +2087,7 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
                     }}
                   />
                 </div>
+                {pendingChip()}
                 <div class="ph-chips">
                   <For each={TYPE_FILTERS}>
                     {(item) => (
@@ -2224,6 +2224,7 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
               >
                 搜索
               </ui.Button>
+              {pendingChip()}
             </div>
 
             <div class="ph-meta">
@@ -2350,6 +2351,7 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
                   onInput={setInstalledQuery}
                 />
               </div>
+              {pendingChip()}
               <div class="ph-chips">
                 {installedFilterButton("all", "全部")}
                 {installedFilterButton("update", "可更新")}

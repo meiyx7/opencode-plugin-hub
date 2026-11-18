@@ -146,50 +146,25 @@ export const CSS = `
   overflow-wrap: anywhere;
 }
 
-/* 来源说明与配置路径：保留原有入口与内容，位置仍在 Hero 之外。 */
-.ph-source {
-  margin: -4px 0 0;
-  font-size: 10.5px;
-  line-height: 1.55;
-  color: var(--ph-faint);
-}
-.ph-inline-source {
+/* Hero 副标题内的来源链接：在深蓝底上保持浅亮可读，与副标题文字同一基线。 */
+.ph-hero-source {
   padding: 0;
   border: 0;
   background: none;
-  color: var(--ph-accent);
+  color: #dce9f8;
   font: inherit;
   line-height: inherit;
+  text-decoration: underline;
+  text-decoration-color: color-mix(in srgb, #dce9f8 45%, transparent);
+  text-underline-offset: 2px;
   cursor: pointer;
 }
-.ph-inline-source:hover { text-decoration: underline; }
-.ph-inline-source:focus-visible {
-  outline: 2px solid color-mix(in srgb, var(--ph-accent) 55%, transparent);
+.ph-hero-source:hover { text-decoration-color: #dce9f8; }
+.ph-hero-source:focus-visible {
+  outline: 2px solid color-mix(in srgb, #dce9f8 65%, transparent);
   outline-offset: 2px;
   border-radius: 2px;
 }
-.ph-path {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  flex: 0 1 auto;
-  max-width: 100%;
-  font-size: 10px;
-  line-height: 1.6;
-  color: var(--ph-faint);
-}
-.ph-path code {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  font-family: var(--ph-mono);
-  font-size: 9.5px;
-  padding: 1px 4px;
-  border-radius: 4px;
-  background: var(--ph-layer-2);
-}
-.ph-path .ph-path-key { flex: 0 0 auto; opacity: 0.8; }
 
 /* ---------- 通知 ---------- */
 .ph-notices { display: flex; flex-direction: column; gap: 7px; }
@@ -250,19 +225,23 @@ export const CSS = `
 .ph-notice-close:hover { opacity: 1; background: color-mix(in srgb, currentColor 10%, transparent); }
 .ph-notice .ph-notice-action { flex: 0 0 auto; align-self: center; }
 
-/* 待生效变更常驻工具栏，不占用正文高度。 */
+/* 配置变更状态：搜索工具栏内的紧凑标签，不单独占一行。 */
 .ph-pending {
-  display: flex;
+  display: inline-flex;
   align-items: center;
-  gap: 6px;
-  flex-wrap: wrap;
-  padding: 5px 8px;
-  border: 1px solid color-mix(in srgb, var(--ph-accent) 22%, transparent);
-  border-radius: 7px;
-  background: color-mix(in srgb, var(--ph-accent) 5%, transparent);
+  gap: 7px;
+  flex: 0 0 auto;
+  padding: 3px 7px;
+  border: 1px solid color-mix(in srgb, var(--ph-accent) 26%, transparent);
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--ph-accent) 7%, transparent);
   color: var(--ph-muted);
-  font-size: 10.5px;
-  line-height: 1.45;
+  font-size: 10px;
+  line-height: 1.5;
+  white-space: nowrap;
+}
+.ph-pending-count {
+  font-variant-numeric: tabular-nums;
 }
 .ph-pending .ph-link {
   padding: 0;
@@ -270,10 +249,12 @@ export const CSS = `
   background: none;
   color: var(--ph-accent);
   font: inherit;
-  font-size: 10.5px;
+  font-size: 10px;
+  font-weight: 600;
   cursor: pointer;
 }
 .ph-pending .ph-link:hover { text-decoration: underline; }
+.ph-pending .ph-link:disabled { opacity: 0.55; cursor: default; }
 
 /* ---------- 工具栏和页签 ---------- */
 .ph-head {
@@ -781,7 +762,8 @@ button.ph-chip[data-active="true"] {
 .ph-detail-pkg { font-family: var(--ph-mono); font-size: 10px; color: var(--ph-faint); overflow-wrap: anywhere; }
 .ph-detail-badges { display: flex; align-items: center; gap: 4px; flex-wrap: wrap; }
 .ph-detail-desc { margin: 2px 0 0; font-size: 11.5px; line-height: 1.55; color: var(--ph-muted); }
-.ph-detail-primary { display: flex; align-items: center; gap: 6px; flex: 0 0 auto; padding-top: 1px; }
+.ph-detail-primary { display: flex; align-items: center; gap: 8px; flex: 0 1 auto; flex-wrap: wrap; justify-content: flex-end; padding-top: 1px; }
+.ph-install-hint { font-size: 10px; line-height: 1.4; color: var(--ph-faint); }
 .ph-detail .ph-warning {
   display: flex;
   align-items: flex-start;
@@ -940,7 +922,6 @@ button.ph-chip[data-active="true"] {
 .ph-tab:focus-visible,
 .ph-sort button:focus-visible,
 button.ph-chip:focus-visible,
-.ph-inline-source:focus-visible,
 .ph-clear:focus-visible,
 .ph-pending .ph-link:focus-visible,
 .ph-card-body[role="button"]:focus-visible {
@@ -985,13 +966,12 @@ button.ph-chip:focus-visible,
 
 /* SettingsPage 的窄内容区；按容器宽度而不是窗口宽度判断。 */
 @container ph-root (max-width: 700px) {
-  .ph-path { max-width: none; }
   .ph-hero { min-height: 120px; padding: 17px 18px; }
   .ph-hero-deco { right: 8%; opacity: .16; }
   .ph-toolbar-action { margin-left: 0; }
 }
 @container ph-root (max-width: 520px) {
-  /* 窄宽度下收紧字号与装饰，但保留品牌行、标题、描述与配置的完整内容。 */
+  /* 窄宽度下收紧字号与装饰，但保留品牌行、标题、描述与来源的完整内容。 */
   .ph-hero { min-height: 0; padding: 15px 16px; }
   .ph-hero-deco { right: -18px; top: 26px; opacity: .11; }
   .ph-hero::after { right: -30px; }
@@ -1005,6 +985,11 @@ button.ph-chip:focus-visible,
   .ph-actions-right { margin-left: 0; }
   .ph-tab { padding: 0 7px; }
   .ph-tab .ph-count-alert { display: none; }
+  /* 配置状态 chip 不挤压搜索框：搜索框保底宽度，状态自然换行。 */
+  .ph-filter-row > .ph-grow,
+  .ph-searchbar > .ph-grow,
+  .ph-installed-search { flex-basis: 100%; }
+  .ph-pending { order: 2; }
 }
 
 @media (max-width: 760px) {
