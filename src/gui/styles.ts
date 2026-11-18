@@ -49,43 +49,115 @@ export const CSS = `
 .ph-root *, .ph-detail * { box-sizing: border-box; }
 .ph-spacer { flex: 1; min-width: 0; }
 
-/* ---------- 页面头部：只保留身份、来源和配置路径 ---------- */
+/* ---------- 品牌 Hero ---------- */
+/* 深蓝渐变是品牌固定色，不随宿主明暗主题翻转——这是刻意的品牌识别，与参考设计一致。
+   文字用固定浅色保证在渐变上的对比度；装饰仅在 Hero 内，pointer-events:none 不挡点击。 */
 .ph-hero {
-  display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
-  gap: 8px 18px;
-  flex-wrap: wrap;
-  padding: 2px 0 2px;
+  position: relative;
+  isolation: isolate;
+  overflow: hidden;
+  min-height: 132px;
+  padding: 19px 20px;
+  border-radius: var(--ph-r-lg);
+  background:
+    radial-gradient(ellipse at 88% 5%, rgba(91,151,231,.24), transparent 38%),
+    linear-gradient(112deg,#172e4c 0%,#203d62 58%,#244b76 100%);
+  color: #fff;
 }
-.ph-hero-copy { display: flex; flex: 1 1 360px; flex-direction: column; gap: 3px; min-width: 0; }
-.ph-kicker { display: none; }
-.ph-title {
-  display: flex;
-  align-items: center;
-  gap: 7px;
-  margin: 0;
-  font-size: 18px;
-  font-weight: 650;
-  letter-spacing: -0.012em;
-  line-height: 1.3;
-  color: var(--ph-strong);
+.ph-hero::after {
+  content: "";
+  position: absolute;
+  width: 250px;
+  height: 250px;
+  right: 46px;
+  top: -158px;
+  border: 1px solid rgba(180,213,255,.17);
+  border-radius: 50%;
+  box-shadow:
+    0 0 0 21px rgba(180,213,255,.035),
+    0 0 0 45px rgba(180,213,255,.03),
+    0 0 0 72px rgba(180,213,255,.02);
+  pointer-events: none;
 }
-.ph-title-icon {
+.ph-hero::before {
+  content: "";
+  position: absolute;
+  width: 150px;
+  height: 150px;
+  right: 56px;
+  bottom: -120px;
+  border: 1px solid rgba(180,213,255,.16);
+  border-radius: 50%;
+  pointer-events: none;
+}
+.ph-hero-deco {
+  position: absolute;
+  right: 12%;
+  top: 30px;
+  width: 118px;
+  height: 84px;
+  color: #b7d7ff;
+  opacity: .2;
+  pointer-events: none;
+}
+.ph-hero-deco svg { width: 100%; height: 100%; display: block; }
+.ph-hero-inner {
+  position: relative;
+  z-index: 1;
+  min-width: 0;
+}
+.ph-brand { display: flex; align-items: center; gap: 10px; min-width: 0; }
+.ph-brand-mark {
+  flex: 0 0 auto;
   display: grid;
   place-items: center;
-  width: 24px;
-  height: 24px;
-  border-radius: 7px;
-  background: color-mix(in srgb, var(--ph-accent) 10%, transparent);
-  color: var(--ph-accent);
+  width: 36px;
+  height: 36px;
+  border-radius: 9px;
+  background: rgba(255,255,255,.12);
+  border: 1px solid rgba(255,255,255,.15);
+  box-shadow: inset 0 1px rgba(255,255,255,.10);
 }
-.ph-sub {
-  max-width: 82ch;
+.ph-brand-mark svg { width: 22px; height: 22px; display: block; }
+.ph-brand-words { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.ph-brand-name {
+  font-size: 14px;
+  font-weight: 650;
+  letter-spacing: .2px;
+  line-height: 1.3;
+}
+.ph-brand-en {
+  font-size: 8.5px;
+  font-weight: 600;
+  letter-spacing: 1.4px;
+  color: #9fb9d9;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+.ph-hero-main { margin-top: 15px; }
+.ph-hero-title {
   margin: 0;
+  font-size: 20px;
+  font-weight: 650;
+  letter-spacing: -.4px;
+  line-height: 1.3;
+  color: #fff;
+}
+.ph-hero-desc {
+  margin: 7px 0 0;
   font-size: 11.5px;
   line-height: 1.55;
-  color: var(--ph-muted);
+  color: #c0d1e5;
+  letter-spacing: .1px;
+  overflow-wrap: anywhere;
+}
+
+/* 来源说明与配置路径：保留原有入口与内容，位置仍在 Hero 之外。 */
+.ph-source {
+  margin: -4px 0 0;
+  font-size: 10.5px;
+  line-height: 1.55;
+  color: var(--ph-faint);
 }
 .ph-inline-source {
   padding: 0;
@@ -107,10 +179,7 @@ export const CSS = `
   align-items: center;
   gap: 4px;
   flex: 0 1 auto;
-  max-width: 44%;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  max-width: 100%;
   font-size: 10px;
   line-height: 1.6;
   color: var(--ph-faint);
@@ -119,6 +188,7 @@ export const CSS = `
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
+  white-space: nowrap;
   font-family: var(--ph-mono);
   font-size: 9.5px;
   padding: 1px 4px;
@@ -889,15 +959,8 @@ button.ph-chip:focus-visible,
   max-width: none;
   padding: 0 0 6px;
 }
-.ph-root[data-embedded="true"] .ph-hero {
-  padding: 0;
-  align-items: center;
-  gap: 4px 14px;
-}
-.ph-root[data-embedded="true"] .ph-hero-copy { flex-direction: row; flex-wrap: wrap; align-items: center; gap: 0 8px; }
-.ph-root[data-embedded="true"] .ph-title { display: none; }
-.ph-root[data-embedded="true"] .ph-sub { font-size: 11px; }
-.ph-root[data-embedded="true"] .ph-path { max-width: 46%; }
+/* Hero 在 Dialog 与设置面板是同一套实现：不再按入口隐藏标题或抽掉内边距，
+   窄宽度交给下面的容器查询统一处理，避免两份视觉定义漂移。 */
 
 [data-component="dialog-v2"][data-size="x-large"]:has(.ph-root[data-embedded="true"]) [data-slot="dialog-container"],
 [data-component="dialog-v2"][data-size="x-large"]:has(.ph-detail) [data-slot="dialog-container"] {
@@ -928,10 +991,21 @@ button.ph-chip:focus-visible,
 
 /* SettingsPage 的窄内容区；按容器宽度而不是窗口宽度判断。 */
 @container ph-root (max-width: 700px) {
-  .ph-path { max-width: none; flex-basis: 100%; }
+  .ph-path { max-width: none; }
+  .ph-hero { min-height: 120px; padding: 17px 18px; }
+  .ph-hero-deco { right: 8%; opacity: .16; }
   .ph-toolbar-action { margin-left: 0; }
 }
 @container ph-root (max-width: 520px) {
+  /* 窄宽度下收紧字号与装饰，但保留品牌行、标题、描述与配置的完整内容。 */
+  .ph-hero { min-height: 0; padding: 15px 16px; }
+  .ph-hero-deco { right: -18px; top: 26px; opacity: .11; }
+  .ph-hero::after { right: -30px; }
+  .ph-hero::before { display: none; }
+  .ph-hero-main { margin-top: 13px; }
+  .ph-hero-title { font-size: 18px; }
+  .ph-hero-desc { font-size: 11px; }
+  .ph-brand-en { letter-spacing: 1px; }
   .ph-list { grid-template-columns: 1fr; }
   .ph-actions { justify-content: flex-start; }
   .ph-actions-right { margin-left: 0; }

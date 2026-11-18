@@ -1896,36 +1896,62 @@ export function PluginHubPage(props: { ctx: Context; admin: AdminClient; embedde
     <div class="ph-root" data-embedded={props.embedded ? "true" : undefined}>
       <style>{CSS}</style>
 
+      {/* 品牌 Hero：Dialog 与设置面板共用同一段实现，不按入口分叉。 */}
       <section class="ph-hero">
-        <div class="ph-hero-copy">
-          <Show when={!props.embedded}>
-            <h2 class="ph-title">
-              <span class="ph-title-icon">
-                <ui.Icon name="extensions" size="small" />
-              </span>
-              插件中心
-            </h2>
-          </Show>
-          <p class="ph-sub">
-            浏览{" "}
-            <button
-              type="button"
-              class="ph-inline-source"
-              title={CATALOG_SOURCE_TITLE}
-              onClick={() => void openUrl(registryUrl())}
-            >
-              awesome-opencode
-            </button>{" "}
-            社区维护的精选目录与 npm 上的 OpenCode 插件。安装前先看 README 与来源。
-          </p>
+        <div class="ph-hero-deco" aria-hidden="true">
+          <svg viewBox="0 0 160 110" fill="none">
+            <path
+              d="M30 55 C30 13 78 13 80 55 C82 97 130 97 130 55 C130 13 82 13 80 55 C78 97 30 97 30 55Z"
+              stroke="currentColor"
+              stroke-width="1.6"
+            />
+            <circle cx="30" cy="55" r="4" fill="currentColor" />
+            <circle cx="130" cy="55" r="4" fill="currentColor" />
+            <circle cx="80" cy="55" r="3" fill="currentColor" />
+          </svg>
         </div>
-        <div class="ph-path" title={state()?.configPath}>
-          <span class="ph-path-key">配置</span>
-          <code>{state()?.configPath ?? "读取中…"}</code>
-          <span class="ph-dot" />
-          <code>{state()?.configKey ?? "plugins"}[]</code>
+        <div class="ph-hero-inner">
+          <div class="ph-brand">
+            <span class="ph-brand-mark" aria-hidden="true">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+                <rect x="3" y="3" width="7" height="7" rx="2" />
+                <rect x="14" y="3" width="7" height="7" rx="2" />
+                <rect x="3" y="14" width="7" height="7" rx="2" />
+                <path d="M17.5 14v7M14 17.5h7" />
+                <path d="M10 6.5h4M6.5 10v4" />
+              </svg>
+            </span>
+            <span class="ph-brand-words">
+              <span class="ph-brand-name">插件中心</span>
+              <span class="ph-brand-en">PLUGIN HUB · OPENCODE ECOSYSTEM</span>
+            </span>
+          </div>
+          <div class="ph-hero-main">
+            <h2 class="ph-hero-title">扩展你的 OpenCode</h2>
+            <p class="ph-hero-desc">发现、安装和管理插件，让开发环境拥有更多可能。</p>
+          </div>
         </div>
       </section>
+
+      <div class="ph-path" title={state()?.configPath}>
+        <span class="ph-path-key">配置</span>
+        <code>{state()?.configPath ?? "读取中…"}</code>
+        <span class="ph-dot" />
+        <code>{state()?.configKey ?? "plugins"}[]</code>
+      </div>
+
+      <p class="ph-source">
+        浏览{" "}
+        <button
+          type="button"
+          class="ph-inline-source"
+          title={CATALOG_SOURCE_TITLE}
+          onClick={() => void openUrl(registryUrl())}
+        >
+          awesome-opencode
+        </button>{" "}
+        社区维护的精选目录与 npm 上的 OpenCode 插件。安装前先看 README 与来源。
+      </p>
 
       <Show when={visibleNote() || state()?.error || runtimeError()}>
         <div class="ph-notices">
